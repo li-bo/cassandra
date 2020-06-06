@@ -17,10 +17,6 @@
  */
 package org.apache.cassandra.io.sstable;
 
-import java.util.Collection;
-import java.util.Collections;
-import java.util.UUID;
-
 import org.apache.cassandra.db.RowIndexEntry;
 import org.apache.cassandra.db.SerializationHeader;
 import org.apache.cassandra.db.lifecycle.LifecycleNewTracker;
@@ -32,7 +28,12 @@ import org.apache.cassandra.io.sstable.metadata.MetadataCollector;
 import org.apache.cassandra.schema.TableId;
 import org.apache.cassandra.schema.TableMetadataRef;
 
-public class SimpleSSTableMultiWriter implements SSTableMultiWriter
+import java.util.Collection;
+import java.util.Collections;
+import java.util.UUID;
+
+public class
+SimpleSSTableMultiWriter implements SSTableMultiWriter
 {
     private final SSTableWriter writer;
     private final LifecycleNewTracker lifecycleNewTracker;
