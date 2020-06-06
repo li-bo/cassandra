@@ -17,7 +17,7 @@
 -XX:MaxTenuringThreshold=1
 -XX:CMSInitiatingOccupancyFraction=75
 -XX:+UseCMSInitiatingOccupancyOnly
-#-XX:CMSWaitDuration=10000
+-XX:CMSWaitDuration=10000
 -XX:+CMSParallelInitialMarkEnabled
 -XX:+CMSEdenChunksRecordAlways
 ## some JVMs will fill up their heap when accessed via JMX, see CASSANDRA-6541

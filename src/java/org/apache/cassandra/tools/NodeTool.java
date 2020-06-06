@@ -148,7 +148,6 @@ public class NodeTool
                 ProxyHistograms.class,
                 Rebuild.class,
                 Refresh.class,
-                RemoveSStables.class,
                 RemoveNode.class,
                 Assassinate.class,
                 ReloadSeeds.class,

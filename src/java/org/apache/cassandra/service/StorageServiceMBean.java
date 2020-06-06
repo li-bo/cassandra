@@ -17,14 +17,6 @@
  */
 package org.apache.cassandra.service;
 
-import org.apache.cassandra.db.ColumnFamilyStoreMBean;
-import org.apache.cassandra.exceptions.ConfigurationException;
-
-import javax.annotation.Nullable;
-import javax.management.NotificationEmitter;
-import javax.management.openmbean.CompositeData;
-import javax.management.openmbean.OpenDataException;
-import javax.management.openmbean.TabularData;
 import java.io.IOException;
 import java.io.Serializable;
 import java.net.InetAddress;
@@ -34,6 +26,15 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeoutException;
+import javax.annotation.Nullable;
+import javax.management.NotificationEmitter;
+import javax.management.openmbean.CompositeData;
+import javax.management.openmbean.OpenDataException;
+import javax.management.openmbean.TabularData;
+
+import org.apache.cassandra.db.ColumnFamilyStoreMBean;
+import org.apache.cassandra.exceptions.ConfigurationException;
+import org.apache.cassandra.utils.Pair;
 
 public interface StorageServiceMBean extends NotificationEmitter
 {

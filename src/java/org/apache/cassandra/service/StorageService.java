@@ -17,76 +17,6 @@
  */
 package org.apache.cassandra.service;
 
-import com.google.common.annotations.VisibleForTesting;
-import com.google.common.base.Preconditions;
-import com.google.common.base.Predicate;
-import com.google.common.base.Predicates;
-import com.google.common.collect.*;
-import com.google.common.util.concurrent.*;
-import org.apache.cassandra.audit.AuditLogManager;
-import org.apache.cassandra.audit.AuditLogOptions;
-import org.apache.cassandra.auth.AuthKeyspace;
-import org.apache.cassandra.auth.AuthSchemaChangeListener;
-import org.apache.cassandra.batchlog.BatchlogManager;
-import org.apache.cassandra.concurrent.ExecutorLocals;
-import org.apache.cassandra.concurrent.NamedThreadFactory;
-import org.apache.cassandra.concurrent.ScheduledExecutors;
-import org.apache.cassandra.concurrent.Stage;
-import org.apache.cassandra.config.Config;
-import org.apache.cassandra.config.DatabaseDescriptor;
-import org.apache.cassandra.config.ParameterizedClass;
-import org.apache.cassandra.cql3.QueryProcessor;
-import org.apache.cassandra.db.*;
-import org.apache.cassandra.db.commitlog.CommitLog;
-import org.apache.cassandra.db.compaction.CompactionManager;
-import org.apache.cassandra.db.compaction.Verifier;
-import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
-import org.apache.cassandra.db.virtual.VirtualKeyspaceRegistry;
-import org.apache.cassandra.dht.Range;
-import org.apache.cassandra.dht.*;
-import org.apache.cassandra.dht.RangeStreamer.FetchReplica;
-import org.apache.cassandra.dht.Token.TokenFactory;
-import org.apache.cassandra.exceptions.ConfigurationException;
-import org.apache.cassandra.exceptions.InvalidRequestException;
-import org.apache.cassandra.exceptions.UnavailableException;
-import org.apache.cassandra.fql.FullQueryLogger;
-import org.apache.cassandra.fql.FullQueryLoggerOptions;
-import org.apache.cassandra.gms.*;
-import org.apache.cassandra.hints.HintsService;
-import org.apache.cassandra.io.sstable.SSTableLoader;
-import org.apache.cassandra.io.util.FileUtils;
-import org.apache.cassandra.locator.*;
-import org.apache.cassandra.locator.ReplicaCollection.Builder.Conflict;
-import org.apache.cassandra.metrics.StorageMetrics;
-import org.apache.cassandra.net.AsyncOneResponse;
-import org.apache.cassandra.net.Message;
-import org.apache.cassandra.net.MessagingService;
-import org.apache.cassandra.repair.RepairRunnable;
-import org.apache.cassandra.repair.SystemDistributedKeyspace;
-import org.apache.cassandra.repair.messages.RepairOption;
-import org.apache.cassandra.schema.CompactionParams.TombstoneOption;
-import org.apache.cassandra.schema.*;
-import org.apache.cassandra.streaming.*;
-import org.apache.cassandra.tracing.TraceKeyspace;
-import org.apache.cassandra.transport.ProtocolVersion;
-import org.apache.cassandra.transport.Server;
-import org.apache.cassandra.utils.*;
-import org.apache.cassandra.utils.logging.LoggingSupportFactory;
-import org.apache.cassandra.utils.progress.ProgressEvent;
-import org.apache.cassandra.utils.progress.ProgressEventType;
-import org.apache.cassandra.utils.progress.ProgressListener;
-import org.apache.cassandra.utils.progress.jmx.JMXBroadcastExecutor;
-import org.apache.cassandra.utils.progress.jmx.JMXProgressSupport;
-import org.apache.commons.lang3.StringUtils;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
-import javax.annotation.Nullable;
-import javax.management.NotificationBroadcasterSupport;
-import javax.management.openmbean.CompositeData;
-import javax.management.openmbean.OpenDataException;
-import javax.management.openmbean.TabularData;
-import javax.management.openmbean.TabularDataSupport;
 import java.io.*;
 import java.net.InetAddress;
 import java.net.UnknownHostException;
@@ -103,11 +33,89 @@ import java.util.stream.Collectors;
 import java.util.stream.Stream;
 import java.util.stream.StreamSupport;
 
+import javax.annotation.Nullable;
+import javax.management.*;
+import javax.management.openmbean.CompositeData;
+import javax.management.openmbean.OpenDataException;
+import javax.management.openmbean.TabularData;
+import javax.management.openmbean.TabularDataSupport;
+
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.base.Preconditions;
+import com.google.common.base.Predicate;
+import com.google.common.base.Predicates;
+import com.google.common.collect.*;
+import com.google.common.util.concurrent.*;
+
+import org.apache.cassandra.config.ParameterizedClass;
+import org.apache.cassandra.dht.RangeStreamer.FetchReplica;
+import org.apache.cassandra.fql.FullQueryLogger;
+import org.apache.cassandra.fql.FullQueryLoggerOptions;
+import org.apache.cassandra.locator.ReplicaCollection.Builder.Conflict;
+import org.apache.commons.lang3.StringUtils;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.audit.AuditLogManager;
+import org.apache.cassandra.audit.AuditLogOptions;
+import org.apache.cassandra.auth.AuthKeyspace;
+import org.apache.cassandra.auth.AuthSchemaChangeListener;
+import org.apache.cassandra.batchlog.BatchlogManager;
+import org.apache.cassandra.concurrent.ExecutorLocals;
+import org.apache.cassandra.concurrent.NamedThreadFactory;
+import org.apache.cassandra.concurrent.ScheduledExecutors;
+import org.apache.cassandra.concurrent.Stage;
+import org.apache.cassandra.config.Config;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.cql3.QueryProcessor;
+import org.apache.cassandra.db.*;
+import org.apache.cassandra.db.commitlog.CommitLog;
+import org.apache.cassandra.db.compaction.CompactionManager;
+import org.apache.cassandra.db.compaction.Verifier;
+import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
+import org.apache.cassandra.db.virtual.VirtualKeyspaceRegistry;
+import org.apache.cassandra.dht.*;
+import org.apache.cassandra.dht.Range;
+import org.apache.cassandra.dht.Token.TokenFactory;
+import org.apache.cassandra.exceptions.*;
+import org.apache.cassandra.gms.*;
+import org.apache.cassandra.hints.HintsService;
+import org.apache.cassandra.io.sstable.SSTableLoader;
+import org.apache.cassandra.io.util.FileUtils;
+import org.apache.cassandra.locator.*;
+import org.apache.cassandra.metrics.StorageMetrics;
+import org.apache.cassandra.net.*;
+import org.apache.cassandra.repair.*;
+import org.apache.cassandra.repair.messages.RepairOption;
+import org.apache.cassandra.schema.CompactionParams.TombstoneOption;
+import org.apache.cassandra.schema.KeyspaceMetadata;
+import org.apache.cassandra.schema.MigrationManager;
+import org.apache.cassandra.schema.ReplicationParams;
+import org.apache.cassandra.schema.Schema;
+import org.apache.cassandra.schema.SchemaConstants;
+import org.apache.cassandra.schema.TableMetadata;
+import org.apache.cassandra.schema.TableMetadataRef;
+import org.apache.cassandra.schema.ViewMetadata;
+import org.apache.cassandra.streaming.*;
+import org.apache.cassandra.tracing.TraceKeyspace;
+import org.apache.cassandra.transport.ProtocolVersion;
+import org.apache.cassandra.transport.Server;
+import org.apache.cassandra.utils.*;
+import org.apache.cassandra.utils.logging.LoggingSupportFactory;
+import org.apache.cassandra.utils.progress.ProgressEvent;
+import org.apache.cassandra.utils.progress.ProgressEventType;
+import org.apache.cassandra.utils.progress.ProgressListener;
+import org.apache.cassandra.utils.progress.jmx.JMXBroadcastExecutor;
+import org.apache.cassandra.utils.progress.jmx.JMXProgressSupport;
+
 import static com.google.common.collect.Iterables.transform;
 import static com.google.common.collect.Iterables.tryFind;
 import static java.util.Arrays.asList;
 import static java.util.Arrays.stream;
-import static java.util.concurrent.TimeUnit.*;
+import static java.util.concurrent.TimeUnit.MINUTES;
+import static java.util.concurrent.TimeUnit.MILLISECONDS;
+import static java.util.concurrent.TimeUnit.NANOSECONDS;
 import static java.util.stream.Collectors.toList;
 import static java.util.stream.Collectors.toMap;
 import static org.apache.cassandra.index.SecondaryIndexManager.getIndexName;
@@ -5178,14 +5186,6 @@ public class StorageService extends NotificationBroadcasterSupport implements IE
         verifyKeyspaceIsValid(ksName);
         ColumnFamilyStore.loadNewSSTables(ksName, cfName);
     }
-
-//    @Override
-//    public void deleteSStables(String ksName, String cfName, String... sstablePath) {
-//        if (!isInitialized())
-//            throw new RuntimeException("Not yet initialized, can't delete sstables");
-//        verifyKeyspaceIsValid(ksName);
-//        ColumnFamilyStore.deleteSSTables(ksName, cfName, sstablePath);
-//    }
 
     /**
      * #{@inheritDoc}

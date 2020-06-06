@@ -17,16 +17,17 @@
  */
 package org.apache.cassandra.db;
 
-import org.apache.cassandra.dht.Range;
-import org.apache.cassandra.dht.Token;
-
-import javax.management.openmbean.CompositeData;
-import javax.management.openmbean.OpenDataException;
 import java.util.Collection;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ExecutionException;
+
+import javax.management.openmbean.CompositeData;
+import javax.management.openmbean.OpenDataException;
+
+import org.apache.cassandra.dht.Range;
+import org.apache.cassandra.dht.Token;
 
 /**
  * The MBean interface for ColumnFamilyStore
@@ -164,9 +165,7 @@ public interface ColumnFamilyStoreMBean
                                           boolean invalidateCaches,
                                           boolean extendedVerify);
 
-    public List<String> removeSSTables(Set<String> sstablePath);
-
-        @Deprecated
+    @Deprecated
     public void loadNewSSTables();
     /**
      * @return the number of SSTables in L0.  Always return 0 if Leveled compaction is not enabled.
