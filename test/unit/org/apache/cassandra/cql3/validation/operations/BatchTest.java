@@ -104,39 +104,6 @@ public class BatchTest extends CQLTester
     }
 
     @Test
-    public void testBatchRangeDelete() throws Throwable
-    {
-        createTable("CREATE TABLE %s (partitionKey int," +
-                "clustering int," +
-                "value int," +
-                " PRIMARY KEY (partitionKey, clustering)) WITH COMPACT STORAGE");
-
-        int value = 0;
-        for (int partitionKey = 0; partitionKey < 4; partitionKey++)
-            for (int clustering1 = 0; clustering1 < 5; clustering1++)
-                execute("INSERT INTO %s (partitionKey, clustering, value) VALUES (?, ?, ?)",
-                        partitionKey, clustering1, value++);
-
-        execute("BEGIN BATCH " +
-                "DELETE FROM %1$s WHERE partitionKey = 1;" +
-                "DELETE FROM %1$s WHERE partitionKey = 0 AND  clustering >= 4;" +
-                "DELETE FROM %1$s WHERE partitionKey = 0 AND clustering <= 0;" +
-                "DELETE FROM %1$s WHERE partitionKey = 2 AND clustering >= 0 AND clustering <= 3;" +
-                "DELETE FROM %1$s WHERE partitionKey = 2 AND clustering <= 3 AND clustering >= 4;" +
-                "DELETE FROM %1$s WHERE partitionKey = 3 AND (clustering) >= (3) AND (clustering) <= (6);" +
-                "APPLY BATCH;");
-
-        assertRows(execute("SELECT * FROM %s"),
-                   row(0, 1, 1),
-                   row(0, 2, 2),
-                   row(0, 3, 3),
-                   row(2, 4, 14),
-                   row(3, 0, 15),
-                   row(3, 1, 16),
-                   row(3, 2, 17));
-    }
-
-    @Test
     public void testBatchUpdate() throws Throwable
     {
         createTable("CREATE TABLE %s (partitionKey int," +
@@ -198,6 +165,26 @@ public class BatchTest extends CQLTester
 
         assertRows(execute(String.format("SELECT * FROM %s", tbl1)), row(0, 1, 2));
         assertRows(execute(String.format("SELECT * FROM %s", tbl2)), row(0, 3, 4));
+    }
+
+    @Test
+    public void testBatchMultipleTablePrepare() throws Throwable
+    {
+        String tbl1 = KEYSPACE + "." + createTableName();
+        String tbl2 = KEYSPACE + "." + createTableName();
+
+        schemaChange(String.format("CREATE TABLE %s (k1 int PRIMARY KEY, v1 int)", tbl1));
+        schemaChange(String.format("CREATE TABLE %s (k2 int PRIMARY KEY, v2 int)", tbl2));
+
+        String query = "BEGIN BATCH " +
+                   String.format("UPDATE %s SET v1 = 1 WHERE k1 = ?;", tbl1) +
+                   String.format("UPDATE %s SET v2 = 2 WHERE k2 = ?;", tbl2) +
+                   "APPLY BATCH;";
+        prepare(query);
+        execute(query, 0, 1);
+
+        assertRows(execute(String.format("SELECT * FROM %s", tbl1)), row(0, 1));
+        assertRows(execute(String.format("SELECT * FROM %s", tbl2)), row(1, 2));
     }
 
     @Test

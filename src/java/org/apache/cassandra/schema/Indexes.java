@@ -21,8 +21,7 @@ import java.util.*;
 import java.util.stream.Stream;
 
 import com.google.common.collect.ImmutableMap;
-
-import org.apache.cassandra.exceptions.ConfigurationException;
+import com.google.common.collect.Sets;
 
 import static java.lang.String.format;
 
@@ -168,20 +167,6 @@ public final class Indexes implements Iterable<IndexMetadata>
 
     public void validate(TableMetadata table)
     {
-        /*
-         * Index name check is duplicated in Keyspaces, for the time being.
-         * The reason for this is that schema altering statements are not calling
-         * Keyspaces.validate() as of yet. TODO: remove this once they do (on CASSANDRA-9425 completion)
-         */
-        Set<String> indexNames = new HashSet<>();
-        for (IndexMetadata index : indexesByName.values())
-        {
-            if (indexNames.contains(index.name))
-                throw new ConfigurationException(format("Duplicate index name %s for table %s", index.name, table));
-
-            indexNames.add(index.name);
-        }
-
         indexesByName.values().forEach(i -> i.validate(table));
     }
 
@@ -195,20 +180,6 @@ public final class Indexes implements Iterable<IndexMetadata>
     public String toString()
     {
         return indexesByName.values().toString();
-    }
-
-    public static String getAvailableIndexName(String ksName, String cfName, String indexNameRoot)
-    {
-
-        KeyspaceMetadata ksm = Schema.instance.getKeyspaceMetadata(ksName);
-        Set<String> existingNames = ksm == null ? new HashSet<>() : ksm.existingIndexNames(null);
-        String baseName = IndexMetadata.getDefaultIndexName(cfName, indexNameRoot);
-        String acceptedName = baseName;
-        int i = 0;
-        while (existingNames.contains(acceptedName))
-            acceptedName = baseName + '_' + (++i);
-
-        return acceptedName;
     }
 
     public static final class Builder

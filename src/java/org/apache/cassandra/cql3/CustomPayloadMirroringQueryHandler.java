@@ -21,7 +21,6 @@ import java.nio.ByteBuffer;
 import java.util.Map;
 
 import org.apache.cassandra.cql3.statements.BatchStatement;
-import org.apache.cassandra.cql3.statements.ParsedStatement;
 import org.apache.cassandra.service.ClientState;
 import org.apache.cassandra.service.QueryState;
 import org.apache.cassandra.transport.messages.ResultMessage;
@@ -36,13 +35,18 @@ public class CustomPayloadMirroringQueryHandler implements QueryHandler
 {
     static QueryProcessor queryProcessor = QueryProcessor.instance;
 
-    public ResultMessage process(String query,
+    public CQLStatement parse(String query, QueryState state, QueryOptions options)
+    {
+        return queryProcessor.parse(query, state, options);
+    }
+
+    public ResultMessage process(CQLStatement statement,
                                  QueryState state,
                                  QueryOptions options,
                                  Map<String, ByteBuffer> customPayload,
                                  long queryStartNanoTime)
     {
-        ResultMessage result = queryProcessor.process(query, state, options, customPayload, queryStartNanoTime);
+        ResultMessage result = queryProcessor.process(statement, state, options, customPayload, queryStartNanoTime);
         result.setCustomPayload(customPayload);
         return result;
     }
@@ -54,7 +58,7 @@ public class CustomPayloadMirroringQueryHandler implements QueryHandler
         return prepared;
     }
 
-    public ParsedStatement.Prepared getPrepared(MD5Digest id)
+    public QueryProcessor.Prepared getPrepared(MD5Digest id)
     {
         return queryProcessor.getPrepared(id);
     }

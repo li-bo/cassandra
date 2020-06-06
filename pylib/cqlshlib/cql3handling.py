@@ -14,15 +14,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .cqlhandling import CqlParsingRuleSet, Hint
 from cassandra.metadata import maybe_escape_name
-
+from cqlshlib import helptopics
+from cqlshlib.cqlhandling import CqlParsingRuleSet, Hint
 
 simple_cql_types = set(('ascii', 'bigint', 'blob', 'boolean', 'counter', 'date', 'decimal', 'double', 'duration', 'float',
                         'inet', 'int', 'smallint', 'text', 'time', 'timestamp', 'timeuuid', 'tinyint', 'uuid', 'varchar', 'varint'))
 simple_cql_types.difference_update(('set', 'map', 'list'))
 
-from . import helptopics
 cqldocs = helptopics.CQL3HelpTopics()
 
 
@@ -34,8 +33,9 @@ class UnexpectedTableStructure(UserWarning):
     def __str__(self):
         return 'Unexpected table structure; may not translate correctly to CQL. ' + self.msg
 
-SYSTEM_KEYSPACES = ('system', 'system_schema', 'system_traces', 'system_auth', 'system_distributed')
-NONALTERBALE_KEYSPACES = ('system', 'system_schema')
+
+SYSTEM_KEYSPACES = ('system', 'system_schema', 'system_traces', 'system_auth', 'system_distributed', 'system_views', 'system_virtual_schema')
+NONALTERBALE_KEYSPACES = ('system', 'system_schema', 'system_views', 'system_virtual_schema')
 
 
 class Cql3ParsingRuleSet(CqlParsingRuleSet):
@@ -43,15 +43,15 @@ class Cql3ParsingRuleSet(CqlParsingRuleSet):
     columnfamily_layout_options = (
         ('bloom_filter_fp_chance', None),
         ('comment', None),
-        ('dclocal_read_repair_chance', 'local_read_repair_chance'),
         ('gc_grace_seconds', None),
         ('min_index_interval', None),
         ('max_index_interval', None),
-        ('read_repair_chance', None),
         ('default_time_to_live', None),
         ('speculative_retry', None),
+        ('additional_write_policy', None),
         ('memtable_flush_period_in_ms', None),
-        ('cdc', None)
+        ('cdc', None),
+        ('read_repair', None),
     )
 
     columnfamily_layout_map_options = (
@@ -142,6 +142,7 @@ class Cql3ParsingRuleSet(CqlParsingRuleSet):
         if cqlword[0] == "'" and cqlword[-1] == "'":
             cqlword = cqlword[1:-1].replace("''", "'")
         return cqlword
+
 
 CqlRuleSet = Cql3ParsingRuleSet()
 
@@ -376,6 +377,7 @@ def prop_equals_completer(ctxt, cass):
             return ()
     return ['=']
 
+
 completer_for('property', 'propeq')(prop_equals_completer)
 
 
@@ -439,19 +441,19 @@ def ks_prop_val_mapkey_completer(ctxt, cass):
     optname = ctxt.get_binding('propname')[-1]
     if optname != 'replication':
         return ()
-    keysseen = map(dequote_value, ctxt.get_binding('propmapkey', ()))
-    valsseen = map(dequote_value, ctxt.get_binding('propmapval', ()))
+    keysseen = list(map(dequote_value, ctxt.get_binding('propmapkey', ())))
+    valsseen = list(map(dequote_value, ctxt.get_binding('propmapval', ())))
     for k, v in zip(keysseen, valsseen):
         if k == 'class':
             repclass = v
             break
     else:
         return ["'class'"]
-    if repclass in CqlRuleSet.replication_factor_strategies:
+    if repclass == 'SimpleStrategy':
         opts = set(('replication_factor',))
     elif repclass == 'NetworkTopologyStrategy':
         return [Hint('<dc_name>')]
-    return map(escape_value, opts.difference(keysseen))
+    return list(map(escape_value, opts.difference(keysseen)))
 
 
 def ks_prop_val_mapval_completer(ctxt, cass):
@@ -460,7 +462,7 @@ def ks_prop_val_mapval_completer(ctxt, cass):
         return ()
     currentkey = dequote_value(ctxt.get_binding('propmapkey')[-1])
     if currentkey == 'class':
-        return map(escape_value, CqlRuleSet.replication_strategies)
+        return list(map(escape_value, CqlRuleSet.replication_strategies))
     return [Hint('<term>')]
 
 
@@ -468,15 +470,15 @@ def ks_prop_val_mapender_completer(ctxt, cass):
     optname = ctxt.get_binding('propname')[-1]
     if optname != 'replication':
         return [',']
-    keysseen = map(dequote_value, ctxt.get_binding('propmapkey', ()))
-    valsseen = map(dequote_value, ctxt.get_binding('propmapval', ()))
+    keysseen = list(map(dequote_value, ctxt.get_binding('propmapkey', ())))
+    valsseen = list(map(dequote_value, ctxt.get_binding('propmapval', ())))
     for k, v in zip(keysseen, valsseen):
         if k == 'class':
             repclass = v
             break
     else:
         return [',']
-    if repclass in CqlRuleSet.replication_factor_strategies:
+    if repclass == 'SimpleStrategy':
         if 'replication_factor' not in keysseen:
             return [',']
     if repclass == 'NetworkTopologyStrategy' and len(keysseen) == 1:
@@ -485,8 +487,8 @@ def ks_prop_val_mapender_completer(ctxt, cass):
 
 
 def cf_prop_name_completer(ctxt, cass):
-    return [c[0] for c in (CqlRuleSet.columnfamily_layout_options +
-                           CqlRuleSet.columnfamily_layout_map_options)]
+    return [c[0] for c in (CqlRuleSet.columnfamily_layout_options
+                           + CqlRuleSet.columnfamily_layout_map_options)]
 
 
 def cf_prop_val_completer(ctxt, cass):
@@ -500,14 +502,15 @@ def cf_prop_val_completer(ctxt, cass):
         return ["{'keys': '"]
     if any(this_opt == opt[0] for opt in CqlRuleSet.obsolete_cf_options):
         return ["'<obsolete_option>'"]
-    if this_opt in ('read_repair_chance', 'bloom_filter_fp_chance',
-                    'dclocal_read_repair_chance'):
+    if this_opt == 'bloom_filter_fp_chance':
         return [Hint('<float_between_0_and_1>')]
     if this_opt in ('min_compaction_threshold', 'max_compaction_threshold',
                     'gc_grace_seconds', 'min_index_interval', 'max_index_interval'):
         return [Hint('<integer>')]
     if this_opt in ('cdc'):
         return [Hint('<true|false>')]
+    if this_opt in ('read_repair'):
+        return [Hint('<\'none\'|\'blocking\'>')]
     return [Hint('<option_value>')]
 
 
@@ -518,13 +521,13 @@ def cf_prop_val_mapkey_completer(ctxt, cass):
             break
     else:
         return ()
-    keysseen = map(dequote_value, ctxt.get_binding('propmapkey', ()))
-    valsseen = map(dequote_value, ctxt.get_binding('propmapval', ()))
-    pairsseen = dict(zip(keysseen, valsseen))
+    keysseen = list(map(dequote_value, ctxt.get_binding('propmapkey', ())))
+    valsseen = list(map(dequote_value, ctxt.get_binding('propmapval', ())))
+    pairsseen = dict(list(zip(keysseen, valsseen)))
     if optname == 'compression':
-        return map(escape_value, set(subopts).difference(keysseen))
+        return list(map(escape_value, set(subopts).difference(keysseen)))
     if optname == 'caching':
-        return map(escape_value, set(subopts).difference(keysseen))
+        return list(map(escape_value, set(subopts).difference(keysseen)))
     if optname == 'compaction':
         opts = set(subopts)
         try:
@@ -541,7 +544,7 @@ def cf_prop_val_mapkey_completer(ctxt, cass):
         elif csc == 'TimeWindowCompactionStrategy':
             opts = opts.union(set(CqlRuleSet.time_window_compaction_strategy_options))
 
-        return map(escape_value, opts)
+        return list(map(escape_value, opts))
     return ()
 
 
@@ -550,11 +553,11 @@ def cf_prop_val_mapval_completer(ctxt, cass):
     key = dequote_value(ctxt.get_binding('propmapkey')[-1])
     if opt == 'compaction':
         if key == 'class':
-            return map(escape_value, CqlRuleSet.available_compaction_classes)
+            return list(map(escape_value, CqlRuleSet.available_compaction_classes))
         return [Hint('<option_value>')]
     elif opt == 'compression':
         if key == 'sstable_compression':
-            return map(escape_value, CqlRuleSet.available_compression_classes)
+            return list(map(escape_value, CqlRuleSet.available_compression_classes))
         return [Hint('<option_value>')]
     elif opt == 'caching':
         if key == 'rows_per_partition':
@@ -580,23 +583,24 @@ def storagetype_completer(ctxt, cass):
 
 @completer_for('keyspaceName', 'ksname')
 def ks_name_completer(ctxt, cass):
-    return map(maybe_escape_name, cass.get_keyspace_names())
+    return list(map(maybe_escape_name, cass.get_keyspace_names()))
 
 
 @completer_for('nonSystemKeyspaceName', 'ksname')
 def non_system_ks_name_completer(ctxt, cass):
     ksnames = [n for n in cass.get_keyspace_names() if n not in SYSTEM_KEYSPACES]
-    return map(maybe_escape_name, ksnames)
+    return list(map(maybe_escape_name, ksnames))
 
 
 @completer_for('alterableKeyspaceName', 'ksname')
 def alterable_ks_name_completer(ctxt, cass):
     ksnames = [n for n in cass.get_keyspace_names() if n not in NONALTERBALE_KEYSPACES]
-    return map(maybe_escape_name, ksnames)
+    return list(map(maybe_escape_name, ksnames))
 
 
 def cf_ks_name_completer(ctxt, cass):
     return [maybe_escape_name(ks) + '.' for ks in cass.get_keyspace_names()]
+
 
 completer_for('columnFamilyName', 'ksname')(cf_ks_name_completer)
 completer_for('materializedViewName', 'ksname')(cf_ks_name_completer)
@@ -607,6 +611,7 @@ def cf_ks_dot_completer(ctxt, cass):
     if name in cass.get_keyspace_names():
         return ['.']
     return []
+
 
 completer_for('columnFamilyName', 'dot')(cf_ks_dot_completer)
 completer_for('materializedViewName', 'dot')(cf_ks_dot_completer)
@@ -623,7 +628,7 @@ def cf_name_completer(ctxt, cass):
         if ks is None:
             return ()
         raise
-    return map(maybe_escape_name, cfnames)
+    return list(map(maybe_escape_name, cfnames))
 
 
 @completer_for('materializedViewName', 'mvname')
@@ -637,7 +642,8 @@ def mv_name_completer(ctxt, cass):
         if ks is None:
             return ()
         raise
-    return map(maybe_escape_name, mvnames)
+    return list(map(maybe_escape_name, mvnames))
+
 
 completer_for('userTypeName', 'ksname')(cf_ks_name_completer)
 
@@ -654,7 +660,7 @@ def ut_name_completer(ctxt, cass):
         if ks is None:
             return ()
         raise
-    return map(maybe_escape_name, utnames)
+    return list(map(maybe_escape_name, utnames))
 
 
 completer_for('userTypeName', 'utname')(ut_name_completer)
@@ -690,6 +696,7 @@ def working_on_keyspace(ctxt):
     if wat in ('KEYSPACE', 'SCHEMA'):
         return True
     return False
+
 
 syntax_rules += r'''
 <useStatement> ::= "USE" <keyspaceName>
@@ -744,7 +751,7 @@ def udf_name_completer(ctxt, cass):
         if ks is None:
             return ()
         raise
-    return map(maybe_escape_name, udfnames)
+    return list(map(maybe_escape_name, udfnames))
 
 
 def uda_name_completer(ctxt, cass):
@@ -757,7 +764,7 @@ def uda_name_completer(ctxt, cass):
         if ks is None:
             return ()
         raise
-    return map(maybe_escape_name, udanames)
+    return list(map(maybe_escape_name, udanames))
 
 
 def udf_uda_name_completer(ctxt, cass):
@@ -770,7 +777,7 @@ def udf_uda_name_completer(ctxt, cass):
         if ks is None:
             return ()
         raise
-    return map(maybe_escape_name, functionnames)
+    return list(map(maybe_escape_name, functionnames))
 
 
 def ref_udf_name_completer(ctxt, cass):
@@ -778,7 +785,7 @@ def ref_udf_name_completer(ctxt, cass):
         udanames = cass.get_userfunction_names(None)
     except Exception:
         return ()
-    return map(maybe_escape_name, udanames)
+    return list(map(maybe_escape_name, udanames))
 
 
 completer_for('functionAggregateName', 'ksname')(cf_ks_name_completer)
@@ -836,7 +843,7 @@ def relation_token_subject_completer(ctxt, cass):
 def select_relation_lhs_completer(ctxt, cass):
     layout = get_table_meta(ctxt, cass)
     filterable = set()
-    already_filtered_on = map(dequote_name, ctxt.get_binding('rel_lhs', ()))
+    already_filtered_on = list(map(dequote_name, ctxt.get_binding('rel_lhs', ())))
     for num in range(0, len(layout.partition_key)):
         if num == 0 or layout.partition_key[num - 1].name in already_filtered_on:
             filterable.add(layout.partition_key[num].name)
@@ -847,9 +854,10 @@ def select_relation_lhs_completer(ctxt, cass):
             filterable.add(layout.clustering_key[num].name)
         else:
             break
-    for idx in layout.indexes.itervalues():
+    for idx in layout.indexes.values():
         filterable.add(idx.index_options["target"])
-    return map(maybe_escape_name, filterable)
+    return list(map(maybe_escape_name, filterable))
+
 
 explain_completion('selector', 'colname')
 
@@ -871,9 +879,9 @@ syntax_rules += r'''
 def regular_column_names(table_meta):
     if not table_meta or not table_meta.columns:
         return []
-    regular_columns = list(set(table_meta.columns.keys()) -
-                           set([key.name for key in table_meta.partition_key]) -
-                           set([key.name for key in table_meta.clustering_key]))
+    regular_columns = list(set(table_meta.columns.keys())
+                           - set([key.name for key in table_meta.partition_key])
+                           - set([key.name for key in table_meta.clustering_key]))
     return regular_columns
 
 
@@ -886,13 +894,13 @@ def insert_colname_completer(ctxt, cass):
         if k.name not in colnames:
             return [maybe_escape_name(k.name)]
     normalcols = set(regular_column_names(layout)) - colnames
-    return map(maybe_escape_name, normalcols)
+    return list(map(maybe_escape_name, normalcols))
 
 
 @completer_for('insertStatement', 'newval')
 def insert_newval_completer(ctxt, cass):
     layout = get_table_meta(ctxt, cass)
-    insertcols = map(dequote_name, ctxt.get_binding('colname'))
+    insertcols = list(map(dequote_name, ctxt.get_binding('colname')))
     valuesdone = ctxt.get_binding('newval', ())
     if len(valuesdone) >= len(insertcols):
         return []
@@ -924,6 +932,7 @@ def insert_option_completer(ctxt, cass):
     for opt in ctxt.get_binding('insertopt', ()):
         opts.discard(opt.split()[0])
     return opts
+
 
 syntax_rules += r'''
 <updateStatement> ::= "UPDATE" cf=<columnFamilyName>
@@ -964,7 +973,7 @@ def update_option_completer(ctxt, cass):
 @completer_for('assignment', 'updatecol')
 def update_col_completer(ctxt, cass):
     layout = get_table_meta(ctxt, cass)
-    return map(maybe_escape_name, regular_column_names(layout))
+    return list(map(maybe_escape_name, regular_column_names(layout)))
 
 
 @completer_for('assignment', 'update_rhs')
@@ -1106,7 +1115,7 @@ def delete_opt_completer(ctxt, cass):
 @completer_for('deleteSelector', 'delcol')
 def delete_delcol_completer(ctxt, cass):
     layout = get_table_meta(ctxt, cass)
-    return map(maybe_escape_name, regular_column_names(layout))
+    return list(map(maybe_escape_name, regular_column_names(layout)))
 
 
 syntax_rules += r'''
@@ -1131,6 +1140,7 @@ def batch_opt_completer(ctxt, cass):
         opts.discard(opt.split()[0])
     return opts
 
+
 syntax_rules += r'''
 <truncateStatement> ::= "TRUNCATE" ("COLUMNFAMILY" | "TABLE")? cf=<columnFamilyName>
                       ;
@@ -1149,6 +1159,7 @@ def create_ks_wat_completer(ctxt, cass):
     if ctxt.get_binding('partial', '') == '':
         return ['KEYSPACE']
     return ['KEYSPACE', 'SCHEMA']
+
 
 syntax_rules += r'''
 <createColumnFamilyStatement> ::= "CREATE" wat=( "COLUMNFAMILY" | "TABLE" ) ("IF" "NOT" "EXISTS")?
@@ -1185,7 +1196,7 @@ syntax_rules += r'''
 
 @completer_for('cfamOrdering', 'ordercol')
 def create_cf_clustering_order_colname_completer(ctxt, cass):
-    colnames = map(dequote_name, ctxt.get_binding('newcolname', ()))
+    colnames = list(map(dequote_name, ctxt.get_binding('newcolname', ())))
     # Definitely some of these aren't valid for ordering, but I'm not sure
     # precisely which are. This is good enough for now
     return colnames
@@ -1197,6 +1208,7 @@ def create_cf_wat_completer(ctxt, cass):
     if ctxt.get_binding('partial', '') == '':
         return ['TABLE']
     return ['TABLE', 'COLUMNFAMILY']
+
 
 explain_completion('createColumnFamilyStatement', 'cf', '<new_table_name>')
 explain_completion('compositeKeyCfSpec', 'newcolname', '<new_column_name>')
@@ -1214,7 +1226,7 @@ def create_cf_ks_dot_completer(ctxt, cass):
 def create_cf_pkdef_declaration_completer(ctxt, cass):
     cols_declared = ctxt.get_binding('newcolname')
     pieces_already = ctxt.get_binding('ptkey', ())
-    pieces_already = map(dequote_name, pieces_already)
+    pieces_already = list(map(dequote_name, pieces_already))
     while cols_declared[0] in pieces_already:
         cols_declared = cols_declared[1:]
         if len(cols_declared) < 2:
@@ -1226,7 +1238,7 @@ def create_cf_pkdef_declaration_completer(ctxt, cass):
 def create_cf_composite_key_declaration_completer(ctxt, cass):
     cols_declared = ctxt.get_binding('newcolname')
     pieces_already = ctxt.get_binding('ptkey', ()) + ctxt.get_binding('pkey', ())
-    pieces_already = map(dequote_name, pieces_already)
+    pieces_already = list(map(dequote_name, pieces_already))
     while cols_declared[0] in pieces_already:
         cols_declared = cols_declared[1:]
         if len(cols_declared) < 2:
@@ -1251,6 +1263,7 @@ def create_cf_composite_primary_key_comma_completer(ctxt, cass):
     if len(pieces_already) >= len(cols_declared) - 1:
         return ()
     return [',']
+
 
 syntax_rules += r'''
 
@@ -1311,9 +1324,10 @@ explain_completion('createUserTypeStatement', 'newcol', '<new_field_name>')
 def create_index_col_completer(ctxt, cass):
     """ Return the columns for which an index doesn't exist yet. """
     layout = get_table_meta(ctxt, cass)
-    idx_targets = [idx.index_options["target"] for idx in layout.indexes.itervalues()]
-    colnames = [cd.name for cd in layout.columns.values() if cd.name not in idx_targets]
-    return map(maybe_escape_name, colnames)
+    idx_targets = [idx.index_options["target"] for idx in layout.indexes.values()]
+    colnames = [cd.name for cd in list(layout.columns.values()) if cd.name not in idx_targets]
+    return list(map(maybe_escape_name, colnames))
+
 
 syntax_rules += r'''
 <dropKeyspaceStatement> ::= "DROP" "KEYSPACE" ("IF" "EXISTS")? ksname=<nonSystemKeyspaceName>
@@ -1370,7 +1384,8 @@ def idx_ks_idx_name_completer(ctxt, cass):
         if ks is None:
             return ()
         raise
-    return map(maybe_escape_name, idxnames)
+    return list(map(maybe_escape_name, idxnames))
+
 
 syntax_rules += r'''
 <alterTableStatement> ::= "ALTER" wat=( "COLUMNFAMILY" | "TABLE" ) cf=<columnFamilyName>
@@ -1397,14 +1412,15 @@ syntax_rules += r'''
 def alter_table_col_completer(ctxt, cass):
     layout = get_table_meta(ctxt, cass)
     cols = [str(md) for md in layout.columns]
-    return map(maybe_escape_name, cols)
+    return list(map(maybe_escape_name, cols))
 
 
 @completer_for('alterTypeInstructions', 'existcol')
 def alter_type_field_completer(ctxt, cass):
     layout = get_ut_layout(ctxt, cass)
     fields = [tuple[0] for tuple in layout]
-    return map(maybe_escape_name, fields)
+    return list(map(maybe_escape_name, fields))
+
 
 explain_completion('alterInstructions', 'newcol', '<new_column_name>')
 explain_completion('alterTypeInstructions', 'newcol', '<new_field_name>')
@@ -1455,6 +1471,8 @@ syntax_rules += r'''
                  | "OPTIONS" "=" <mapLiteral>
                  | "SUPERUSER" "=" <boolean>
                  | "LOGIN" "=" <boolean>
+                 | "ACCESS" "TO" "DATACENTERS" <setLiteral>
+                 | "ACCESS" "TO" "ALL" "DATACENTERS"
                  ;
 
 <dropRoleStatement> ::= "DROP" "ROLE" <rolename>
@@ -1538,7 +1556,7 @@ def username_name_completer(ctxt, cass):
         return [Hint('<username>')]
 
     session = cass.session
-    return [maybe_quote(row.values()[0].replace("'", "''")) for row in session.execute("LIST USERS")]
+    return [maybe_quote(list(row.values())[0].replace("'", "''")) for row in session.execute("LIST USERS")]
 
 
 @completer_for('rolename', 'role')
@@ -1554,6 +1572,7 @@ def rolename_completer(ctxt, cass):
 
     session = cass.session
     return [maybe_quote(row[0].replace("'", "''")) for row in session.execute("LIST ROLES")]
+
 
 syntax_rules += r'''
 <createTriggerStatement> ::= "CREATE" "TRIGGER" ( "IF" "NOT" "EXISTS" )? <cident>
@@ -1576,7 +1595,8 @@ def get_trigger_names(ctxt, cass):
 @completer_for('dropTriggerStatement', 'triggername')
 def drop_trigger_completer(ctxt, cass):
     names = get_trigger_names(ctxt, cass)
-    return map(maybe_escape_name, names)
+    return list(map(maybe_escape_name, names))
+
 
 # END SYNTAX/COMPLETION RULE DEFINITIONS
 

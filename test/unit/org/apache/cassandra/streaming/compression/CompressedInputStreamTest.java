@@ -21,23 +21,26 @@ import java.io.*;
 import java.util.*;
 
 import org.junit.BeforeClass;
+import org.junit.Rule;
 import org.junit.Test;
+import org.junit.rules.TemporaryFolder;
 
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.ClusteringComparator;
 import org.apache.cassandra.db.marshal.BytesType;
 import org.apache.cassandra.io.compress.CompressedSequentialWriter;
 import org.apache.cassandra.io.compress.CompressionMetadata;
+import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.io.util.DataInputPlus.DataInputStreamPlus;
+import org.apache.cassandra.io.util.FileUtils;
 import org.apache.cassandra.io.util.SequentialWriterOption;
 import org.apache.cassandra.schema.CompressionParams;
 import org.apache.cassandra.io.sstable.Component;
 import org.apache.cassandra.io.sstable.Descriptor;
 import org.apache.cassandra.io.sstable.metadata.MetadataCollector;
-import org.apache.cassandra.streaming.compress.CompressedInputStream;
-import org.apache.cassandra.streaming.compress.CompressionInfo;
+import org.apache.cassandra.db.streaming.CompressedInputStream;
+import org.apache.cassandra.db.streaming.CompressionInfo;
 import org.apache.cassandra.utils.ChecksumType;
-import org.apache.cassandra.utils.Pair;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.fail;
@@ -46,6 +49,9 @@ import static org.junit.Assert.fail;
  */
 public class CompressedInputStreamTest
 {
+    @Rule
+    public TemporaryFolder tempFolder = new TemporaryFolder();
+
     @BeforeClass
     public static void setupDD()
     {
@@ -108,7 +114,7 @@ public class CompressedInputStreamTest
         assert valuesToCheck != null && valuesToCheck.length > 0;
 
         // write compressed data file of longs
-        File parentDir = new File(System.getProperty("java.io.tmpdir"));
+        File parentDir = tempFolder.newFolder();
         Descriptor desc = new Descriptor(parentDir, "ks", "cf", 1);
         File tmp = new File(desc.filenameFor(Component.DATA));
         MetadataCollector collector = new MetadataCollector(new ClusteringComparator(BytesType.instance));
@@ -129,11 +135,11 @@ public class CompressedInputStreamTest
         }
 
         CompressionMetadata comp = CompressionMetadata.create(tmp.getAbsolutePath());
-        List<Pair<Long, Long>> sections = new ArrayList<>();
+        List<SSTableReader.PartitionPositionBounds> sections = new ArrayList<>();
         for (long l : valuesToCheck)
         {
             long position = index.get(l);
-            sections.add(Pair.create(position, position + 8));
+            sections.add(new SSTableReader.PartitionPositionBounds(position, position + 8));
         }
         CompressionMetadata.Chunk[] chunks = comp.getChunksForSections(sections);
         long totalSize = comp.getTotalSizeForSections(sections);
@@ -179,14 +185,14 @@ public class CompressedInputStreamTest
         {
             for (int i = 0; i < sections.size(); i++)
             {
-                input.position(sections.get(i).left);
+                input.position(sections.get(i).lowerPosition);
                 long readValue = in.readLong();
                 assertEquals("expected " + valuesToCheck[i] + " but was " + readValue, valuesToCheck[i], readValue);
             }
         }
     }
 
-    private static void testException(List<Pair<Long, Long>> sections, CompressionInfo info) throws IOException
+    private static void testException(List<SSTableReader.PartitionPositionBounds> sections, CompressionInfo info) throws IOException
     {
         CompressedInputStream input = new CompressedInputStream(new DataInputStreamPlus(new ByteArrayInputStream(new byte[0])), info, ChecksumType.CRC32, () -> 1.0);
 
@@ -195,7 +201,7 @@ public class CompressedInputStreamTest
             for (int i = 0; i < sections.size(); i++)
             {
                 try {
-                    input.position(sections.get(i).left);
+                    input.position(sections.get(i).lowerPosition);
                     in.readLong();
                     fail("Should have thrown IOException");
                 }

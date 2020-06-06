@@ -20,6 +20,7 @@ package org.apache.cassandra.cql3.statements;
 import java.nio.ByteBuffer;
 import java.util.*;
 
+import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Iterables;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -28,7 +29,6 @@ import org.apache.cassandra.auth.Permission;
 import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.schema.Schema;
 import org.apache.cassandra.schema.TableMetadata;
-import org.apache.cassandra.schema.ColumnMetadata.Raw;
 import org.apache.cassandra.schema.ViewMetadata;
 import org.apache.cassandra.cql3.*;
 import org.apache.cassandra.cql3.conditions.ColumnCondition;
@@ -53,6 +53,7 @@ import org.apache.cassandra.service.paxos.Commit;
 import org.apache.cassandra.transport.messages.ResultMessage;
 import org.apache.cassandra.triggers.TriggerExecutor;
 import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.MD5Digest;
 import org.apache.cassandra.utils.Pair;
 import org.apache.cassandra.utils.UUIDGen;
 
@@ -66,6 +67,8 @@ public abstract class ModificationStatement implements CQLStatement
 {
     protected static final Logger logger = LoggerFactory.getLogger(ModificationStatement.class);
 
+    private final static MD5Digest EMPTY_HASH = MD5Digest.wrap(new byte[] {});
+
     public static final String CUSTOM_EXPRESSIONS_NOT_ALLOWED =
         "Custom index expressions cannot be used in WHERE clauses for UPDATE or DELETE statements";
 
@@ -73,7 +76,8 @@ public abstract class ModificationStatement implements CQLStatement
 
     protected final StatementType type;
 
-    private final int boundTerms;
+    protected final VariableSpecifications bindVariables;
+
     public final TableMetadata metadata;
     private final Attributes attrs;
 
@@ -90,7 +94,7 @@ public abstract class ModificationStatement implements CQLStatement
     private final RegularAndStaticColumns requiresRead;
 
     public ModificationStatement(StatementType type,
-                                 int boundTerms,
+                                 VariableSpecifications bindVariables,
                                  TableMetadata metadata,
                                  Operations operations,
                                  StatementRestrictions restrictions,
@@ -98,7 +102,7 @@ public abstract class ModificationStatement implements CQLStatement
                                  Attributes attrs)
     {
         this.type = type;
-        this.boundTerms = boundTerms;
+        this.bindVariables = bindVariables;
         this.metadata = metadata;
         this.restrictions = restrictions;
         this.operations = operations;
@@ -143,6 +147,19 @@ public abstract class ModificationStatement implements CQLStatement
         this.requiresRead = requiresReadBuilder.build();
     }
 
+    @Override
+    public List<ColumnSpecification> getBindVariables()
+    {
+        return bindVariables.getBindVariables();
+    }
+
+    @Override
+    public short[] getPartitionKeyBindVariableIndexes()
+    {
+        return bindVariables.getPartitionKeyBindVariableIndexes(metadata);
+    }
+
+    @Override
     public Iterable<Function> getFunctions()
     {
         List<Function> functions = new ArrayList<>();
@@ -171,14 +188,9 @@ public abstract class ModificationStatement implements CQLStatement
         return restrictions;
     }
 
-    public abstract void addUpdateForKey(PartitionUpdate update, Clustering clustering, UpdateParameters params);
+    public abstract void addUpdateForKey(PartitionUpdate.Builder updateBuilder, Clustering clustering, UpdateParameters params);
 
-    public abstract void addUpdateForKey(PartitionUpdate update, Slice slice, UpdateParameters params);
-
-    public int getBoundTerms()
-    {
-        return boundTerms;
-    }
+    public abstract void addUpdateForKey(PartitionUpdate.Builder updateBuilder, Slice slice, UpdateParameters params);
 
     public String keyspace()
     {
@@ -200,6 +212,11 @@ public abstract class ModificationStatement implements CQLStatement
         return metadata().isView();
     }
 
+    public boolean isVirtual()
+    {
+        return metadata().isVirtual();
+    }
+
     public long getTimestamp(long now, QueryOptions options) throws InvalidRequestException
     {
         return attrs.getTimestamp(now, options);
@@ -212,31 +229,31 @@ public abstract class ModificationStatement implements CQLStatement
 
     public int getTimeToLive(QueryOptions options) throws InvalidRequestException
     {
-        return attrs.getTimeToLive(options, metadata().params.defaultTimeToLive);
+        return attrs.getTimeToLive(options, metadata);
     }
 
-    public void checkAccess(ClientState state) throws InvalidRequestException, UnauthorizedException
+    public void authorize(ClientState state) throws InvalidRequestException, UnauthorizedException
     {
-        state.hasColumnFamilyAccess(metadata, Permission.MODIFY);
+        state.ensureTablePermission(metadata, Permission.MODIFY);
 
         // CAS updates can be used to simulate a SELECT query, so should require Permission.SELECT as well.
         if (hasConditions())
-            state.hasColumnFamilyAccess(metadata, Permission.SELECT);
+            state.ensureTablePermission(metadata, Permission.SELECT);
 
         // MV updates need to get the current state from the table, and might update the views
         // Require Permission.SELECT on the base table, and Permission.MODIFY on the views
         Iterator<ViewMetadata> views = View.findAll(keyspace(), columnFamily()).iterator();
         if (views.hasNext())
         {
-            state.hasColumnFamilyAccess(metadata, Permission.SELECT);
+            state.ensureTablePermission(metadata, Permission.SELECT);
             do
             {
-                state.hasColumnFamilyAccess(views.next().metadata, Permission.MODIFY);
+                state.ensureTablePermission(views.next().metadata, Permission.MODIFY);
             } while (views.hasNext());
         }
 
         for (Function function : getFunctions())
-            state.ensureHasPermission(Permission.EXECUTE, function);
+            state.ensurePermission(Permission.EXECUTE, function);
     }
 
     public void validate(ClientState state) throws InvalidRequestException
@@ -245,6 +262,8 @@ public abstract class ModificationStatement implements CQLStatement
         checkFalse(isCounter() && attrs.isTimestampSet(), "Cannot provide custom timestamp for counter updates");
         checkFalse(isCounter() && attrs.isTimeToLiveSet(), "Cannot provide custom TTL for counter updates");
         checkFalse(isView(), "Cannot directly modify a materialized view");
+        checkFalse(isVirtual() && attrs.isTimeToLiveSet(), "Expiring columns are not supported by virtual tables");
+        checkFalse(isVirtual() && hasConditions(), "Conditional updates are not supported by virtual tables");
     }
 
     public RegularAndStaticColumns updatedColumns()
@@ -356,6 +375,7 @@ public abstract class ModificationStatement implements CQLStatement
                                                            DataLimits limits,
                                                            boolean local,
                                                            ConsistencyLevel cl,
+                                                           int nowInSeconds,
                                                            long queryStartNanoTime)
     {
         if (!requiresRead())
@@ -371,10 +391,9 @@ public abstract class ModificationStatement implements CQLStatement
         }
 
         List<SinglePartitionReadCommand> commands = new ArrayList<>(partitionKeys.size());
-        int nowInSec = FBUtilities.nowInSeconds();
         for (ByteBuffer key : partitionKeys)
             commands.add(SinglePartitionReadCommand.create(metadata(),
-                                                           nowInSec,
+                                                           nowInSeconds,
                                                            ColumnFilter.selection(this.requiresRead),
                                                            RowFilter.NONE,
                                                            limits,
@@ -437,21 +456,28 @@ public abstract class ModificationStatement implements CQLStatement
     private ResultMessage executeWithoutCondition(QueryState queryState, QueryOptions options, long queryStartNanoTime)
     throws RequestExecutionException, RequestValidationException
     {
+        if (isVirtual())
+            return executeInternalWithoutCondition(queryState, options, queryStartNanoTime);
+
         ConsistencyLevel cl = options.getConsistency();
         if (isCounter())
             cl.validateCounterForWrite(metadata());
         else
             cl.validateForWrite(metadata.keyspace);
 
-        Collection<? extends IMutation> mutations = getMutations(options, false, options.getTimestamp(queryState), queryStartNanoTime);
+        List<? extends IMutation> mutations =
+            getMutations(options,
+                         false,
+                         options.getTimestamp(queryState),
+                         options.getNowInSeconds(queryState),
+                         queryStartNanoTime);
         if (!mutations.isEmpty())
             StorageProxy.mutateWithTriggers(mutations, cl, false, queryStartNanoTime);
 
         return null;
     }
 
-    public ResultMessage executeWithCondition(QueryState queryState, QueryOptions options, long queryStartNanoTime)
-    throws RequestExecutionException, RequestValidationException
+    private ResultMessage executeWithCondition(QueryState queryState, QueryOptions options, long queryStartNanoTime)
     {
         CQL3CasRequest request = makeCasRequest(queryState, options);
 
@@ -462,9 +488,10 @@ public abstract class ModificationStatement implements CQLStatement
                                                    options.getSerialConsistency(),
                                                    options.getConsistency(),
                                                    queryState.getClientState(),
+                                                   options.getNowInSeconds(queryState),
                                                    queryStartNanoTime))
         {
-            return new ResultMessage.Rows(buildCasResultSet(result, options));
+            return new ResultMessage.Rows(buildCasResultSet(result, queryState, options));
         }
     }
 
@@ -477,17 +504,18 @@ public abstract class ModificationStatement implements CQLStatement
                    type.isUpdate()? "updates" : "deletions");
 
         DecoratedKey key = metadata().partitioner.decorateKey(keys.get(0));
-        long now = options.getTimestamp(queryState);
+        long timestamp = options.getTimestamp(queryState);
+        int nowInSeconds = options.getNowInSeconds(queryState);
 
         checkFalse(restrictions.clusteringKeyRestrictionsHasIN(),
                    "IN on the clustering key columns is not supported with conditional %s",
                     type.isUpdate()? "updates" : "deletions");
 
         Clustering clustering = Iterables.getOnlyElement(createClustering(options));
-        CQL3CasRequest request = new CQL3CasRequest(metadata(), key, false, conditionColumns(), updatesRegularRows(), updatesStaticRow());
+        CQL3CasRequest request = new CQL3CasRequest(metadata(), key, conditionColumns(), updatesRegularRows(), updatesStaticRow());
 
         addConditions(clustering, request, options);
-        request.addRowUpdate(clustering, this, options, now);
+        request.addRowUpdate(clustering, this, options, timestamp, nowInSeconds);
 
         return request;
     }
@@ -497,22 +525,39 @@ public abstract class ModificationStatement implements CQLStatement
         conditions.addConditionsTo(request, clustering, options);
     }
 
-    private ResultSet buildCasResultSet(RowIterator partition, QueryOptions options) throws InvalidRequestException
+    private static ResultSet.ResultMetadata buildCASSuccessMetadata(String ksName, String cfName)
     {
-        return buildCasResultSet(keyspace(), columnFamily(), partition, getColumnsWithConditions(), false, options);
+        List<ColumnSpecification> specs = new ArrayList<>();
+        specs.add(casResultColumnSpecification(ksName, cfName));
+
+        return new ResultSet.ResultMetadata(EMPTY_HASH, specs);
     }
 
-    public static ResultSet buildCasResultSet(String ksName, String tableName, RowIterator partition, Iterable<ColumnMetadata> columnsWithConditions, boolean isBatch, QueryOptions options)
-    throws InvalidRequestException
+    private static ColumnSpecification casResultColumnSpecification(String ksName, String cfName)
+    {
+        return new ColumnSpecification(ksName, cfName, CAS_RESULT_COLUMN, BooleanType.instance);
+    }
+
+    private ResultSet buildCasResultSet(RowIterator partition, QueryState state, QueryOptions options)
+    {
+        return buildCasResultSet(keyspace(), columnFamily(), partition, getColumnsWithConditions(), false, state, options);
+    }
+
+    static ResultSet buildCasResultSet(String ksName,
+                                       String tableName,
+                                       RowIterator partition,
+                                       Iterable<ColumnMetadata> columnsWithConditions,
+                                       boolean isBatch,
+                                       QueryState state,
+                                       QueryOptions options)
     {
         boolean success = partition == null;
 
-        ColumnSpecification spec = new ColumnSpecification(ksName, tableName, CAS_RESULT_COLUMN, BooleanType.instance);
-        ResultSet.ResultMetadata metadata = new ResultSet.ResultMetadata(Collections.singletonList(spec));
+        ResultSet.ResultMetadata metadata = buildCASSuccessMetadata(ksName, tableName);
         List<List<ByteBuffer>> rows = Collections.singletonList(Collections.singletonList(BooleanType.instance.decompose(success)));
 
         ResultSet rs = new ResultSet(metadata, rows);
-        return success ? rs : merge(rs, buildCasFailureResultSet(partition, columnsWithConditions, isBatch, options));
+        return success ? rs : merge(rs, buildCasFailureResultSet(partition, columnsWithConditions, isBatch, options, options.getNowInSeconds(state)));
     }
 
     private static ResultSet merge(ResultSet left, ResultSet right)
@@ -535,11 +580,14 @@ public abstract class ModificationStatement implements CQLStatement
             row.addAll(right.rows.get(i));
             rows.add(row);
         }
-        return new ResultSet(new ResultSet.ResultMetadata(specs), rows);
+        return new ResultSet(new ResultSet.ResultMetadata(EMPTY_HASH, specs), rows);
     }
 
-    private static ResultSet buildCasFailureResultSet(RowIterator partition, Iterable<ColumnMetadata> columnsWithConditions, boolean isBatch, QueryOptions options)
-    throws InvalidRequestException
+    private static ResultSet buildCasFailureResultSet(RowIterator partition,
+                                                      Iterable<ColumnMetadata> columnsWithConditions,
+                                                      boolean isBatch,
+                                                      QueryOptions options,
+                                                      int nowInSeconds)
     {
         TableMetadata metadata = partition.metadata();
         Selection selection;
@@ -563,42 +611,44 @@ public abstract class ModificationStatement implements CQLStatement
 
         Selectors selectors = selection.newSelectors(options);
         ResultSetBuilder builder = new ResultSetBuilder(selection.getResultMetadata(), selectors);
-        SelectStatement.forSelection(metadata, selection).processPartition(partition,
-                                                                      options,
-                                                                      builder,
-                                                                      FBUtilities.nowInSeconds());
+        SelectStatement.forSelection(metadata, selection)
+                       .processPartition(partition, options, builder, nowInSeconds);
 
         return builder.build();
     }
 
-    public ResultMessage executeInternal(QueryState queryState, QueryOptions options) throws RequestValidationException, RequestExecutionException
+    public ResultMessage executeLocally(QueryState queryState, QueryOptions options) throws RequestValidationException, RequestExecutionException
     {
         return hasConditions()
                ? executeInternalWithCondition(queryState, options)
                : executeInternalWithoutCondition(queryState, options, System.nanoTime());
     }
 
-    public ResultMessage executeInternalWithoutCondition(QueryState queryState, QueryOptions options, long queryStartNanoTime) throws RequestValidationException, RequestExecutionException
+    public ResultMessage executeInternalWithoutCondition(QueryState queryState, QueryOptions options, long queryStartNanoTime)
+    throws RequestValidationException, RequestExecutionException
     {
-        for (IMutation mutation : getMutations(options, true, queryState.getTimestamp(), queryStartNanoTime))
+        long timestamp = options.getTimestamp(queryState);
+        int nowInSeconds = options.getNowInSeconds(queryState);
+        for (IMutation mutation : getMutations(options, true, timestamp, nowInSeconds, queryStartNanoTime))
             mutation.apply();
         return null;
     }
 
-    public ResultMessage executeInternalWithCondition(QueryState state, QueryOptions options) throws RequestValidationException, RequestExecutionException
+    public ResultMessage executeInternalWithCondition(QueryState state, QueryOptions options)
     {
         CQL3CasRequest request = makeCasRequest(state, options);
-        try (RowIterator result = casInternal(request, state))
+
+        try (RowIterator result = casInternal(request, options.getTimestamp(state), options.getNowInSeconds(state)))
         {
-            return new ResultMessage.Rows(buildCasResultSet(result, options));
+            return new ResultMessage.Rows(buildCasResultSet(result, state, options));
         }
     }
 
-    static RowIterator casInternal(CQL3CasRequest request, QueryState state)
+    static RowIterator casInternal(CQL3CasRequest request, long timestamp, int nowInSeconds)
     {
-        UUID ballot = UUIDGen.getTimeUUIDFromMicros(state.getTimestamp());
+        UUID ballot = UUIDGen.getTimeUUIDFromMicros(timestamp);
 
-        SinglePartitionReadCommand readCommand = request.readCommand(FBUtilities.nowInSeconds());
+        SinglePartitionReadQuery readCommand = request.readCommand(nowInSeconds);
         FilteredPartition current;
         try (ReadExecutionController executionController = readCommand.executionController();
              PartitionIterator iter = readCommand.executeInternal(executionController))
@@ -622,23 +672,26 @@ public abstract class ModificationStatement implements CQLStatement
      *
      * @param options value for prepared statement markers
      * @param local if true, any requests (for collections) performed by getMutation should be done locally only.
-     * @param now the current timestamp in microseconds to use if no timestamp is user provided.
+     * @param timestamp the current timestamp in microseconds to use if no timestamp is user provided.
      *
      * @return list of the mutations
      */
-    private Collection<? extends IMutation> getMutations(QueryOptions options, boolean local, long now, long queryStartNanoTime)
+    private List<? extends IMutation> getMutations(QueryOptions options,
+                                                         boolean local,
+                                                         long timestamp,
+                                                         int nowInSeconds,
+                                                         long queryStartNanoTime)
     {
-        UpdatesCollector collector = new UpdatesCollector(Collections.singletonMap(metadata.id, updatedColumns), 1);
-        addUpdates(collector, options, local, now, queryStartNanoTime);
-        collector.validateIndexedColumns();
-
+        UpdatesCollector collector = new SingleTableUpdatesCollector(metadata, updatedColumns, 1);
+        addUpdates(collector, options, local, timestamp, nowInSeconds, queryStartNanoTime);
         return collector.toMutations();
     }
 
     final void addUpdates(UpdatesCollector collector,
                           QueryOptions options,
                           boolean local,
-                          long now,
+                          long timestamp,
+                          int nowInSeconds,
                           long queryStartNanoTime)
     {
         List<ByteBuffer> keys = buildPartitionKeyNames(options);
@@ -656,17 +709,18 @@ public abstract class ModificationStatement implements CQLStatement
                                                            options,
                                                            DataLimits.NONE,
                                                            local,
-                                                           now,
+                                                           timestamp,
+                                                           nowInSeconds,
                                                            queryStartNanoTime);
             for (ByteBuffer key : keys)
             {
                 Validation.validateKey(metadata(), key);
                 DecoratedKey dk = metadata().partitioner.decorateKey(key);
 
-                PartitionUpdate upd = collector.getPartitionUpdate(metadata(), dk, options.getConsistency());
+                PartitionUpdate.Builder updateBuilder = collector.getPartitionUpdateBuilder(metadata(), dk, options.getConsistency());
 
                 for (Slice slice : slices)
-                    addUpdateForKey(upd, slice, params);
+                    addUpdateForKey(updateBuilder, slice, params);
             }
         }
         else
@@ -677,32 +731,31 @@ public abstract class ModificationStatement implements CQLStatement
             if (restrictions.hasClusteringColumnsRestrictions() && clusterings.isEmpty())
                 return;
 
-            UpdateParameters params = makeUpdateParameters(keys, clusterings, options, local, now, queryStartNanoTime);
+            UpdateParameters params = makeUpdateParameters(keys, clusterings, options, local, timestamp, nowInSeconds, queryStartNanoTime);
 
             for (ByteBuffer key : keys)
             {
                 Validation.validateKey(metadata(), key);
                 DecoratedKey dk = metadata().partitioner.decorateKey(key);
 
-                PartitionUpdate upd = collector.getPartitionUpdate(metadata, dk, options.getConsistency());
+                PartitionUpdate.Builder updateBuilder = collector.getPartitionUpdateBuilder(metadata(), dk, options.getConsistency());
 
                 if (!restrictions.hasClusteringColumnsRestrictions())
                 {
-                    addUpdateForKey(upd, Clustering.EMPTY, params);
+                    addUpdateForKey(updateBuilder, Clustering.EMPTY, params);
                 }
                 else
                 {
                     for (Clustering clustering : clusterings)
                     {
-                       for (ByteBuffer c : clustering.getRawValues())
-                       {
-                           if (c != null && c.remaining() > FBUtilities.MAX_UNSIGNED_SHORT)
-                               throw new InvalidRequestException(String.format("Key length of %d is longer than maximum of %d",
-                                                                               clustering.dataSize(),
-                                                                               FBUtilities.MAX_UNSIGNED_SHORT));
-                       }
-
-                        addUpdateForKey(upd, clustering, params);
+                        for (ByteBuffer c : clustering.getRawValues())
+                        {
+                            if (c != null && c.remaining() > FBUtilities.MAX_UNSIGNED_SHORT)
+                                throw new InvalidRequestException(String.format("Key length of %d is longer than maximum of %d",
+                                                                                clustering.dataSize(),
+                                                                                FBUtilities.MAX_UNSIGNED_SHORT));
+                        }
+                        addUpdateForKey(updateBuilder, clustering, params);
                     }
                 }
             }
@@ -721,7 +774,8 @@ public abstract class ModificationStatement implements CQLStatement
                                                   NavigableSet<Clustering> clusterings,
                                                   QueryOptions options,
                                                   boolean local,
-                                                  long now,
+                                                  long timestamp,
+                                                  int nowInSeconds,
                                                   long queryStartNanoTime)
     {
         if (clusterings.contains(Clustering.STATIC_CLUSTERING))
@@ -730,7 +784,8 @@ public abstract class ModificationStatement implements CQLStatement
                                         options,
                                         DataLimits.cqlLimits(1),
                                         local,
-                                        now,
+                                        timestamp,
+                                        nowInSeconds,
                                         queryStartNanoTime);
 
         return makeUpdateParameters(keys,
@@ -738,7 +793,8 @@ public abstract class ModificationStatement implements CQLStatement
                                     options,
                                     DataLimits.NONE,
                                     local,
-                                    now,
+                                    timestamp,
+                                    nowInSeconds,
                                     queryStartNanoTime);
     }
 
@@ -747,12 +803,27 @@ public abstract class ModificationStatement implements CQLStatement
                                                   QueryOptions options,
                                                   DataLimits limits,
                                                   boolean local,
-                                                  long now,
+                                                  long timestamp,
+                                                  int nowInSeconds,
                                                   long queryStartNanoTime)
     {
         // Some lists operation requires reading
-        Map<DecoratedKey, Partition> lists = readRequiredLists(keys, filter, limits, local, options.getConsistency(), queryStartNanoTime);
-        return new UpdateParameters(metadata(), updatedColumns(), options, getTimestamp(now, options), getTimeToLive(options), lists);
+        Map<DecoratedKey, Partition> lists =
+            readRequiredLists(keys,
+                              filter,
+                              limits,
+                              local,
+                              options.getConsistency(),
+                              nowInSeconds,
+                              queryStartNanoTime);
+
+        return new UpdateParameters(metadata(),
+                                    updatedColumns(),
+                                    options,
+                                    getTimestamp(timestamp, options),
+                                    nowInSeconds,
+                                    getTimeToLive(options),
+                                    lists);
     }
 
     private Slices toSlices(SortedSet<ClusteringBound> startBounds, SortedSet<ClusteringBound> endBounds)
@@ -776,7 +847,7 @@ public abstract class ModificationStatement implements CQLStatement
         return builder.build();
     }
 
-    public static abstract class Parsed extends CFStatement
+    public static abstract class Parsed extends QualifiedStatement
     {
         protected final StatementType type;
         private final Attributes.Raw attrs;
@@ -784,7 +855,7 @@ public abstract class ModificationStatement implements CQLStatement
         private final boolean ifNotExists;
         private final boolean ifExists;
 
-        protected Parsed(CFName name,
+        protected Parsed(QualifiedName name,
                          StatementType type,
                          Attributes.Raw attrs,
                          List<Pair<ColumnMetadata.Raw, ColumnCondition.Raw>> conditions,
@@ -794,39 +865,36 @@ public abstract class ModificationStatement implements CQLStatement
             super(name);
             this.type = type;
             this.attrs = attrs;
-            this.conditions = conditions == null ? Collections.<Pair<ColumnMetadata.Raw, ColumnCondition.Raw>>emptyList() : conditions;
+            this.conditions = conditions == null ? Collections.emptyList() : conditions;
             this.ifNotExists = ifNotExists;
             this.ifExists = ifExists;
         }
 
-        public ParsedStatement.Prepared prepare()
+        public ModificationStatement prepare(ClientState state)
         {
-            VariableSpecifications boundNames = getBoundVariables();
-            ModificationStatement statement = prepare(boundNames);
-            TableMetadata metadata = Schema.instance.validateTable(keyspace(), columnFamily());
-            return new ParsedStatement.Prepared(statement, boundNames, boundNames.getPartitionKeyBindIndexes(metadata));
+            return prepare(bindVariables);
         }
 
-        public ModificationStatement prepare(VariableSpecifications boundNames)
+        public ModificationStatement prepare(VariableSpecifications bindVariables)
         {
-            TableMetadata metadata = Schema.instance.validateTable(keyspace(), columnFamily());
+            TableMetadata metadata = Schema.instance.validateTable(keyspace(), name());
 
-            Attributes preparedAttributes = attrs.prepare(keyspace(), columnFamily());
-            preparedAttributes.collectMarkerSpecification(boundNames);
+            Attributes preparedAttributes = attrs.prepare(keyspace(), name());
+            preparedAttributes.collectMarkerSpecification(bindVariables);
 
-            Conditions preparedConditions = prepareConditions(metadata, boundNames);
+            Conditions preparedConditions = prepareConditions(metadata, bindVariables);
 
-            return prepareInternal(metadata, boundNames, preparedConditions, preparedAttributes);
+            return prepareInternal(metadata, bindVariables, preparedConditions, preparedAttributes);
         }
 
         /**
          * Returns the column conditions.
          *
          * @param metadata the column family meta data
-         * @param boundNames the bound names
+         * @param bindVariables the bound names
          * @return the column conditions.
          */
-        private Conditions prepareConditions(TableMetadata metadata, VariableSpecifications boundNames)
+        private Conditions prepareConditions(TableMetadata metadata, VariableSpecifications bindVariables)
         {
             // To have both 'IF EXISTS'/'IF NOT EXISTS' and some other conditions doesn't make sense.
             // So far this is enforced by the parser, but let's assert it for sanity if ever the parse changes.
@@ -847,17 +915,17 @@ public abstract class ModificationStatement implements CQLStatement
             if (conditions.isEmpty())
                 return Conditions.EMPTY_CONDITION;
 
-            return prepareColumnConditions(metadata, boundNames);
+            return prepareColumnConditions(metadata, bindVariables);
         }
 
         /**
          * Returns the column conditions.
          *
          * @param metadata the column family meta data
-         * @param boundNames the bound names
+         * @param bindVariables the bound names
          * @return the column conditions.
          */
-        private ColumnConditions prepareColumnConditions(TableMetadata metadata, VariableSpecifications boundNames)
+        private ColumnConditions prepareColumnConditions(TableMetadata metadata, VariableSpecifications bindVariables)
         {
             checkNull(attrs.timestamp, "Cannot provide custom timestamp for conditional updates");
 
@@ -867,7 +935,7 @@ public abstract class ModificationStatement implements CQLStatement
             {
                 ColumnMetadata def = entry.left.prepare(metadata);
                 ColumnCondition condition = entry.right.prepare(keyspace(), def, metadata);
-                condition.collectMarkerSpecification(boundNames);
+                condition.collectMarkerSpecification(bindVariables);
 
                 checkFalse(def.isPrimaryKeyColumn(), "PRIMARY KEY column '%s' cannot have IF conditions", def.name);
                 builder.add(condition);
@@ -876,7 +944,7 @@ public abstract class ModificationStatement implements CQLStatement
         }
 
         protected abstract ModificationStatement prepareInternal(TableMetadata metadata,
-                                                                 VariableSpecifications boundNames,
+                                                                 VariableSpecifications bindVariables,
                                                                  Conditions conditions,
                                                                  Attributes attrs);
 
@@ -910,9 +978,19 @@ public abstract class ModificationStatement implements CQLStatement
          * @param rawId the raw <code>ColumnIdentifier</code>
          * @return the <code>ColumnMetadata</code> corresponding to the specified raw <code>ColumnIdentifier</code>
          */
-        protected static ColumnMetadata getColumnDefinition(TableMetadata metadata, Raw rawId)
+        protected static ColumnMetadata getColumnDefinition(TableMetadata metadata, ColumnMetadata.Raw rawId)
         {
             return rawId.prepare(metadata);
+        }
+
+        public List<Pair<ColumnMetadata.Raw, ColumnCondition.Raw>> getConditions()
+        {
+            ImmutableList.Builder<Pair<ColumnMetadata.Raw, ColumnCondition.Raw>> builder = ImmutableList.builderWithExpectedSize(conditions.size());
+
+            for (Pair<ColumnMetadata.Raw, ColumnCondition.Raw> condition : conditions)
+                builder.add(Pair.create(condition.left, condition.right));
+
+            return builder.build();
         }
     }
 }

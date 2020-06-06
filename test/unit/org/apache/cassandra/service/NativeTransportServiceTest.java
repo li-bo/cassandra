@@ -18,8 +18,8 @@
 package org.apache.cassandra.service;
 
 import java.util.Arrays;
+import java.util.function.BooleanSupplier;
 import java.util.function.Consumer;
-import java.util.function.Supplier;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 
@@ -47,7 +47,7 @@ public class NativeTransportServiceTest
     @After
     public void resetConfig()
     {
-        DatabaseDescriptor.getClientEncryptionOptions().enabled = false;
+        DatabaseDescriptor.updateNativeProtocolEncryptionOptions(options -> options.withEnabled(false));
         DatabaseDescriptor.setNativeTransportPortSSL(null);
     }
 
@@ -84,12 +84,11 @@ public class NativeTransportServiceTest
     public void testDestroy()
     {
         withService((NativeTransportService service) -> {
-            Supplier<Boolean> allTerminated = () ->
-                                              service.getWorkerGroup().isShutdown() && service.getWorkerGroup().isTerminated() &&
-                                              service.getEventExecutor().isShutdown() && service.getEventExecutor().isTerminated();
-            assertFalse(allTerminated.get());
+            BooleanSupplier allTerminated = () ->
+                                            service.getWorkerGroup().isShutdown() && service.getWorkerGroup().isTerminated();
+            assertFalse(allTerminated.getAsBoolean());
             service.destroy();
-            assertTrue(allTerminated.get());
+            assertTrue(allTerminated.getAsBoolean());
         });
     }
 
@@ -128,8 +127,8 @@ public class NativeTransportServiceTest
     public void testSSLOnly()
     {
         // default ssl settings: client encryption enabled and default native transport port used for ssl only
-        DatabaseDescriptor.getClientEncryptionOptions().enabled = true;
-        DatabaseDescriptor.getClientEncryptionOptions().optional = false;
+        DatabaseDescriptor.updateNativeProtocolEncryptionOptions(options -> options.withEnabled(true)
+                                                                                   .withOptional(false));
 
         withService((NativeTransportService service) ->
                     {
@@ -145,8 +144,8 @@ public class NativeTransportServiceTest
     public void testSSLOptional()
     {
         // default ssl settings: client encryption enabled and default native transport port used for optional ssl
-        DatabaseDescriptor.getClientEncryptionOptions().enabled = true;
-        DatabaseDescriptor.getClientEncryptionOptions().optional = true;
+        DatabaseDescriptor.updateNativeProtocolEncryptionOptions(options -> options.withEnabled(true)
+                                                                                   .withOptional(true));
 
         withService((NativeTransportService service) ->
                     {
@@ -162,7 +161,7 @@ public class NativeTransportServiceTest
     public void testSSLWithNonSSL()
     {
         // ssl+non-ssl settings: client encryption enabled and additional ssl port specified
-        DatabaseDescriptor.getClientEncryptionOptions().enabled = true;
+        DatabaseDescriptor.updateNativeProtocolEncryptionOptions(options -> options.withEnabled(true));
         DatabaseDescriptor.setNativeTransportPortSSL(8432);
 
         withService((NativeTransportService service) ->

@@ -29,11 +29,10 @@ import com.google.common.collect.Iterables;
 import com.google.common.util.concurrent.MoreExecutors;
 
 import com.github.benmanes.caffeine.cache.*;
-import com.codahale.metrics.Timer;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.io.sstable.CorruptSSTableException;
 import org.apache.cassandra.io.util.*;
-import org.apache.cassandra.metrics.CacheMissMetrics;
+import org.apache.cassandra.metrics.ChunkCacheMetrics;
 import org.apache.cassandra.utils.memory.BufferPool;
 
 public class ChunkCache
@@ -41,12 +40,13 @@ public class ChunkCache
 {
     public static final int RESERVED_POOL_SPACE_IN_MB = 32;
     public static final long cacheSize = 1024L * 1024L * Math.max(0, DatabaseDescriptor.getFileCacheSizeInMB() - RESERVED_POOL_SPACE_IN_MB);
+    public static final boolean roundUp = DatabaseDescriptor.getFileCacheRoundUp();
 
     private static boolean enabled = cacheSize > 0;
     public static final ChunkCache instance = enabled ? new ChunkCache() : null;
 
     private final LoadingCache<Key, Buffer> cache;
-    public final CacheMissMetrics metrics;
+    public final ChunkCacheMetrics metrics;
 
     static class Key
     {
@@ -134,29 +134,25 @@ public class ChunkCache
         }
     }
 
-    public ChunkCache()
+    private ChunkCache()
     {
+        metrics = new ChunkCacheMetrics(this);
         cache = Caffeine.newBuilder()
-                .maximumWeight(cacheSize)
-                .executor(MoreExecutors.directExecutor())
-                .weigher((key, buffer) -> ((Buffer) buffer).buffer.capacity())
-                .removalListener(this)
-                .build(this);
-        metrics = new CacheMissMetrics("ChunkCache", this);
+                        .maximumWeight(cacheSize)
+                        .executor(MoreExecutors.directExecutor())
+                        .weigher((key, buffer) -> ((Buffer) buffer).buffer.capacity())
+                        .removalListener(this)
+                        .recordStats(() -> metrics)
+                        .build(this);
     }
 
     @Override
-    public Buffer load(Key key) throws Exception
+    public Buffer load(Key key)
     {
-        ChunkReader rebufferer = key.file;
-        metrics.misses.mark();
-        try (Timer.Context ctx = metrics.missLatency.time())
-        {
-            ByteBuffer buffer = BufferPool.get(key.file.chunkSize(), key.file.preferredBufferType());
-            assert buffer != null;
-            rebufferer.readChunk(key.position, buffer);
-            return new Buffer(buffer, key.position);
-        }
+        ByteBuffer buffer = BufferPool.get(key.file.chunkSize(), key.file.preferredBufferType());
+        assert buffer != null;
+        key.file.readChunk(key.position, buffer);
+        return new Buffer(buffer, key.position);
     }
 
     @Override
@@ -219,7 +215,7 @@ public class ChunkCache
         {
             source = file;
             int chunkSize = file.chunkSize();
-            assert Integer.bitCount(chunkSize) == 1;    // Must be power of two
+            assert Integer.bitCount(chunkSize) == 1 : String.format("%d must be a power of two", chunkSize);
             alignmentMask = -chunkSize;
         }
 
@@ -228,7 +224,6 @@ public class ChunkCache
         {
             try
             {
-                metrics.requests.mark();
                 long pageAlignedPos = position & alignmentMask;
                 Buffer buf;
                 do

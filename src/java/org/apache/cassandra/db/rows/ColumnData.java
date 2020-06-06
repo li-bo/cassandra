@@ -17,9 +17,9 @@
  */
 package org.apache.cassandra.db.rows;
 
-import java.security.MessageDigest;
 import java.util.Comparator;
 
+import org.apache.cassandra.db.Digest;
 import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.db.DeletionPurger;
 import org.apache.cassandra.db.partitions.PartitionUpdate;
@@ -65,11 +65,23 @@ public abstract class ColumnData
     public abstract void validate();
 
     /**
+     * Validates the deletions (ttl and local deletion time) if any.
+     *
+     * @return true if it has any invalid deletions, false otherwise
+     */
+    public abstract boolean hasInvalidDeletions();
+
+    /**
      * Adds the data to the provided digest.
      *
-     * @param digest the {@code MessageDigest} to add the data to.
+     * @param digest the {@link Digest} to add the data to.
      */
-    public abstract void digest(MessageDigest digest);
+    public abstract void digest(Digest digest);
+
+    public static void digest(Digest digest, ColumnData cd)
+    {
+        cd.digest(digest);
+    }
 
     /**
      * Returns a copy of the data where all timestamps for live data have replaced by {@code newTimestamp} and

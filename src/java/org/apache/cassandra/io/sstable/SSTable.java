@@ -23,6 +23,7 @@ import java.nio.charset.Charset;
 import java.util.*;
 import java.util.concurrent.CopyOnWriteArraySet;
 
+import com.google.common.base.Preconditions;
 import com.google.common.base.Predicates;
 import com.google.common.collect.Collections2;
 import com.google.common.collect.Sets;
@@ -33,7 +34,9 @@ import org.slf4j.LoggerFactory;
 import org.apache.cassandra.db.BufferDecoratedKey;
 import org.apache.cassandra.db.DecoratedKey;
 import org.apache.cassandra.db.RowIndexEntry;
+import org.apache.cassandra.dht.AbstractBounds;
 import org.apache.cassandra.dht.IPartitioner;
+import org.apache.cassandra.dht.Token;
 import org.apache.cassandra.io.FSWriteError;
 import org.apache.cassandra.io.util.DiskOptimizationStrategy;
 import org.apache.cassandra.io.util.FileUtils;
@@ -43,6 +46,9 @@ import org.apache.cassandra.schema.TableMetadataRef;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.Pair;
 import org.apache.cassandra.utils.memory.HeapAllocator;
+
+import static org.apache.cassandra.service.ActiveRepairService.NO_PENDING_REPAIR;
+import static org.apache.cassandra.service.ActiveRepairService.UNREPAIRED_SSTABLE;
 
 /**
  * This class is built on top of the SequenceFile. It stores
@@ -102,6 +108,7 @@ public abstract class SSTable
      */
     public static boolean delete(Descriptor desc, Set<Component> components)
     {
+        logger.info("Deleting sstable: {}", desc);
         // remove the DATA component first if it exists
         if (components.contains(Component.DATA))
             FileUtils.deleteWithConfirm(desc.filenameFor(Component.DATA));
@@ -116,7 +123,6 @@ public abstract class SSTable
         if (components.contains(Component.SUMMARY))
             FileUtils.delete(desc.filenameFor(Component.SUMMARY));
 
-        logger.trace("Deleted {}", desc);
         return true;
     }
 
@@ -168,7 +174,7 @@ public abstract class SSTable
 
     public List<String> getAllFilePaths()
     {
-        List<String> ret = new ArrayList<>();
+        List<String> ret = new ArrayList<>(components.size());
         for (Component component : components)
             ret.add(descriptor.filenameFor(component));
         return ret;
@@ -342,5 +348,19 @@ public abstract class SSTable
         Collection<Component> componentsToAdd = Collections2.filter(newComponents, Predicates.not(Predicates.in(components)));
         appendTOC(descriptor, componentsToAdd);
         components.addAll(componentsToAdd);
+    }
+
+    public AbstractBounds<Token> getBounds()
+    {
+        return AbstractBounds.bounds(first.getToken(), true, last.getToken(), true);
+    }
+
+    public static void validateRepairedMetadata(long repairedAt, UUID pendingRepair, boolean isTransient)
+    {
+        Preconditions.checkArgument((pendingRepair == NO_PENDING_REPAIR) || (repairedAt == UNREPAIRED_SSTABLE),
+                                    "pendingRepair cannot be set on a repaired sstable");
+        Preconditions.checkArgument(!isTransient || (pendingRepair != NO_PENDING_REPAIR),
+                                    "isTransient can only be true for sstables pending repair");
+
     }
 }

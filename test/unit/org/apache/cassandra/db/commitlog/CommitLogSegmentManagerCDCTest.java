@@ -25,7 +25,6 @@ import java.nio.file.Path;
 import java.util.*;
 
 import org.junit.Assert;
-import org.junit.Assume;
 import org.junit.Before;
 import org.junit.BeforeClass;
 import org.junit.Test;
@@ -44,9 +43,11 @@ public class CommitLogSegmentManagerCDCTest extends CQLTester
     private static final Random random = new Random();
 
     @BeforeClass
-    public static void checkConfig()
+    public static void setUpClass()
     {
-        Assume.assumeTrue(DatabaseDescriptor.isCDCEnabled());
+        DatabaseDescriptor.setCDCEnabled(true);
+        DatabaseDescriptor.setCDCSpaceInMB(1024);
+        CQLTester.setUpClass();
     }
 
     @Before
@@ -167,7 +168,7 @@ public class CommitLogSegmentManagerCDCTest extends CQLTester
             .add("data", randomizeBuffer(DatabaseDescriptor.getCommitLogSegmentSize() / 3))
             .build().apply();
 
-        CommitLog.instance.sync();
+        CommitLog.instance.sync(true);
         CommitLogSegment currentSegment = CommitLog.instance.segmentManager.allocatingFrom();
         int syncOffset = currentSegment.lastSyncedOffset;
 
@@ -188,6 +189,8 @@ public class CommitLogSegmentManagerCDCTest extends CQLTester
     {
         createTable("CREATE TABLE %s (idx int, data text, primary key(idx)) WITH cdc=true;");
         CommitLogSegment initialSegment = CommitLog.instance.segmentManager.allocatingFrom();
+        Integer originalCDCSize = DatabaseDescriptor.getCDCSpaceInMB();
+
         DatabaseDescriptor.setCDCSpaceInMB(8);
         try
         {
@@ -201,6 +204,10 @@ public class CommitLogSegmentManagerCDCTest extends CQLTester
         catch (CDCWriteException ce)
         {
             // pass. Expected since we'll have a file or two linked on restart of CommitLog due to replay
+        }
+        finally
+        {
+            DatabaseDescriptor.setCDCSpaceInMB(originalCDCSize);
         }
 
         CommitLog.instance.forceRecycleAllSegments();
@@ -233,7 +240,7 @@ public class CommitLogSegmentManagerCDCTest extends CQLTester
         Assert.assertFalse("Expected index file to not be created but found: " + cdcIndexFile, cdcIndexFile.exists());
 
         // Sync and confirm no index written as index is written on flush
-        CommitLog.instance.sync();
+        CommitLog.instance.sync(true);
         Assert.assertTrue("File does not exist: " + linked, Files.exists(linked));
         Assert.assertFalse("Expected index file to not be created but found: " + cdcIndexFile, cdcIndexFile.exists());
 
@@ -260,7 +267,7 @@ public class CommitLogSegmentManagerCDCTest extends CQLTester
         Assert.assertTrue("File does not exist: " + linked, Files.exists(linked));
 
         // Sync and confirm index written as index is written on flush
-        CommitLog.instance.sync();
+        CommitLog.instance.sync(true);
         Assert.assertTrue("File does not exist: " + linked, Files.exists(linked));
         Assert.assertTrue("Expected cdc index file after flush but found none: " + cdcIndexFile, cdcIndexFile.exists());
 
@@ -275,6 +282,7 @@ public class CommitLogSegmentManagerCDCTest extends CQLTester
     {
         // Assert.assertEquals(0, new File(DatabaseDescriptor.getCDCLogLocation()).listFiles().length);
         String table_name = createTable("CREATE TABLE %s (idx int, data text, primary key(idx)) WITH cdc=true;");
+        Integer originalCDCSize = DatabaseDescriptor.getCDCSpaceInMB();
 
         DatabaseDescriptor.setCDCSpaceInMB(8);
         TableMetadata ccfm = Keyspace.open(keyspace()).getColumnFamilyStore(table_name).metadata();
@@ -292,8 +300,12 @@ public class CommitLogSegmentManagerCDCTest extends CQLTester
         {
             // pass
         }
+        finally
+        {
+            DatabaseDescriptor.setCDCSpaceInMB(originalCDCSize);
+        }
 
-        CommitLog.instance.sync();
+        CommitLog.instance.sync(true);
         CommitLog.instance.stopUnsafe(false);
 
         // Build up a list of expected index files after replay and then clear out cdc_raw

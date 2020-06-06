@@ -18,17 +18,17 @@
 package org.apache.cassandra.db.rows;
 
 import java.nio.ByteBuffer;
-import java.security.MessageDigest;
 import java.util.Objects;
 
-import org.apache.cassandra.schema.ColumnMetadata;
+import org.apache.cassandra.db.Digest;
 import org.apache.cassandra.db.DeletionPurger;
 import org.apache.cassandra.db.TypeSizes;
 import org.apache.cassandra.db.context.CounterContext;
 import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.db.marshal.CollectionType;
+import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.serializers.MarshalException;
-import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.memory.AbstractAllocator;
 
 /**
@@ -119,20 +119,16 @@ public abstract class AbstractCell extends Cell
                + (path == null ? 0 : path.dataSize());
     }
 
-    public void digest(MessageDigest digest)
+    public void digest(Digest digest)
     {
         if (isCounterCell())
-        {
-            CounterContext.instance().updateDigest(digest, value());
-        }
+            digest.updateWithCounterContext(value());
         else
-        {
-            digest.update(value().duplicate());
-        }
+            digest.update(value());
 
-        FBUtilities.updateWithLong(digest, timestamp());
-        FBUtilities.updateWithInt(digest, ttl());
-        FBUtilities.updateWithBoolean(digest, isCounterCell());
+        digest.updateWithLong(timestamp())
+              .updateWithInt(ttl())
+              .updateWithBoolean(isCounterCell());
         if (path() != null)
             path().digest(digest);
     }
@@ -151,6 +147,13 @@ public abstract class AbstractCell extends Cell
         // validation is done there too as it also involves the cell path
         // for complex columns
         column().validateCell(this);
+    }
+
+    public boolean hasInvalidDeletions()
+    {
+        if (ttl() < 0 || localDeletionTime() < 0 || (isExpiring() && localDeletionTime() == NO_DELETION_TIME))
+            return true;
+        return false;
     }
 
     public long maxTimestamp()
@@ -202,7 +205,19 @@ public abstract class AbstractCell extends Cell
         if (isTombstone())
             return String.format("[%s=<tombstone> %s]", column().name, livenessInfoString());
         else
-            return String.format("[%s=%s %s]", column().name, type.getString(value()), livenessInfoString());
+            return String.format("[%s=%s %s]", column().name, safeToString(type, value()), livenessInfoString());
+    }
+
+    private static String safeToString(AbstractType<?> type, ByteBuffer data)
+    {
+        try
+        {
+            return type.getString(data);
+        }
+        catch (Exception e)
+        {
+            return "0x" + ByteBufferUtil.bytesToHex(data);
+        }
     }
 
     private String livenessInfoString()

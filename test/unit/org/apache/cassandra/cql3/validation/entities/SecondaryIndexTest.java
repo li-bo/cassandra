@@ -22,9 +22,12 @@ import java.util.*;
 import java.util.concurrent.Callable;
 import java.util.concurrent.CountDownLatch;
 
+import com.google.common.collect.ImmutableSet;
+
 import org.apache.commons.lang3.StringUtils;
 import org.junit.Test;
 
+import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.config.DatabaseDescriptor;
@@ -32,13 +35,12 @@ import org.apache.cassandra.cql3.CQLTester;
 import org.apache.cassandra.cql3.ColumnIdentifier;
 import org.apache.cassandra.cql3.QueryProcessor;
 import org.apache.cassandra.cql3.restrictions.StatementRestrictions;
-import org.apache.cassandra.cql3.statements.IndexTarget;
+import org.apache.cassandra.cql3.statements.schema.IndexTarget;
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.DeletionTime;
 import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.db.rows.Cell;
 import org.apache.cassandra.db.rows.Row;
-import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.exceptions.SyntaxException;
 import org.apache.cassandra.index.IndexNotAvailableException;
 import org.apache.cassandra.index.SecondaryIndexManager;
@@ -51,6 +53,8 @@ import org.apache.cassandra.transport.messages.ResultMessage;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.MD5Digest;
 import org.apache.cassandra.utils.Pair;
+
+import static java.lang.String.format;
 
 import static org.apache.cassandra.Util.throwAssert;
 import static org.apache.cassandra.utils.ByteBufferUtil.EMPTY_BYTE_BUFFER;
@@ -96,17 +100,17 @@ public class SecondaryIndexTest extends CQLTester
      */
     private void testCreateAndDropIndex(String indexName, boolean addKeyspaceOnDrop) throws Throwable
     {
-        execute("USE system");
-        assertInvalidMessage(String.format("Index '%s' could not be found",
-                                           removeQuotes(indexName.toLowerCase(Locale.US))),
-                             "DROP INDEX " + indexName + ";");
+        assertInvalidMessage(format("Index '%s.%s' doesn't exist",
+                                    KEYSPACE,
+                                    removeQuotes(indexName.toLowerCase(Locale.US))),
+                             format("DROP INDEX %s.%s", KEYSPACE, indexName));
 
         createTable("CREATE TABLE %s (a int primary key, b int);");
         createIndex("CREATE INDEX " + indexName + " ON %s(b);");
         createIndex("CREATE INDEX IF NOT EXISTS " + indexName + " ON %s(b);");
 
-        assertInvalidMessage(String.format("Index %s already exists",
-                                           removeQuotes(indexName.toLowerCase(Locale.US))),
+        assertInvalidMessage(format("Index '%s' already exists",
+                                    removeQuotes(indexName.toLowerCase(Locale.US))),
                              "CREATE INDEX " + indexName + " ON %s(b)");
 
         // IF NOT EXISTS should apply in cases where the new index differs from an existing one in name only
@@ -114,9 +118,9 @@ public class SecondaryIndexTest extends CQLTester
         assertEquals(1, getCurrentColumnFamilyStore().metadata().indexes.size());
         createIndex("CREATE INDEX IF NOT EXISTS " + otherIndexName + " ON %s(b)");
         assertEquals(1, getCurrentColumnFamilyStore().metadata().indexes.size());
-        assertInvalidMessage(String.format("Index %s is a duplicate of existing index %s",
-                                           removeQuotes(otherIndexName.toLowerCase(Locale.US)),
-                                           removeQuotes(indexName.toLowerCase(Locale.US))),
+        assertInvalidMessage(format("Index %s is a duplicate of existing index %s",
+                                    removeQuotes(otherIndexName.toLowerCase(Locale.US)),
+                                    removeQuotes(indexName.toLowerCase(Locale.US))),
                              "CREATE INDEX " + otherIndexName + " ON %s(b)");
 
         execute("INSERT INTO %s (a, b) values (?, ?);", 0, 0);
@@ -125,26 +129,24 @@ public class SecondaryIndexTest extends CQLTester
         execute("INSERT INTO %s (a, b) values (?, ?);", 3, 1);
 
         assertRows(execute("SELECT * FROM %s where b = ?", 1), row(1, 1), row(3, 1));
-        assertInvalidMessage(String.format("Index '%s' could not be found in any of the tables of keyspace 'system'",
-                                           removeQuotes(indexName.toLowerCase(Locale.US))),
-                             "DROP INDEX " + indexName);
 
         if (addKeyspaceOnDrop)
         {
-            dropIndex("DROP INDEX " + KEYSPACE + "." + indexName);
+            dropIndex(format("DROP INDEX %s.%s", KEYSPACE, indexName));
         }
         else
         {
             execute("USE " + KEYSPACE);
-            execute("DROP INDEX " + indexName);
+            execute(format("DROP INDEX %s", indexName));
         }
 
         assertInvalidMessage(StatementRestrictions.REQUIRES_ALLOW_FILTERING_MESSAGE,
                              "SELECT * FROM %s where b = ?", 1);
-        dropIndex("DROP INDEX IF EXISTS " + indexName);
-        assertInvalidMessage(String.format("Index '%s' could not be found",
-                                           removeQuotes(indexName.toLowerCase(Locale.US))),
-                             "DROP INDEX " + indexName);
+        dropIndex(format("DROP INDEX IF EXISTS %s.%s", KEYSPACE, indexName));
+        assertInvalidMessage(format("Index '%s.%s' doesn't exist",
+                                    KEYSPACE,
+                                    removeQuotes(indexName.toLowerCase(Locale.US))),
+                             format("DROP INDEX %s.%s", KEYSPACE, indexName));
     }
 
     /**
@@ -239,10 +241,10 @@ public class SecondaryIndexTest extends CQLTester
     public void testUnknownCompressionOptions() throws Throwable
     {
         String tableName = createTableName();
-        assertInvalidThrow(SyntaxException.class, String.format("CREATE TABLE %s (key varchar PRIMARY KEY, password varchar, gender varchar) WITH compression_parameters:sstable_compressor = 'DeflateCompressor'", tableName));
+        assertInvalidThrow(SyntaxException.class, format("CREATE TABLE %s (key varchar PRIMARY KEY, password varchar, gender varchar) WITH compression_parameters:sstable_compressor = 'DeflateCompressor'", tableName));
 
-        assertInvalidThrow(ConfigurationException.class, String.format("CREATE TABLE %s (key varchar PRIMARY KEY, password varchar, gender varchar) WITH compression = { 'sstable_compressor': 'DeflateCompressor' }",
-                                                                       tableName));
+        assertInvalidThrow(ConfigurationException.class, format("CREATE TABLE %s (key varchar PRIMARY KEY, password varchar, gender varchar) WITH compression = { 'sstable_compressor': 'DeflateCompressor' }",
+                                                                tableName));
     }
 
     /**
@@ -558,14 +560,14 @@ public class SecondaryIndexTest extends CQLTester
     {
         String indexName = columnName + "_idx";
         SecondaryIndexManager indexManager = getCurrentColumnFamilyStore().indexManager;
-        createIndex(String.format("CREATE INDEX %s on %%s(%s)", indexName, columnName));
+        createIndex(format("CREATE INDEX %s on %%s(%s)", indexName, columnName));
         IndexMetadata indexDef = indexManager.getIndexByName(indexName).getIndexMetadata();
-        assertEquals(String.format("values(%s)", columnName), indexDef.options.get(IndexTarget.TARGET_OPTION_NAME));
-        dropIndex(String.format("DROP INDEX %s.%s", KEYSPACE, indexName));
+        assertEquals(format("values(%s)", columnName), indexDef.options.get(IndexTarget.TARGET_OPTION_NAME));
+        dropIndex(format("DROP INDEX %s.%s", KEYSPACE, indexName));
         assertFalse(indexManager.hasIndexes());
-        createIndex(String.format("CREATE INDEX %s on %%s(values(%s))", indexName, columnName));
+        createIndex(format("CREATE INDEX %s on %%s(values(%s))", indexName, columnName));
         assertEquals(indexDef, indexManager.getIndexByName(indexName).getIndexMetadata());
-        dropIndex(String.format("DROP INDEX %s.%s", KEYSPACE, indexName));
+        dropIndex(format("DROP INDEX %s.%s", KEYSPACE, indexName));
     }
 
     @Test
@@ -594,15 +596,15 @@ public class SecondaryIndexTest extends CQLTester
     private void createAndDropIndexWithQuotedColumnIdentifier(String target) throws Throwable
     {
         String indexName = "test_mixed_case_idx";
-        createIndex(String.format("CREATE INDEX %s ON %%s(%s)", indexName, target));
+        createIndex(format("CREATE INDEX %s ON %%s(%s)", indexName, target));
         SecondaryIndexManager indexManager = getCurrentColumnFamilyStore().indexManager;
         IndexMetadata indexDef = indexManager.getIndexByName(indexName).getIndexMetadata();
-        dropIndex(String.format("DROP INDEX %s.%s", KEYSPACE, indexName));
+        dropIndex(format("DROP INDEX %s.%s", KEYSPACE, indexName));
         // verify we can re-create the index using the target string
-        createIndex(String.format("CREATE INDEX %s ON %%s(%s)",
-                                  indexName, indexDef.options.get(IndexTarget.TARGET_OPTION_NAME)));
+        createIndex(format("CREATE INDEX %s ON %%s(%s)",
+                           indexName, indexDef.options.get(IndexTarget.TARGET_OPTION_NAME)));
         assertEquals(indexDef, indexManager.getIndexByName(indexName).getIndexMetadata());
-        dropIndex(String.format("DROP INDEX %s.%s", KEYSPACE, indexName));
+        dropIndex(format("DROP INDEX %s.%s", KEYSPACE, indexName));
     }
 
 
@@ -651,23 +653,6 @@ public class SecondaryIndexTest extends CQLTester
     }
 
     @Test
-    public void testCompactTableWithValueOver64k() throws Throwable
-    {
-        createTable("CREATE TABLE %s(a int, b blob, PRIMARY KEY (a)) WITH COMPACT STORAGE");
-        createIndex("CREATE INDEX ON %s(b)");
-        failInsert("INSERT INTO %s (a, b) VALUES (0, ?)", ByteBuffer.allocate(TOO_BIG));
-        failInsert("INSERT INTO %s (a, b) VALUES (0, ?) IF NOT EXISTS", ByteBuffer.allocate(TOO_BIG));
-        failInsert("BEGIN BATCH\n" +
-                   "INSERT INTO %s (a, b) VALUES (0, ?);\n" +
-                   "APPLY BATCH",
-                   ByteBuffer.allocate(TOO_BIG));
-        failInsert("BEGIN BATCH\n" +
-                   "INSERT INTO %s (a, b) VALUES (0, ?) IF NOT EXISTS;\n" +
-                   "APPLY BATCH",
-                   ByteBuffer.allocate(TOO_BIG));
-    }
-
-    @Test
     public void testIndexOnPartitionKeyInsertValueOver64k() throws Throwable
     {
         createTable("CREATE TABLE %s(a int, b int, c blob, PRIMARY KEY ((a, b)))");
@@ -681,7 +666,7 @@ public class SecondaryIndexTest extends CQLTester
         // the indexed value passes validation, but the batch size will
         // exceed the default failure threshold, so temporarily raise it
         // (the non-conditional batch doesn't hit this because
-        // BatchStatement::executeInternal skips the size check but CAS
+        // BatchStatement::executeLocally skips the size check but CAS
         // path does not)
         long batchSizeThreshold = DatabaseDescriptor.getBatchSizeFailThreshold();
         try
@@ -734,7 +719,7 @@ public class SecondaryIndexTest extends CQLTester
         // the indexed value passes validation, but the batch size will
         // exceed the default failure threshold, so temporarily raise it
         // (the non-conditional batch doesn't hit this because
-        // BatchStatement::executeInternal skips the size check but CAS
+        // BatchStatement::executeLocally skips the size check but CAS
         // path does not)
         long batchSizeThreshold = DatabaseDescriptor.getBatchSizeFailThreshold();
         try
@@ -771,15 +756,15 @@ public class SecondaryIndexTest extends CQLTester
     public void prepareStatementsWithLIKEClauses() throws Throwable
     {
         createTable("CREATE TABLE %s (a int, c1 text, c2 text, v1 text, v2 text, v3 int, PRIMARY KEY (a, c1, c2))");
-        createIndex(String.format("CREATE CUSTOM INDEX c1_idx on %%s(c1) USING '%s' WITH OPTIONS = {'mode' : 'PREFIX'}",
-                                  SASIIndex.class.getName()));
-        createIndex(String.format("CREATE CUSTOM INDEX c2_idx on %%s(c2) USING '%s' WITH OPTIONS = {'mode' : 'CONTAINS'}",
-                                  SASIIndex.class.getName()));
-        createIndex(String.format("CREATE CUSTOM INDEX v1_idx on %%s(v1) USING '%s' WITH OPTIONS = {'mode' : 'PREFIX'}",
-                                  SASIIndex.class.getName()));
-        createIndex(String.format("CREATE CUSTOM INDEX v2_idx on %%s(v2) USING '%s' WITH OPTIONS = {'mode' : 'CONTAINS'}",
-                                  SASIIndex.class.getName()));
-        createIndex(String.format("CREATE CUSTOM INDEX v3_idx on %%s(v3) USING '%s'", SASIIndex.class.getName()));
+        createIndex(format("CREATE CUSTOM INDEX c1_idx on %%s(c1) USING '%s' WITH OPTIONS = {'mode' : 'PREFIX'}",
+                           SASIIndex.class.getName()));
+        createIndex(format("CREATE CUSTOM INDEX c2_idx on %%s(c2) USING '%s' WITH OPTIONS = {'mode' : 'CONTAINS'}",
+                           SASIIndex.class.getName()));
+        createIndex(format("CREATE CUSTOM INDEX v1_idx on %%s(v1) USING '%s' WITH OPTIONS = {'mode' : 'PREFIX'}",
+                           SASIIndex.class.getName()));
+        createIndex(format("CREATE CUSTOM INDEX v2_idx on %%s(v2) USING '%s' WITH OPTIONS = {'mode' : 'CONTAINS'}",
+                           SASIIndex.class.getName()));
+        createIndex(format("CREATE CUSTOM INDEX v3_idx on %%s(v3) USING '%s'", SASIIndex.class.getName()));
 
         forcePreparedValues();
         // prefix mode indexes support prefix/contains/matches
@@ -881,30 +866,14 @@ public class SecondaryIndexTest extends CQLTester
                    row("B"), row("E"));
     }
 
-    /**
-     * Migrated from cql_tests.py:TestCQL.invalid_clustering_indexing_test()
-     */
-    @Test
-    public void testIndexesOnClusteringInvalid() throws Throwable
-    {
-        createTable("CREATE TABLE %s (a int, b int, c int, d int, PRIMARY KEY ((a, b))) WITH COMPACT STORAGE");
-        assertInvalid("CREATE INDEX ON %s (a)");
-        assertInvalid("CREATE INDEX ON %s (b)");
-
-        createTable("CREATE TABLE %s (a int, b int, c int, PRIMARY KEY (a, b)) WITH COMPACT STORAGE");
-        assertInvalid("CREATE INDEX ON %s (a)");
-        assertInvalid("CREATE INDEX ON %s (b)");
-        assertInvalid("CREATE INDEX ON %s (c)");
-    }
-
     @Test
     public void testMultipleIndexesOnOneColumn() throws Throwable
     {
         String indexClassName = StubIndex.class.getName();
         createTable("CREATE TABLE %s (a int, b int, c int, PRIMARY KEY ((a), b))");
         // uses different options otherwise the two indexes are considered duplicates
-        createIndex(String.format("CREATE CUSTOM INDEX c_idx_1 ON %%s(c) USING '%s' WITH OPTIONS = {'foo':'a'}", indexClassName));
-        createIndex(String.format("CREATE CUSTOM INDEX c_idx_2 ON %%s(c) USING '%s' WITH OPTIONS = {'foo':'b'}", indexClassName));
+        createIndex(format("CREATE CUSTOM INDEX c_idx_1 ON %%s(c) USING '%s' WITH OPTIONS = {'foo':'a'}", indexClassName));
+        createIndex(format("CREATE CUSTOM INDEX c_idx_2 ON %%s(c) USING '%s' WITH OPTIONS = {'foo':'b'}", indexClassName));
 
         ColumnFamilyStore cfs = getCurrentColumnFamilyStore();
         TableMetadata cfm = cfs.metadata();
@@ -946,7 +915,7 @@ public class SecondaryIndexTest extends CQLTester
 
         String indexClassName = StubIndex.class.getName();
         createTable("CREATE TABLE %s (a int, b int, c int, PRIMARY KEY ((a), b))");
-        createIndex(String.format("CREATE CUSTOM INDEX c_idx ON %%s(c) USING '%s'", indexClassName));
+        createIndex(format("CREATE CUSTOM INDEX c_idx ON %%s(c) USING '%s'", indexClassName));
 
         ColumnFamilyStore cfs = getCurrentColumnFamilyStore();
         TableMetadata cfm = cfs.metadata();
@@ -1002,7 +971,7 @@ public class SecondaryIndexTest extends CQLTester
         // Any columns which are unchanged by the update are not passed to the Indexer
         // Note that for simplicity this test resets the index between each scenario
         createTable("CREATE TABLE %s (k int, c int, v1 int, v2 int, PRIMARY KEY (k,c))");
-        createIndex(String.format("CREATE CUSTOM INDEX test_index ON %%s() USING '%s'", StubIndex.class.getName()));
+        createIndex(format("CREATE CUSTOM INDEX test_index ON %%s() USING '%s'", StubIndex.class.getName()));
         execute("INSERT INTO %s (k, c, v1, v2) VALUES (0, 0, 0, 0) USING TIMESTAMP 0");
 
         ColumnMetadata v1 = getCurrentColumnFamilyStore().metadata().getColumn(new ColumnIdentifier("v1", true));
@@ -1015,10 +984,10 @@ public class SecondaryIndexTest extends CQLTester
         execute("UPDATE %s USING TIMESTAMP 1 SET v1=1 WHERE k=0 AND c=0");
         assertEquals(1, index.rowsUpdated.size());
         Row oldRow = index.rowsUpdated.get(0).left;
-        assertEquals(1, oldRow.size());
+        assertEquals(1, oldRow.columnCount());
         validateCell(oldRow.getCell(v1), v1, ByteBufferUtil.bytes(0), 0);
         Row newRow = index.rowsUpdated.get(0).right;
-        assertEquals(1, newRow.size());
+        assertEquals(1, newRow.columnCount());
         validateCell(newRow.getCell(v1), v1, ByteBufferUtil.bytes(1), 1);
         index.reset();
 
@@ -1026,11 +995,11 @@ public class SecondaryIndexTest extends CQLTester
         execute("UPDATE %s USING TIMESTAMP 2 SET v1=2, v2=2 WHERE k=0 AND c=0");
         assertEquals(1, index.rowsUpdated.size());
         oldRow = index.rowsUpdated.get(0).left;
-        assertEquals(2, oldRow.size());
+        assertEquals(2, oldRow.columnCount());
         validateCell(oldRow.getCell(v1), v1, ByteBufferUtil.bytes(1), 1);
         validateCell(oldRow.getCell(v2), v2, ByteBufferUtil.bytes(0), 0);
         newRow = index.rowsUpdated.get(0).right;
-        assertEquals(2, newRow.size());
+        assertEquals(2, newRow.columnCount());
         validateCell(newRow.getCell(v1), v1, ByteBufferUtil.bytes(2), 2);
         validateCell(newRow.getCell(v2), v2, ByteBufferUtil.bytes(2), 2);
         index.reset();
@@ -1039,10 +1008,10 @@ public class SecondaryIndexTest extends CQLTester
         execute("DELETE v1 FROM %s USING TIMESTAMP 3 WHERE k=0 AND c=0");
         assertEquals(1, index.rowsUpdated.size());
         oldRow = index.rowsUpdated.get(0).left;
-        assertEquals(1, oldRow.size());
+        assertEquals(1, oldRow.columnCount());
         validateCell(oldRow.getCell(v1), v1, ByteBufferUtil.bytes(2), 2);
         newRow = index.rowsUpdated.get(0).right;
-        assertEquals(1, newRow.size());
+        assertEquals(1, newRow.columnCount());
         Cell newCell = newRow.getCell(v1);
         assertTrue(newCell.isTombstone());
         assertEquals(3, newCell.timestamp());
@@ -1054,10 +1023,10 @@ public class SecondaryIndexTest extends CQLTester
         execute("INSERT INTO %s(k, c) VALUES (0, 0) USING TIMESTAMP 4");
         assertEquals(1, index.rowsUpdated.size());
         oldRow = index.rowsUpdated.get(0).left;
-        assertEquals(0, oldRow.size());
+        assertEquals(0, oldRow.columnCount());
         assertEquals(0, oldRow.primaryKeyLivenessInfo().timestamp());
         newRow = index.rowsUpdated.get(0).right;
-        assertEquals(0, newRow.size());
+        assertEquals(0, newRow.columnCount());
         assertEquals(4, newRow.primaryKeyLivenessInfo().timestamp());
     }
 
@@ -1084,6 +1053,84 @@ public class SecondaryIndexTest extends CQLTester
         {
             execute("DROP index " + KEYSPACE + ".testIndex");
         }
+    }
+
+    @Test // A Bad init could leave an index only accepting reads
+    public void testReadOnlyIndex() throws Throwable
+    {
+        // On successful initialization both reads and writes go through
+        String tableName = createTable("CREATE TABLE %s (pk int, ck int, value int, PRIMARY KEY (pk, ck))");
+        String indexName = createIndex("CREATE CUSTOM INDEX ON %s (value) USING '" + ReadOnlyOnFailureIndex.class.getName() + "'");
+        assertTrue(waitForIndex(keyspace(), tableName, indexName));
+        execute("SELECT value FROM %s WHERE value = 1");
+        execute("INSERT INTO %s (pk, ck, value) VALUES (?, ?, ?)", 1, 1, 1);
+        ReadOnlyOnFailureIndex index = (ReadOnlyOnFailureIndex) getCurrentColumnFamilyStore().indexManager.getIndexByName(indexName);
+        assertEquals(1, index.rowsInserted.size());
+
+        // Upon rebuild, both reads and writes still go through
+        getCurrentColumnFamilyStore().indexManager.rebuildIndexesBlocking(ImmutableSet.of(indexName));
+        assertEquals(1, index.rowsInserted.size());
+        execute("SELECT value FROM %s WHERE value = 1");
+        execute("INSERT INTO %s (pk, ck, value) VALUES (?, ?, ?)", 2, 1, 1);
+        assertEquals(2, index.rowsInserted.size());
+        dropIndex(format("DROP INDEX %s.%s", KEYSPACE, indexName));
+
+        // On bad initial build writes are not forwarded to the index
+        ReadOnlyOnFailureIndex.failInit = true;
+        indexName = createIndex("CREATE CUSTOM INDEX ON %s (value) USING '" + ReadOnlyOnFailureIndex.class.getName() + "'");
+        index = (ReadOnlyOnFailureIndex) getCurrentColumnFamilyStore().indexManager.getIndexByName(indexName);
+        assertTrue(waitForIndexBuilds(keyspace(), indexName));
+        assertInvalidThrow(IndexNotAvailableException.class, "SELECT value FROM %s WHERE value = 1");
+        execute("INSERT INTO %s (pk, ck, value) VALUES (?, ?, ?)", 1, 1, 1);
+        assertEquals(0, index.rowsInserted.size());
+
+        // Upon recovery, we can index data again
+        index.reset();
+        getCurrentColumnFamilyStore().indexManager.rebuildIndexesBlocking(ImmutableSet.of(indexName));
+        assertEquals(2, index.rowsInserted.size());
+        execute("SELECT value FROM %s WHERE value = 1");
+        execute("INSERT INTO %s (pk, ck, value) VALUES (?, ?, ?)", 2, 1, 1);
+        assertEquals(3, index.rowsInserted.size());
+        dropIndex(format("DROP INDEX %s.%s", KEYSPACE, indexName));
+    }
+
+    @Test  // A Bad init could leave an index only accepting writes
+    public void testWriteOnlyIndex() throws Throwable
+    {
+        // On successful initialization both reads and writes go through
+        String tableName = createTable("CREATE TABLE %s (pk int, ck int, value int, PRIMARY KEY (pk, ck))");
+        String indexName = createIndex("CREATE CUSTOM INDEX ON %s (value) USING '" + WriteOnlyOnFailureIndex.class.getName() + "'");
+        assertTrue(waitForIndex(keyspace(), tableName, indexName));
+        execute("SELECT value FROM %s WHERE value = 1");
+        execute("INSERT INTO %s (pk, ck, value) VALUES (?, ?, ?)", 1, 1, 1);
+        WriteOnlyOnFailureIndex index = (WriteOnlyOnFailureIndex) getCurrentColumnFamilyStore().indexManager.getIndexByName(indexName);
+        assertEquals(1, index.rowsInserted.size());
+
+        // Upon rebuild, both reads and writes still go through
+        getCurrentColumnFamilyStore().indexManager.rebuildIndexesBlocking(ImmutableSet.of(indexName));
+        assertEquals(1, index.rowsInserted.size());
+        execute("SELECT value FROM %s WHERE value = 1");
+        execute("INSERT INTO %s (pk, ck, value) VALUES (?, ?, ?)", 2, 1, 1);
+        assertEquals(2, index.rowsInserted.size());
+        dropIndex(format("DROP INDEX %s.%s", KEYSPACE, indexName));
+
+        // On bad initial build writes are forwarded to the index
+        WriteOnlyOnFailureIndex.failInit = true;
+        indexName = createIndex("CREATE CUSTOM INDEX ON %s (value) USING '" + WriteOnlyOnFailureIndex.class.getName() + "'");
+        index = (WriteOnlyOnFailureIndex) getCurrentColumnFamilyStore().indexManager.getIndexByName(indexName);
+        assertTrue(waitForIndexBuilds(keyspace(), indexName));
+        execute("INSERT INTO %s (pk, ck, value) VALUES (?, ?, ?)", 1, 1, 1);
+        assertEquals(1, index.rowsInserted.size());
+        assertInvalidThrow(IndexNotAvailableException.class, "SELECT value FROM %s WHERE value = 1");
+
+        // Upon recovery, we can query data again
+        index.reset();
+        getCurrentColumnFamilyStore().indexManager.rebuildIndexesBlocking(ImmutableSet.of(indexName));
+        assertEquals(2, index.rowsInserted.size());
+        execute("SELECT value FROM %s WHERE value = 1");
+        execute("INSERT INTO %s (pk, ck, value) VALUES (?, ?, ?)", 2, 1, 1);
+        assertEquals(3, index.rowsInserted.size());
+        dropIndex(format("DROP INDEX %s.%s", KEYSPACE, indexName));
     }
 
     @Test
@@ -1230,27 +1277,6 @@ public class SecondaryIndexTest extends CQLTester
             assertRows(execute("SELECT * FROM %s WHERE pk = textAsBlob('foo123') AND v = textAsBlob('');"),
                        row(bytes("foo123"), bytes("3"), EMPTY_BYTE_BUFFER));
         });
-    }
-
-    @Test
-    public void testEmptyRestrictionValueWithSecondaryIndexAndCompactTables() throws Throwable
-    {
-        createTable("CREATE TABLE %s (pk blob, c blob, v blob, PRIMARY KEY ((pk), c)) WITH COMPACT STORAGE");
-        assertInvalidMessage("Secondary indexes are not supported on COMPACT STORAGE tables that have clustering columns",
-                            "CREATE INDEX on %s(c)");
-
-        createTable("CREATE TABLE %s (pk blob PRIMARY KEY, v blob) WITH COMPACT STORAGE");
-        createIndex("CREATE INDEX on %s(v)");
-
-        execute("INSERT INTO %s (pk, v) VALUES (?, ?)", bytes("foo123"), bytes("1"));
-
-        // Test restrictions on non-primary key value
-        assertEmpty(execute("SELECT * FROM %s WHERE pk = textAsBlob('foo123') AND v = textAsBlob('');"));
-
-        execute("INSERT INTO %s (pk, v) VALUES (?, ?)", bytes("foo124"), EMPTY_BYTE_BUFFER);
-
-        assertRows(execute("SELECT * FROM %s WHERE v = textAsBlob('');"),
-                   row(bytes("foo124"), EMPTY_BYTE_BUFFER));
     }
 
     @Test
@@ -1429,6 +1455,7 @@ public class SecondaryIndexTest extends CQLTester
 
         execute("INSERT INTO %s (k, v) VALUES (?, ?)", 0, udt1);
         String indexName = createIndex("CREATE INDEX ON %s (v)");
+
         execute("INSERT INTO %s (k, v) VALUES (?, ?)", 1, udt2);
         execute("INSERT INTO %s (k, v) VALUES (?, ?)", 1, udt1);
         assertTrue(waitForIndex(keyspace(), tableName, indexName));
@@ -1440,8 +1467,8 @@ public class SecondaryIndexTest extends CQLTester
         assertRows(execute("SELECT * FROM %s WHERE v = ?", udt1), row(1, udt1));
 
         dropIndex("DROP INDEX %s." + indexName);
-        assertInvalidMessage(String.format("Index '%s' could not be found", indexName),
-                             String.format("DROP INDEX %s.%s", KEYSPACE, indexName));
+        assertInvalidMessage(format("Index '%s.%s' doesn't exist", KEYSPACE, indexName),
+                             format("DROP INDEX %s.%s", KEYSPACE, indexName));
         assertInvalidMessage(StatementRestrictions.REQUIRES_ALLOW_FILTERING_MESSAGE,
                              "SELECT * FROM %s WHERE v = ?", udt1);
     }
@@ -1473,8 +1500,8 @@ public class SecondaryIndexTest extends CQLTester
         assertEmpty(execute("SELECT * FROM %s WHERE v = ?", set(udt2)));
 
         dropIndex("DROP INDEX %s." + indexName);
-        assertInvalidMessage(String.format("Index '%s' could not be found", indexName),
-                             String.format("DROP INDEX %s.%s", KEYSPACE, indexName));
+        assertInvalidMessage(format("Index '%s.%s' doesn't exist", KEYSPACE, indexName),
+                             format("DROP INDEX %s.%s", KEYSPACE, indexName));
         assertInvalidMessage(StatementRestrictions.REQUIRES_ALLOW_FILTERING_MESSAGE,
                              "SELECT * FROM %s WHERE v CONTAINS ?", udt1);
     }
@@ -1507,8 +1534,8 @@ public class SecondaryIndexTest extends CQLTester
         assertRows(execute("SELECT * FROM %s WHERE v CONTAINS ?", udt2), row(2, set(udt2)));
 
         dropIndex("DROP INDEX %s." + indexName);
-        assertInvalidMessage(String.format("Index '%s' could not be found", indexName),
-                             String.format("DROP INDEX %s.%s", KEYSPACE, indexName));
+        assertInvalidMessage(format("Index '%s.%s' doesn't exist", KEYSPACE, indexName),
+                             format("DROP INDEX %s.%s", KEYSPACE, indexName));
         assertInvalidMessage(StatementRestrictions.REQUIRES_ALLOW_FILTERING_MESSAGE,
                              "SELECT * FROM %s WHERE v CONTAINS ?", udt1);
     }
@@ -1518,9 +1545,9 @@ public class SecondaryIndexTest extends CQLTester
     {
         String type = createType("CREATE TYPE %s (a int)");
         createTable("CREATE TABLE %s (k int PRIMARY KEY, v " + type + ")");
-        assertInvalidMessage("Secondary indexes are not supported on non-frozen UDTs", "CREATE INDEX ON %s (v)");
-        assertInvalidMessage("Non-collection columns support only simple indexes", "CREATE INDEX ON %s (keys(v))");
-        assertInvalidMessage("Non-collection columns support only simple indexes", "CREATE INDEX ON %s (values(v))");
+        assertInvalidMessage("Cannot create index on non-frozen UDT column v", "CREATE INDEX ON %s (v)");
+        assertInvalidMessage("Cannot create keys() index on v. Non-collection columns only support simple indexes", "CREATE INDEX ON %s (keys(v))");
+        assertInvalidMessage("Cannot create values() index on v. Non-collection columns only support simple indexes", "CREATE INDEX ON %s (values(v))");
         assertInvalidMessage("full() indexes can only be created on frozen collections", "CREATE INDEX ON %s (full(v))");
     }
 
@@ -1566,52 +1593,9 @@ public class SecondaryIndexTest extends CQLTester
         assertEmpty(execute("SELECT * FROM %s WHERE a = 5"));
     }
 
-    @Test
-    public void testIndicesOnCompactTable() throws Throwable
-    {
-        assertInvalidMessage("COMPACT STORAGE with composite PRIMARY KEY allows no more than one column not part of the PRIMARY KEY (got: v1, v2)",
-                             "CREATE TABLE test (pk int, c int, v1 int, v2 int, PRIMARY KEY(pk, c)) WITH COMPACT STORAGE");
-
-        createTable("CREATE TABLE %s (pk int, c int, v int, PRIMARY KEY(pk, c)) WITH COMPACT STORAGE");
-        assertInvalidMessage("Secondary indexes are not supported on COMPACT STORAGE tables that have clustering columns",
-                             "CREATE INDEX ON %s(v)");
-
-        createTable("CREATE TABLE %s (pk int PRIMARY KEY, v int) WITH COMPACT STORAGE");
-        createIndex("CREATE INDEX ON %s(v)");
-
-        execute("INSERT INTO %s (pk, v) VALUES (?, ?)", 1, 1);
-        execute("INSERT INTO %s (pk, v) VALUES (?, ?)", 2, 1);
-        execute("INSERT INTO %s (pk, v) VALUES (?, ?)", 3, 3);
-
-        assertRows(execute("SELECT pk, v FROM %s WHERE v = 1"),
-                   row(1, 1),
-                   row(2, 1));
-
-        assertRows(execute("SELECT pk, v FROM %s WHERE v = 3"),
-                   row(3, 3));
-
-        assertEmpty(execute("SELECT pk, v FROM %s WHERE v = 5"));
-
-        createTable("CREATE TABLE %s (pk int PRIMARY KEY, v1 int, v2 int) WITH COMPACT STORAGE");
-        createIndex("CREATE INDEX ON %s(v1)");
-
-        execute("INSERT INTO %s (pk, v1, v2) VALUES (?, ?, ?)", 1, 1, 1);
-        execute("INSERT INTO %s (pk, v1, v2) VALUES (?, ?, ?)", 2, 1, 2);
-        execute("INSERT INTO %s (pk, v1, v2) VALUES (?, ?, ?)", 3, 3, 3);
-
-        assertRows(execute("SELECT pk, v2 FROM %s WHERE v1 = 1"),
-                   row(1, 1),
-                   row(2, 2));
-
-        assertRows(execute("SELECT pk, v2 FROM %s WHERE v1 = 3"),
-                   row(3, 3));
-
-        assertEmpty(execute("SELECT pk, v2 FROM %s WHERE v1 = 5"));
-    }
-
     private ResultMessage.Prepared prepareStatement(String cql)
     {
-        return QueryProcessor.prepare(String.format(cql, KEYSPACE, currentTable()),
+        return QueryProcessor.prepare(format(cql, KEYSPACE, currentTable()),
                                       ClientState.forInternalCalls());
     }
 
@@ -1655,6 +1639,64 @@ public class SecondaryIndexTest extends CQLTester
         {
             latch.countDown();
             return super.getInvalidateTask();
+        }
+    }
+
+    /**
+     * {@code StubIndex} that only supports some load. Could be intentional or a result of a bad init.
+     */
+    public static class LoadTypeConstrainedIndex extends StubIndex
+    {
+        static volatile boolean failInit = false;
+        final LoadType supportedLoadOnFailure;
+
+        LoadTypeConstrainedIndex(ColumnFamilyStore baseCfs, IndexMetadata indexDef, LoadType supportedLoadOnFailure)
+        {
+            super(baseCfs, indexDef);
+            this.supportedLoadOnFailure = supportedLoadOnFailure;
+        }
+
+        @Override
+        public LoadType getSupportedLoadTypeOnFailure(boolean isInitialBuild)
+        {
+            return supportedLoadOnFailure;
+        }
+
+        @Override
+        public void reset()
+        {
+            super.reset();
+            failInit = false;
+        }
+
+        @Override
+        public Callable<?> getInitializationTask()
+        {
+            if (failInit)
+                return () -> {throw new IllegalStateException("Index is configured to fail.");};
+
+            return null;
+        }
+
+        public boolean shouldBuildBlocking()
+        {
+            return true;
+        }
+    }
+
+    public static class ReadOnlyOnFailureIndex extends LoadTypeConstrainedIndex
+    {
+        public ReadOnlyOnFailureIndex(ColumnFamilyStore baseCfs, IndexMetadata indexDef)
+        {
+            super(baseCfs, indexDef, LoadType.READ);
+        }
+    }
+
+    public static class WriteOnlyOnFailureIndex extends LoadTypeConstrainedIndex
+    {
+        public WriteOnlyOnFailureIndex(ColumnFamilyStore baseCfs, IndexMetadata indexDef)
+        {
+            super(baseCfs, indexDef, LoadType.WRITE);
         }
     }
 }

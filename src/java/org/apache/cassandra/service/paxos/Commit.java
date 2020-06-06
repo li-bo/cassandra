@@ -59,8 +59,8 @@ public class Commit
 
     public static Commit newProposal(UUID ballot, PartitionUpdate update)
     {
-        update.updateAllTimestamp(UUIDGen.microsTimestamp(ballot));
-        return new Commit(ballot, update);
+        PartitionUpdate withNewTimestamp = new PartitionUpdate.Builder(update, 0).updateAllTimestamp(UUIDGen.microsTimestamp(ballot)).build();
+        return new Commit(ballot, withNewTimestamp);
     }
 
     public static Commit emptyCommit(DecoratedKey key, TableMetadata metadata)
@@ -117,7 +117,7 @@ public class Commit
         public Commit deserialize(DataInputPlus in, int version) throws IOException
         {
             UUID ballot = UUIDSerializer.serializer.deserialize(in, version);
-            PartitionUpdate update = PartitionUpdate.serializer.deserialize(in, version, SerializationHelper.Flag.LOCAL);
+            PartitionUpdate update = PartitionUpdate.serializer.deserialize(in, version, DeserializationHelper.Flag.LOCAL);
             return new Commit(ballot, update);
         }
 

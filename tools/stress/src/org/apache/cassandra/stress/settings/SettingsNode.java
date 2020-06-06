@@ -29,6 +29,8 @@ import java.net.InetSocketAddress;
 import java.net.UnknownHostException;
 import java.util.*;
 
+import com.google.common.net.HostAndPort;
+
 import com.datastax.driver.core.Host;
 import org.apache.cassandra.stress.util.ResultLogger;
 
@@ -80,7 +82,7 @@ public class SettingsNode implements Serializable
                 if (!isWhiteList)
                 {
                     for (Host host : settings.getJavaDriverClient().getCluster().getMetadata().getAllHosts())
-                        r.add(host.getAddress().getHostName());
+                        r.add(host.getSocketAddress().getHostString() + ":" + host.getSocketAddress().getPort());
                     break;
                 }
             case SIMPLE_NATIVE:
@@ -97,7 +99,8 @@ public class SettingsNode implements Serializable
         {
             try
             {
-                r.add(InetAddress.getByName(node));
+                HostAndPort hap = HostAndPort.fromString(node);
+                r.add(InetAddress.getByName(hap.getHost()));
             }
             catch (UnknownHostException e)
             {
@@ -114,7 +117,8 @@ public class SettingsNode implements Serializable
         {
             try
             {
-                r.add(new InetSocketAddress(InetAddress.getByName(node), port));
+                HostAndPort hap = HostAndPort.fromString(node).withDefaultPort(port);
+                r.add(new InetSocketAddress(InetAddress.getByName(hap.getHost()), hap.getPort()));
             }
             catch (UnknownHostException e)
             {

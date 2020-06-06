@@ -29,6 +29,7 @@ import org.apache.commons.cli.*;
 import java.io.File;
 import java.io.IOException;
 import java.util.function.BiFunction;
+import java.util.function.BiPredicate;
 
 import static org.apache.cassandra.tools.BulkLoader.CmdLineOptions;
 
@@ -83,7 +84,7 @@ public class StandaloneSSTableUtil
 
     private static void listFiles(Options options, TableMetadata metadata, OutputHandler handler) throws IOException
     {
-        Directories directories = new Directories(metadata, ColumnFamilyStore.getInitialDirectories());
+        Directories directories = new Directories(metadata);
 
         for (File dir : directories.getCFDirectories())
         {
@@ -92,7 +93,7 @@ public class StandaloneSSTableUtil
         }
     }
 
-    private static BiFunction<File, Directories.FileType, Boolean> getFilter(Options options)
+    private static BiPredicate<File, Directories.FileType> getFilter(Options options)
     {
         return (file, type) ->
         {

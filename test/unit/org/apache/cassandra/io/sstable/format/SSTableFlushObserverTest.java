@@ -25,6 +25,7 @@ import java.util.Collection;
 import java.util.Collections;
 import java.util.Iterator;
 
+import org.apache.cassandra.db.commitlog.CommitLog;
 import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.config.DatabaseDescriptor;
@@ -52,7 +53,7 @@ import org.apache.cassandra.utils.Pair;
 import com.google.common.collect.ArrayListMultimap;
 import com.google.common.collect.Multimap;
 
-import junit.framework.Assert;
+import org.junit.Assert;
 
 import org.junit.BeforeClass;
 import org.junit.Test;
@@ -63,6 +64,7 @@ public class SSTableFlushObserverTest
     public static void initDD()
     {
         DatabaseDescriptor.daemonInitialization();
+        CommitLog.instance.start();
     }
 
     private static final String KS_NAME = "test";
@@ -96,7 +98,7 @@ public class SSTableFlushObserverTest
                                                                   KS_NAME, CF_NAME,
                                                                   0,
                                                                   sstableFormat),
-                                                   10L, 0L, null, TableMetadataRef.forOfflineTools(cfm),
+                                                   10L, 0L, null, false, TableMetadataRef.forOfflineTools(cfm),
                                                    new MetadataCollector(cfm.comparator).sstableLevel(0),
                                                    new SerializationHeader(true, cfm, cfm.regularAndStaticColumns(), EncodingStats.NO_STATS),
                                                    Collections.singletonList(observer),

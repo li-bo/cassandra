@@ -19,7 +19,7 @@ package org.apache.cassandra.auth;
 
 import java.util.concurrent.TimeUnit;
 
-import org.apache.cassandra.cql3.statements.CreateTableStatement;
+import org.apache.cassandra.cql3.statements.schema.CreateTableStatement;
 import org.apache.cassandra.schema.TableId;
 import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.schema.SchemaConstants;
@@ -35,10 +35,21 @@ public final class AuthKeyspace
     {
     }
 
+    /**
+     * Generation is used as a timestamp for automatic table creation on startup.
+     * If you make any changes to the tables below, make sure to increment the
+     * generation and document your change here.
+     *
+     * gen 0: original definition in 3.0
+     * gen 1: compression chunk length reduced to 16KiB, memtable_flush_period_in_ms now unset on all tables in 4.0
+     */
+    public static final long GENERATION = 1;
+
     public static final String ROLES = "roles";
     public static final String ROLE_MEMBERS = "role_members";
     public static final String ROLE_PERMISSIONS = "role_permissions";
     public static final String RESOURCE_ROLE_INDEX = "resource_role_permissons_index";
+    public static final String NETWORK_PERMISSIONS = "network_permissions";
 
     public static final long SUPERUSER_SETUP_DELAY = Long.getLong("cassandra.superuser_setup_delay_ms", 10000);
 
@@ -78,13 +89,19 @@ public final class AuthKeyspace
               + "role text,"
               + "PRIMARY KEY(resource, role))");
 
+    private static final TableMetadata NetworkPermissions =
+        parse(NETWORK_PERMISSIONS,
+              "user network permissions",
+              "CREATE TABLE %s ("
+              + "role text, "
+              + "dcs frozen<set<text>>, "
+              + "PRIMARY KEY(role))");
 
     private static TableMetadata parse(String name, String description, String cql)
     {
         return CreateTableStatement.parse(format(cql, name), SchemaConstants.AUTH_KEYSPACE_NAME)
                                    .id(TableId.forSystemTable(SchemaConstants.AUTH_KEYSPACE_NAME, name))
                                    .comment(description)
-                                   .dcLocalReadRepairChance(0.0)
                                    .gcGraceSeconds((int) TimeUnit.DAYS.toSeconds(90))
                                    .build();
     }
@@ -93,6 +110,6 @@ public final class AuthKeyspace
     {
         return KeyspaceMetadata.create(SchemaConstants.AUTH_KEYSPACE_NAME,
                                        KeyspaceParams.simple(1),
-                                       Tables.of(Roles, RoleMembers, RolePermissions, ResourceRoleIndex));
+                                       Tables.of(Roles, RoleMembers, RolePermissions, ResourceRoleIndex, NetworkPermissions));
     }
 }

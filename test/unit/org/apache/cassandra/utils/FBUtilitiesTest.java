@@ -26,6 +26,14 @@ import java.nio.charset.StandardCharsets;
 import java.util.Map;
 import java.util.Optional;
 import java.util.TreeMap;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 
 import com.google.common.primitives.Ints;
 
@@ -153,7 +161,7 @@ public class FBUtilitiesTest
     }
 
     @Test
-    public void testGetBroadcastRpcAddress() throws Exception
+    public void testGetBroadcastNativeAddress() throws Exception
     {
         //When both rpc_address and broadcast_rpc_address are null, it should return the local address (from DD.applyAddressConfig)
         FBUtilities.reset();
@@ -161,22 +169,63 @@ public class FBUtilitiesTest
         testConfig.rpc_address = null;
         testConfig.broadcast_rpc_address = null;
         DatabaseDescriptor.applyAddressConfig(testConfig);
-        assertEquals(FBUtilities.getLocalAddress(), FBUtilities.getBroadcastRpcAddress());
+        assertEquals(FBUtilities.getJustLocalAddress(), FBUtilities.getJustBroadcastNativeAddress());
 
         //When rpc_address is defined and broadcast_rpc_address is null, it should return the rpc_address
         FBUtilities.reset();
         testConfig.rpc_address = "127.0.0.2";
         testConfig.broadcast_rpc_address = null;
         DatabaseDescriptor.applyAddressConfig(testConfig);
-        assertEquals(InetAddress.getByName("127.0.0.2"), FBUtilities.getBroadcastRpcAddress());
+        assertEquals(InetAddress.getByName("127.0.0.2"), FBUtilities.getJustBroadcastNativeAddress());
 
         //When both rpc_address and broadcast_rpc_address are defined, it should return broadcast_rpc_address
         FBUtilities.reset();
         testConfig.rpc_address = "127.0.0.2";
         testConfig.broadcast_rpc_address = "127.0.0.3";
         DatabaseDescriptor.applyAddressConfig(testConfig);
-        assertEquals(InetAddress.getByName("127.0.0.3"), FBUtilities.getBroadcastRpcAddress());
+        assertEquals(InetAddress.getByName("127.0.0.3"), FBUtilities.getJustBroadcastNativeAddress());
 
         FBUtilities.reset();
     }
+
+    @Test
+    public void testWaitFirstFuture() throws ExecutionException, InterruptedException
+    {
+        final int threadCount = 10;
+        ExecutorService executor = Executors.newFixedThreadPool(threadCount);
+        try
+        {
+            List<Future<?>> futures = new ArrayList<>(threadCount);
+            List<CountDownLatch> latches = new ArrayList<>(threadCount);
+
+            for (int i = 0; i < threadCount; i++)
+            {
+                CountDownLatch latch = new CountDownLatch(1);
+                latches.add(latch);
+                int finalI = i;
+                futures.add(executor.submit(() -> {
+                    latch.await(10, TimeUnit.SECONDS);
+                    // Sleep to emulate "work" done by the future to make it not return immediately
+                    // after counting down the latch in order to test for delay and spinning done
+                    // in FBUtilities#waitOnFirstFuture.
+                    TimeUnit.MILLISECONDS.sleep(10);
+                    return latch.getCount() == 0 ? finalI : -1;
+                }));
+            }
+
+            for (int i = 0; i < threadCount; i++)
+            {
+                latches.get(i).countDown();
+                Future<?> fut = FBUtilities.waitOnFirstFuture(futures, 3);
+                int futSleep = (Integer) fut.get();
+                assertEquals(futSleep, i);
+                futures.remove(fut);
+            }
+        }
+        finally
+        {
+            executor.shutdown();
+        }
+    }
+
 }

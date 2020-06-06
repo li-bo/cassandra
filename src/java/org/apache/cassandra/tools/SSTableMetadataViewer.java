@@ -21,6 +21,7 @@ import static org.apache.cassandra.tools.Util.BLUE;
 import static org.apache.cassandra.tools.Util.CYAN;
 import static org.apache.cassandra.tools.Util.RESET;
 import static org.apache.cassandra.tools.Util.WHITE;
+import static org.apache.commons.lang3.time.DurationFormatUtils.formatDurationWords;
 
 import java.io.DataInputStream;
 import java.io.File;
@@ -70,10 +71,9 @@ import org.apache.commons.cli.Option;
 import org.apache.commons.cli.Options;
 import org.apache.commons.cli.ParseException;
 import org.apache.commons.cli.PosixParser;
-import org.joda.time.Duration;
-import org.joda.time.format.PeriodFormat;
 
 import com.google.common.collect.MinMaxPriorityQueue;
+import org.apache.commons.lang3.time.DurationFormatUtils;
 
 /**
  * Shows the contents of sstable metadata
@@ -143,7 +143,7 @@ public class SSTableMetadataViewer
         {
             return "never";
         }
-        return PeriodFormat.getDefault().print(new Duration(unit.toMillis(duration)).toPeriod());
+        return formatDurationWords(unit.toMillis(duration), true, true);
     }
 
     public static String toByteString(long bytes)
@@ -387,7 +387,7 @@ public class SSTableMetadataViewer
                                                                 offset,
                                                                 Util.wrapQuiet(toDateString(offset, TimeUnit.SECONDS),
                                                                                         color)),
-                                                         Object::toString);
+                                                         String::valueOf);
             estDropped.printHistogram(out, color, unicode);
             field("Partition Size", "");
             TermHistogram rowSize = new TermHistogram(stats.estimatedPartitionSize,
@@ -395,13 +395,13 @@ public class SSTableMetadataViewer
                                                       offset -> String.format("%d %s",
                                                                               offset,
                                                                               Util.wrapQuiet(toByteString(offset), color)),
-                                                      Object::toString);
+                                                      String::valueOf);
             rowSize.printHistogram(out, color, unicode);
             field("Column Count", "");
-            TermHistogram cellCount = new TermHistogram(stats.estimatedColumnCount,
+            TermHistogram cellCount = new TermHistogram(stats.estimatedCellPerPartitionCount,
                                                         "Columns",
-                                                        Object::toString,
-                                                        Object::toString);
+                                                        String::valueOf,
+                                                        String::valueOf);
             cellCount.printHistogram(out, color, unicode);
         }
         if (compaction != null)
@@ -425,13 +425,14 @@ public class SSTableMetadataViewer
             field("EncodingStats minTTL", encodingStats.minTTL,
                     toDurationString(encodingStats.minTTL, TimeUnit.SECONDS));
             field("EncodingStats minLocalDeletionTime", encodingStats.minLocalDeletionTime,
-                    toDateString(encodingStats.minLocalDeletionTime, TimeUnit.MILLISECONDS));
+                    toDateString(encodingStats.minLocalDeletionTime, TimeUnit.SECONDS));
             field("EncodingStats minTimestamp", encodingStats.minTimestamp,
                     toDateString(encodingStats.minTimestamp, tsUnit));
             field("KeyType", keyType.toString());
             field("ClusteringTypes", clusteringTypes.toString());
             field("StaticColumns", FBUtilities.toString(statics));
             field("RegularColumns", FBUtilities.toString(regulars));
+            field("IsTransient", stats.isTransient);
         }
     }
 

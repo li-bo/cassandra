@@ -220,6 +220,24 @@ Running a user mode test with multiple yaml files::
 This will run operations as specified in both the example.yaml and example2.yaml files. example.yaml and example2.yaml can reference the same table
  although care must be taken that the table definition is identical (data generation specs can be different).
 
+Lightweight transaction support
++++++++++++++++++++++++++++++++
+
+cassandra-stress supports lightweight transactions. In this it will first read current data from Cassandra and then uses read value(s)
+to fulfill lightweight transaction condition(s).
+
+Lightweight transaction update query::
+
+    queries:
+      regularupdate:
+          cql: update blogposts set author = ? where domain = ? and published_date = ?
+          fields: samerow
+      updatewithlwt:
+          cql: update blogposts set author = ? where domain = ? and published_date = ? IF body = ? AND url = ?
+          fields: samerow
+
+The full example can be found here :download:`yaml <./stress-lwt-example.yaml>`
+
 Graphing
 ^^^^^^^^
 
@@ -249,3 +267,7 @@ Use the schema option making sure to either escape the parenthesis or enclose in
 Use the transport option::
 
     cassandra-stress "write n=100k cl=ONE no-warmup" -transport "truststore=$HOME/jks/truststore.jks truststore-password=cassandra"
+
+**Is Cassandra Stress a secured tool?**
+
+Cassandra stress is not a secured tool. Serialization and other aspects of the tool offer no security guarantees.

@@ -38,6 +38,7 @@ import org.slf4j.LoggerFactory;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.compaction.OperationType;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
+import org.apache.cassandra.io.sstable.metadata.StatsMetadata;
 import org.apache.cassandra.io.util.FileUtils;
 import org.apache.cassandra.metrics.StorageMetrics;
 import org.apache.cassandra.notifications.*;
@@ -245,7 +246,7 @@ public class Tracker
             // It is important that any method accepting/returning a Throwable never throws an exception, and does its best
             // to complete the instructions given to it
             List<LogTransaction.Obsoletion> obsoletions = new ArrayList<>();
-            accumulate = prepareForBulkObsoletion(removed, txnLogs, obsoletions, accumulate);
+            accumulate = prepareForObsoletion(removed, txnLogs, obsoletions, accumulate);
             try
             {
                 txnLogs.finish();
@@ -446,6 +447,14 @@ public class Tracker
             subscriber.handleNotification(notification, this);
     }
 
+    public void notifySSTableMetadataChanged(SSTableReader levelChanged, StatsMetadata oldMetadata)
+    {
+        INotification notification = new SSTableMetadataChanged(levelChanged, oldMetadata);
+        for (INotificationConsumer subscriber : subscribers)
+            subscriber.handleNotification(notification, this);
+
+    }
+
     public void notifyDeleting(SSTableReader deleting)
     {
         INotification notification = new SSTableDeletingNotification(deleting);
@@ -504,5 +513,13 @@ public class Tracker
     public View getView()
     {
         return view.get();
+    }
+
+    @VisibleForTesting
+    public void removeUnsafe(Set<SSTableReader> toRemove)
+    {
+        Pair<View, View> result = apply(view -> {
+            return updateLiveSet(toRemove, emptySet()).apply(view);
+        });
     }
 }

@@ -93,8 +93,8 @@ Table of Contents
   it is moving. The rest of that byte is the protocol version (5 for the protocol
   defined in this document). In other words, for this version of the protocol,
   version will be one of:
-    0x04    Request frame for this protocol version
-    0x84    Response frame for this protocol version
+    0x05    Request frame for this protocol version
+    0x85    Response frame for this protocol version
 
   Please note that while every message ships with the version, only one version
   of messages is accepted on a given connection. In other words, the first message
@@ -332,52 +332,57 @@ Table of Contents
     <query><query_parameters>
   where <query> is a [long string] representing the query and
   <query_parameters> must be
-    <consistency><flags>[<n>[name_1]<value_1>...[name_n]<value_n>][<result_page_size>][<paging_state>][<serial_consistency>][<timestamp>][<keyspace>]
+    <consistency><flags>[<n>[name_1]<value_1>...[name_n]<value_n>][<result_page_size>][<paging_state>][<serial_consistency>][<timestamp>][<keyspace>][<now_in_seconds>]
   where:
     - <consistency> is the [consistency] level for the operation.
     - <flags> is a [int] whose bits define the options for this query and
       in particular influence what the remainder of the message contains.
       A flag is set if the bit corresponding to its `mask` is set. Supported
       flags are, given their mask:
-        0x01: Values. If set, a [short] <n> followed by <n> [value]
-              values are provided. Those values are used for bound variables in
-              the query. Optionally, if the 0x40 flag is present, each value
-              will be preceded by a [string] name, representing the name of
-              the marker the value must be bound to.
-        0x02: Skip_metadata. If set, the Result Set returned as a response
-              to the query (if any) will have the NO_METADATA flag (see
-              Section 4.2.5.2).
-        0x04: Page_size. If set, <result_page_size> is an [int]
-              controlling the desired page size of the result (in CQL3 rows).
-              See the section on paging (Section 8) for more details.
-        0x08: With_paging_state. If set, <paging_state> should be present.
-              <paging_state> is a [bytes] value that should have been returned
-              in a result set (Section 4.2.5.2). The query will be
-              executed but starting from a given paging state. This is also to
-              continue paging on a different node than the one where it
-              started (See Section 8 for more details).
-        0x10: With serial consistency. If set, <serial_consistency> should be
-              present. <serial_consistency> is the [consistency] level for the
-              serial phase of conditional updates. That consitency can only be
-              either SERIAL or LOCAL_SERIAL and if not present, it defaults to
-              SERIAL. This option will be ignored for anything else other than a
-              conditional update/insert.
-        0x20: With default timestamp. If set, <timestamp> should be present.
-              <timestamp> is a [long] representing the default timestamp for the query
-              in microseconds (negative values are forbidden). This will
-              replace the server side assigned timestamp as default timestamp.
-              Note that a timestamp in the query itself will still override
-              this timestamp. This is entirely optional.
-        0x40: With names for values. This only makes sense if the 0x01 flag is set and
-              is ignored otherwise. If present, the values from the 0x01 flag will
-              be preceded by a name (see above). Note that this is only useful for
-              QUERY requests where named bind markers are used; for EXECUTE statements,
-              since the names for the expected values was returned during preparation,
-              a client can always provide values in the right order without any names
-              and using this flag, while supported, is almost surely inefficient.
-        0x80: With keyspace. If set, <keyspace> must be present. <keyspace> is a
-              [string] indicating the keyspace that the query should be executed in.
-              It supercedes the keyspace that the connection is bound to, if any.
+        0x0001: Values. If set, a [short] <n> followed by <n> [value]
+                values are provided. Those values are used for bound variables in
+                the query. Optionally, if the 0x40 flag is present, each value
+                will be preceded by a [string] name, representing the name of
+                the marker the value must be bound to.
+        0x0002: Skip_metadata. If set, the Result Set returned as a response
+                to the query (if any) will have the NO_METADATA flag (see
+                Section 4.2.5.2).
+        0x0004: Page_size. If set, <result_page_size> is an [int]
+                controlling the desired page size of the result (in CQL3 rows).
+                See the section on paging (Section 8) for more details.
+        0x0008: With_paging_state. If set, <paging_state> should be present.
+                <paging_state> is a [bytes] value that should have been returned
+                in a result set (Section 4.2.5.2). The query will be
+                executed but starting from a given paging state. This is also to
+                continue paging on a different node than the one where it
+                started (See Section 8 for more details).
+        0x0010: With serial consistency. If set, <serial_consistency> should be
+                present. <serial_consistency> is the [consistency] level for the
+                serial phase of conditional updates. That consitency can only be
+                either SERIAL or LOCAL_SERIAL and if not present, it defaults to
+                SERIAL. This option will be ignored for anything else other than a
+                conditional update/insert.
+        0x0020: With default timestamp. If set, <timestamp> must be present.
+                <timestamp> is a [long] representing the default timestamp for the query
+                in microseconds (negative values are forbidden). This will
+                replace the server side assigned timestamp as default timestamp.
+                Note that a timestamp in the query itself will still override
+                this timestamp. This is entirely optional.
+        0x0040: With names for values. This only makes sense if the 0x01 flag is set and
+                is ignored otherwise. If present, the values from the 0x01 flag will
+                be preceded by a name (see above). Note that this is only useful for
+                QUERY requests where named bind markers are used; for EXECUTE statements,
+                since the names for the expected values was returned during preparation,
+                a client can always provide values in the right order without any names
+                and using this flag, while supported, is almost surely inefficient.
+        0x0080: With keyspace. If set, <keyspace> must be present. <keyspace> is a
+                [string] indicating the keyspace that the query should be executed in.
+                It supercedes the keyspace that the connection is bound to, if any.
+        0x0100: With now in seconds. If set, <now_in_seconds> must be present.
+                <now_in_seconds> is an [int] representing the current time (now) for
+                the query. Affects TTL cell liveness in read queries and local deletion
+                time for tombstones and TTL cells in update requests. It's intended
+                for testing purposes and is optional.
 
   Note that the consistency is ignored by some queries (USE, CREATE, ALTER,
   TRUNCATE, ...).
@@ -407,12 +412,15 @@ Table of Contents
 4.1.6. EXECUTE
 
   Executes a prepared query. The body of the message must be:
-    <id><query_parameters>
-  where <id> is the prepared query ID. It's the [short bytes] returned as a
-  response to a PREPARE message. As for <query_parameters>, it has the exact
-  same definition as in QUERY (see Section 4.1.4).
-
-  The response from the server will be a RESULT message.
+  <id><result_metadata_id><query_parameters>
+  where
+    - <id> is the prepared query ID. It's the [short bytes] returned as a
+      response to a PREPARE message.
+    - <result_metadata_id> is the ID of the resultset metadata that was sent
+      along with response to PREPARE message. If a RESULT/Rows message reports
+      changed resultset metadata with the Metadata_changed flag, the reported new
+      resultset metadata must be used in subsequent executions.
+    - <query_parameters> has the exact same definition as in QUERY (see Section 4.1.4).
 
 
 4.1.7. BATCH
@@ -420,7 +428,7 @@ Table of Contents
   Allows executing a list of queries (prepared or not) as a batch (note that
   only DML statements are accepted in a batch). The body of the message must
   be:
-    <type><n><query_1>...<query_n><consistency><flags>[<serial_consistency>][<timestamp>][<keyspace>]
+    <type><n><query_1>...<query_n><consistency><flags>[<serial_consistency>][<timestamp>][<keyspace>][<now_in_seconds>]
   where:
     - <type> is a [byte] indicating the type of batch to use:
         - If <type> == 0, the batch will be "logged". This is equivalent to a
@@ -434,27 +442,32 @@ Table of Contents
       bits must always be 0 as their corresponding options do not make sense for
       Batch. A flag is set if the bit corresponding to its `mask` is set. Supported
       flags are, given their mask:
-        0x10: With serial consistency. If set, <serial_consistency> should be
-              present. <serial_consistency> is the [consistency] level for the
-              serial phase of conditional updates. That consistency can only be
-              either SERIAL or LOCAL_SERIAL and if not present, it defaults to
-              SERIAL. This option will be ignored for anything else other than a
-              conditional update/insert.
-        0x20: With default timestamp. If set, <timestamp> should be present.
-              <timestamp> is a [long] representing the default timestamp for the query
-              in microseconds. This will replace the server side assigned
-              timestamp as default timestamp. Note that a timestamp in the query itself
-              will still override this timestamp. This is entirely optional.
-        0x40: With names for values. If set, then all values for all <query_i> must be
-              preceded by a [string] <name_i> that have the same meaning as in QUERY
-              requests [IMPORTANT NOTE: this feature does not work and should not be
-              used. It is specified in a way that makes it impossible for the server
-              to implement. This will be fixed in a future version of the native
-              protocol. See https://issues.apache.org/jira/browse/CASSANDRA-10246 for
-              more details].
-        0x80: With keyspace. If set, <keyspace> must be present. <keyspace> is a
-              [string] indicating the keyspace that the query should be executed in.
-              It supercedes the keyspace that the connection is bound to, if any.
+        0x0010: With serial consistency. If set, <serial_consistency> should be
+                present. <serial_consistency> is the [consistency] level for the
+                serial phase of conditional updates. That consistency can only be
+                either SERIAL or LOCAL_SERIAL and if not present, it defaults to
+                SERIAL. This option will be ignored for anything else other than a
+                conditional update/insert.
+        0x0020: With default timestamp. If set, <timestamp> should be present.
+                <timestamp> is a [long] representing the default timestamp for the query
+                in microseconds. This will replace the server side assigned
+                timestamp as default timestamp. Note that a timestamp in the query itself
+                will still override this timestamp. This is entirely optional.
+        0x0040: With names for values. If set, then all values for all <query_i> must be
+                preceded by a [string] <name_i> that have the same meaning as in QUERY
+                requests [IMPORTANT NOTE: this feature does not work and should not be
+                used. It is specified in a way that makes it impossible for the server
+                to implement. This will be fixed in a future version of the native
+                protocol. See https://issues.apache.org/jira/browse/CASSANDRA-10246 for
+                more details].
+        0x0080: With keyspace. If set, <keyspace> must be present. <keyspace> is a
+                [string] indicating the keyspace that the query should be executed in.
+                It supercedes the keyspace that the connection is bound to, if any.
+        0x0100: With now in seconds. If set, <now_in_seconds> must be present.
+                <now_in_seconds> is an [int] representing the current time (now) for
+                the query. Affects TTL cell liveness in read queries and local deletion
+                time for tombstones and TTL cells in update requests. It's intended
+                for testing purposes and is optional.
     - <n> is a [short] indicating the number of following queries.
     - <query_1>...<query_n> are the queries to execute. A <query_i> must be of the
       form:
@@ -583,7 +596,7 @@ Table of Contents
     <metadata><rows_count><rows_content>
   where:
     - <metadata> is composed of:
-        <flags><columns_count>[<paging_state>][<global_table_spec>?<col_spec_1>...<col_spec_n>]
+        <flags><columns_count>[<paging_state>][<new_metadata_id>][<global_table_spec>?<col_spec_1>...<col_spec_n>]
       where:
         - <flags> is an [int]. The bits of <flags> provides information on the
           formatting of the remaining information. A flag is set if the bit
@@ -604,9 +617,16 @@ Table of Contents
                       no other information (so no <global_table_spec> nor <col_spec_i>).
                       This will only ever be the case if this was requested
                       during the query (see QUERY and RESULT messages).
+            0x0008    Metadata_changed: if set, the No_metadata flag has to be unset
+                      and <new_metadata_id> has to be supplied. This flag is to be
+                      used to avoid a roundtrip in case of metadata changes for queries
+                      that requested metadata to be skipped.
         - <columns_count> is an [int] representing the number of columns selected
           by the query that produced this result. It defines the number of <col_spec_i>
           elements in and the number of elements for each row in <rows_content>.
+        - <new_metadata_id> is [short bytes] representing the new, changed resultset
+           metadata. The new metadata ID must also be used in subsequent executions of
+           the corresponding prepared statement, if any.
         - <global_table_spec> is present if the Global_tables_spec is set in
           <flags>. It is composed of two [string] representing the
           (unique) keyspace name and table name the columns belong to.
@@ -688,9 +708,10 @@ Table of Contents
 4.2.5.4. Prepared
 
   The result to a PREPARE message. The body of a Prepared result is:
-    <id><metadata><result_metadata>
+    <id><result_metadata_id><metadata><result_metadata>
   where:
     - <id> is [short bytes] representing the prepared query ID.
+    - <result_metadata_id> is [short bytes] representing the resultset metadata ID.
     - <metadata> is composed of:
         <flags><columns_count><pk_count>[<pk_index_1>...<pk_index_n>][<global_table_spec>?<col_spec_1>...<col_spec_n>]
       where:
@@ -1099,7 +1120,7 @@ Table of Contents
     0x1003    Truncate_error: error during a truncation error.
     0x1100    Write_timeout: Timeout exception during a write request. The rest
               of the ERROR message body will be
-                <cl><received><blockfor><writeType>
+                <cl><received><blockfor><writeType><contentions>
               where:
                 <cl> is the [consistency] level of the query having triggered
                      the exception.
@@ -1123,6 +1144,14 @@ Table of Contents
                              - "BATCH_LOG": the timeout occurred during the
                                write to the batch log when a (logged) batch
                                write was requested.
+                             - "CAS": the timeout occured during the Compare And Set write/update.
+                             - "VIEW": the timeout occured when a write involves
+                               VIEW update and failure to acqiure local view(MV)
+                               lock for key within timeout
+                             - "CDC": the timeout occured when cdc_total_space_in_mb is
+                               exceeded when doing a write to data tracked by cdc.
+                <contentions> is a [short] that describes the number of contentions occured during the CAS operation.
+                              The field only presents when the <writeType> is "CAS".
     0x1200    Read_timeout: Timeout exception during a read request. The rest
               of the ERROR message body will be
                 <cl><received><blockfor><data_present>
@@ -1198,6 +1227,24 @@ Table of Contents
                              - "BATCH_LOG": the failure occured during the
                                write to the batch log when a (logged) batch
                                write was requested.
+                             - "CAS": the failure occured during the Compare And Set write/update.
+                             - "VIEW": the failure occured when a write involves
+                               VIEW update and failure to acqiure local view(MV)
+                               lock for key within timeout
+                             - "CDC": the failure occured when cdc_total_space_in_mb is
+                               exceeded when doing a write to data tracked by cdc.
+    0x1600    CDC_WRITE_FAILURE: // todo
+    0x1700    CAS_WRITE_UNKNOWN: An exception occured due to contended Compare And Set write/update.
+              The CAS operation was only partially completed and the operation may or may not get completed by
+              the contending CAS write or SERIAL/LOCAL_SERIAL read. The rest of the ERROR message body will be
+                <cl><received><blockfor>
+              where:
+                <cl> is the [consistency] level of the query having triggered
+                     the exception.
+                <received> is an [int] representing the number of nodes having
+                           acknowledged the request.
+                <blockfor> is an [int] representing the number of replicas whose
+                           acknowledgement is required to achieve <cl>.
 
     0x2000    Syntax_error: The submitted query has a syntax error.
     0x2100    Unauthorized: The logged user doesn't have the right to perform
@@ -1229,4 +1276,6 @@ Table of Contents
     (Sections 4.1.4, 4.1.6 and 4.1.7).
   * Add the duration data type
   * Added keyspace field in QUERY, PREPARE, and BATCH messages (Sections 4.1.4, 4.1.5, and 4.1.7).
+  * Added now_in_seconds field in QUERY, EXECUTE, and BATCH messages (Sections 4.1.4, 4.1.6, and 4.1.7).
   * Added [int] flags field in PREPARE message (Section 4.1.5).
+  * Removed NO_COMPACT startup option (Section 4.1.1.)

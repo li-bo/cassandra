@@ -17,6 +17,7 @@
  */
 package org.apache.cassandra.concurrent;
 
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.LockSupport;
@@ -26,6 +27,9 @@ import org.slf4j.LoggerFactory;
 
 import io.netty.util.concurrent.FastThreadLocalThread;
 import org.apache.cassandra.utils.JVMStabilityInspector;
+
+import static org.apache.cassandra.concurrent.SEPExecutor.TakeTaskPermitResult.RETURNED_WORK_PERMIT;
+import static org.apache.cassandra.concurrent.SEPExecutor.TakeTaskPermitResult.TOOK_PERMIT;
 
 final class SEPWorker extends AtomicReference<SEPWorker.Work> implements Runnable
 {
@@ -73,9 +77,14 @@ final class SEPWorker extends AtomicReference<SEPWorker.Work> implements Runnabl
         {
             while (true)
             {
+                if (pool.shuttingDown)
+                    return;
+
                 if (isSpinning() && !selfAssign())
                 {
                     doWaitSpin();
+                    // if the pool is terminating, but we have been assigned STOP_SIGNALLED, if we do not re-check
+                    // whether the pool is shutting down this thread will go to sleep and block forever
                     continue;
                 }
 
@@ -98,6 +107,7 @@ final class SEPWorker extends AtomicReference<SEPWorker.Work> implements Runnabl
                 // (which is also a state that will never be interrupted externally)
                 set(Work.WORKING);
                 boolean shutdown;
+                SEPExecutor.TakeTaskPermitResult status = null; // make sure set if shutdown check short circuits
                 while (true)
                 {
                     // before we process any task, we maybe schedule a new worker _to our executor only_; this
@@ -109,17 +119,27 @@ final class SEPWorker extends AtomicReference<SEPWorker.Work> implements Runnabl
                     task.run();
                     task = null;
 
-                    // if we're shutting down, or we fail to take a permit, we don't perform any more work
-                    if ((shutdown = assigned.shuttingDown) || !assigned.takeTaskPermit())
+                    if (shutdown = assigned.shuttingDown)
                         break;
+
+                    if (TOOK_PERMIT != (status = assigned.takeTaskPermit(true)))
+                        break;
+
                     task = assigned.tasks.poll();
                 }
 
                 // return our work permit, and maybe signal shutdown
-                assigned.returnWorkPermit();
-                if (shutdown && assigned.getActiveCount() == 0)
-                    assigned.shutdown.signalAll();
+                if (status != RETURNED_WORK_PERMIT)
+                    assigned.returnWorkPermit();
+
+                if (shutdown)
+                {
+                    if (assigned.getActiveTaskCount() == 0)
+                        assigned.shutdown.signalAll();
+                    return;
+                }
                 assigned = null;
+
 
                 // try to immediately reassign ourselves some work; if we fail, start spinning
                 if (!selfAssign())
@@ -142,9 +162,9 @@ final class SEPWorker extends AtomicReference<SEPWorker.Work> implements Runnabl
             if (assigned != null)
                 assigned.returnWorkPermit();
             if (task != null)
-                logger.error("Failed to execute task, unexpected exception killed worker: {}", t.getMessage());
+                logger.error("Failed to execute task, unexpected exception killed worker", t);
             else
-                logger.error("Unexpected exception killed worker: {}", t.getMessage());
+                logger.error("Unexpected exception killed worker", t);
         }
     }
 
@@ -168,7 +188,11 @@ final class SEPWorker extends AtomicReference<SEPWorker.Work> implements Runnabl
 
             // if we're being descheduled, place ourselves in the descheduled collection
             if (work.isStop())
+            {
                 pool.descheduled.put(workerId, this);
+                if (pool.shuttingDown)
+                    return true;
+            }
 
             // if we're currently stopped, and the new state is not a stop signal
             // (which we can immediately convert to stopped), unpark the worker
@@ -230,7 +254,7 @@ final class SEPWorker extends AtomicReference<SEPWorker.Work> implements Runnabl
         // we should always have a thread about to wake up, but most threads are sleeping
         long sleep = 10000L * pool.spinningCount.get();
         sleep = Math.min(1000000, sleep);
-        sleep *= Math.random();
+        sleep *= ThreadLocalRandom.current().nextDouble();
         sleep = Math.max(10000, sleep);
 
         long start = System.nanoTime();

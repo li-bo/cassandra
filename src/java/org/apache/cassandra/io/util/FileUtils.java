@@ -18,7 +18,11 @@
 package org.apache.cassandra.io.util;
 
 import java.io.*;
+import java.lang.invoke.MethodHandle;
+import java.lang.invoke.MethodHandles;
+import java.lang.reflect.Method;
 import java.nio.ByteBuffer;
+import java.nio.channels.Channels;
 import java.nio.channels.FileChannel;
 import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
@@ -29,13 +33,15 @@ import java.nio.file.attribute.FileStoreAttributeView;
 import java.text.DecimalFormat;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Optional;
+import java.util.Set;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import sun.nio.ch.DirectBuffer;
 
 import org.apache.cassandra.concurrent.ScheduledExecutors;
 import org.apache.cassandra.io.FSError;
@@ -43,8 +49,11 @@ import org.apache.cassandra.io.FSErrorHandler;
 import org.apache.cassandra.io.FSReadError;
 import org.apache.cassandra.io.FSWriteError;
 import org.apache.cassandra.io.sstable.CorruptSSTableException;
+import org.apache.cassandra.service.StorageService;
 import org.apache.cassandra.utils.JVMStabilityInspector;
+import org.apache.cassandra.utils.SyncUtil;
 
+import static com.google.common.base.Throwables.propagate;
 import static org.apache.cassandra.utils.Throwables.maybeFail;
 import static org.apache.cassandra.utils.Throwables.merge;
 
@@ -59,24 +68,39 @@ public final class FileUtils
     public static final long ONE_TB = 1024 * ONE_GB;
 
     private static final DecimalFormat df = new DecimalFormat("#.##");
-    public static final boolean isCleanerAvailable;
     private static final AtomicReference<Optional<FSErrorHandler>> fsErrorHandler = new AtomicReference<>(Optional.empty());
+
+    private static Class clsDirectBuffer;
+    private static MethodHandle mhDirectBufferCleaner;
+    private static MethodHandle mhCleanerClean;
 
     static
     {
-        boolean canClean = false;
         try
         {
+            clsDirectBuffer = Class.forName("sun.nio.ch.DirectBuffer");
+            Method mDirectBufferCleaner = clsDirectBuffer.getMethod("cleaner");
+            mhDirectBufferCleaner = MethodHandles.lookup().unreflect(mDirectBufferCleaner);
+            Method mCleanerClean = mDirectBufferCleaner.getReturnType().getMethod("clean");
+            mhCleanerClean = MethodHandles.lookup().unreflect(mCleanerClean);
+
             ByteBuffer buf = ByteBuffer.allocateDirect(1);
-            ((DirectBuffer) buf).cleaner().clean();
-            canClean = true;
+            clean(buf);
+        }
+        catch (IllegalAccessException e)
+        {
+            logger.error("FATAL: Cassandra is unable to access required classes. This usually means it has been " +
+                "run without the aid of the standard startup scripts or the scripts have been edited. If this was " +
+                "intentional, and you are attempting to use Java 11+ you may need to add the --add-exports and " +
+                "--add-opens jvm options from either jvm11-server.options or jvm11-client.options");
+            throw new RuntimeException(e);  // causes ExceptionInInitializerError, will prevent startup
         }
         catch (Throwable t)
         {
+            logger.error("FATAL: Cannot initialize optimized memory deallocator.");
             JVMStabilityInspector.inspectThrowable(t);
-            logger.info("Cannot initialize un-mmaper.  (Are you using a non-Oracle JVM?)  Compacted data files will not be removed promptly.  Consider using an Oracle JVM or using standard disk access mode");
+            throw new RuntimeException(t); // causes ExceptionInInitializerError, will prevent startup
         }
-        isCleanerAvailable = canClean;
     }
 
     public static void createHardLink(String from, String to)
@@ -101,11 +125,44 @@ public final class FileUtils
         }
     }
 
+    private static final File tempDir = new File(System.getProperty("java.io.tmpdir"));
+    private static final AtomicLong tempFileNum = new AtomicLong();
+
+    public static File getTempDir()
+    {
+        return tempDir;
+    }
+
+    /**
+     * Pretty much like {@link File#createTempFile(String, String, File)}, but with
+     * the guarantee that the "random" part of the generated file name between
+     * {@code prefix} and {@code suffix} is a positive, increasing {@code long} value.
+     */
     public static File createTempFile(String prefix, String suffix, File directory)
     {
         try
         {
-            return File.createTempFile(prefix, suffix, directory);
+            // Do not use java.io.File.createTempFile(), because some tests rely on the
+            // behavior that the "random" part in the temp file name is a positive 'long'.
+            // However, at least since Java 9 the code to generate the "random" part
+            // uses an _unsigned_ random long generated like this:
+            // Long.toUnsignedString(new java.util.Random.nextLong())
+
+            while (true)
+            {
+                // The contract of File.createTempFile() says, that it must not return
+                // the same file name again. We do that here in a very simple way,
+                // that probably doesn't cover all edge cases. Just rely on system
+                // wall clock and return strictly increasing values from that.
+                long num = tempFileNum.getAndIncrement();
+
+                // We have a positive long here, which is safe to use for example
+                // for CommitLogTest.
+                String fileName = prefix + Long.toString(num) + suffix;
+                File candidate = new File(directory, fileName);
+                if (candidate.createNewFile())
+                    return candidate;
+            }
         }
         catch (IOException e)
         {
@@ -115,22 +172,29 @@ public final class FileUtils
 
     public static File createTempFile(String prefix, String suffix)
     {
-        return createTempFile(prefix, suffix, new File(System.getProperty("java.io.tmpdir")));
+        return createTempFile(prefix, suffix, tempDir);
     }
 
-    public static Throwable deleteWithConfirm(String filePath, boolean expect, Throwable accumulate)
+    public static File createDeletableTempFile(String prefix, String suffix)
     {
-        return deleteWithConfirm(new File(filePath), expect, accumulate);
+        File f = createTempFile(prefix, suffix, getTempDir());
+        f.deleteOnExit();
+        return f;
     }
 
-    public static Throwable deleteWithConfirm(File file, boolean expect, Throwable accumulate)
+    public static Throwable deleteWithConfirm(String filePath, Throwable accumulate)
     {
-        boolean exists = file.exists();
-        assert exists || !expect : "attempted to delete non-existing file " + file.getName();
+        return deleteWithConfirm(new File(filePath), accumulate);
+    }
+
+    public static Throwable deleteWithConfirm(File file, Throwable accumulate)
+    {
         try
         {
-            if (exists)
-                Files.delete(file.toPath());
+            if (!StorageService.instance.isDaemonSetupCompleted())
+                logger.info("Deleting file during startup: {}", file);
+
+            Files.delete(file.toPath());
         }
         catch (Throwable t)
         {
@@ -153,7 +217,7 @@ public final class FileUtils
 
     public static void deleteWithConfirm(File file)
     {
-        maybeFail(deleteWithConfirm(file, true, null));
+        maybeFail(deleteWithConfirm(file, null));
     }
 
     public static void renameWithOutConfirm(String from, String to)
@@ -255,7 +319,7 @@ public final class FileUtils
 
     public static void close(Iterable<? extends Closeable> cs) throws IOException
     {
-        IOException e = null;
+        Throwable e = null;
         for (Closeable c : cs)
         {
             try
@@ -263,14 +327,14 @@ public final class FileUtils
                 if (c != null)
                     c.close();
             }
-            catch (IOException ex)
+            catch (Throwable ex)
             {
-                e = ex;
+                if (e == null) e = ex;
+                else e.addSuppressed(ex);
                 logger.warn("Failed closing stream {}", c, ex);
             }
         }
-        if (e != null)
-            throw e;
+        maybeFail(e, IOException.class);
     }
 
     public static void closeQuietly(Iterable<? extends AutoCloseable> cs)
@@ -316,8 +380,8 @@ public final class FileUtils
     /** Return true if file is contained in folder */
     public static boolean isContained(File folder, File file)
     {
-        String folderPath = getCanonicalPath(folder);
-        String filePath = getCanonicalPath(file);
+        Path folderPath = Paths.get(getCanonicalPath(folder));
+        Path filePath = Paths.get(getCanonicalPath(file));
 
         return filePath.startsWith(folderPath);
     }
@@ -338,13 +402,29 @@ public final class FileUtils
 
     public static void clean(ByteBuffer buffer)
     {
-        if (buffer == null)
+        if (buffer == null || !buffer.isDirect())
             return;
-        if (isCleanerAvailable && buffer.isDirect())
+
+        // TODO Once we can get rid of Java 8, it's simpler to call sun.misc.Unsafe.invokeCleaner(ByteBuffer),
+        // but need to take care of the attachment handling (i.e. whether 'buf' is a duplicate or slice) - that
+        // is different in sun.misc.Unsafe.invokeCleaner and this implementation.
+
+        try
         {
-            DirectBuffer db = (DirectBuffer) buffer;
-            if (db.cleaner() != null)
-                db.cleaner().clean();
+            Object cleaner = mhDirectBufferCleaner.bindTo(buffer).invoke();
+            if (cleaner != null)
+            {
+                // ((DirectBuffer) buf).cleaner().clean();
+                mhCleanerClean.bindTo(cleaner).invoke();
+            }
+        }
+        catch (RuntimeException e)
+        {
+            throw e;
+        }
+        catch (Throwable e)
+        {
+            throw new RuntimeException(e);
         }
     }
 
@@ -364,6 +444,9 @@ public final class FileUtils
 
     public static boolean delete(String file)
     {
+        if (!StorageService.instance.isDaemonSetupCompleted())
+            logger.info("Deleting file during startup: {}", file);
+
         File f = new File(file);
         return f.delete();
     }
@@ -372,6 +455,9 @@ public final class FileUtils
     {
         for ( File file : files )
         {
+            if (!StorageService.instance.isDaemonSetupCompleted())
+                logger.info("Deleting file during startup: {}", file);
+
             file.delete();
         }
     }
@@ -386,6 +472,45 @@ public final class FileUtils
             }
         };
         ScheduledExecutors.nonPeriodicTasks.execute(runnable);
+    }
+
+    public static long parseFileSize(String value)
+    {
+        long result;
+        if (!value.matches("\\d+(\\.\\d+)? (GiB|KiB|MiB|TiB|bytes)"))
+        {
+            throw new IllegalArgumentException(
+                String.format("value %s is not a valid human-readable file size", value));
+        }
+        if (value.endsWith(" TiB"))
+        {
+            result = Math.round(Double.valueOf(value.replace(" TiB", "")) * ONE_TB);
+            return result;
+        }
+        else if (value.endsWith(" GiB"))
+        {
+            result = Math.round(Double.valueOf(value.replace(" GiB", "")) * ONE_GB);
+            return result;
+        }
+        else if (value.endsWith(" KiB"))
+        {
+            result = Math.round(Double.valueOf(value.replace(" KiB", "")) * ONE_KB);
+            return result;
+        }
+        else if (value.endsWith(" MiB"))
+        {
+            result = Math.round(Double.valueOf(value.replace(" MiB", "")) * ONE_MB);
+            return result;
+        }
+        else if (value.endsWith(" bytes"))
+        {
+            result = Math.round(Double.valueOf(value.replace(" bytes", "")));
+            return result;
+        }
+        else
+        {
+            throw new IllegalStateException(String.format("FileUtils.parseFileSize() reached an illegal state parsing %s", value));
+        }
     }
 
     public static String stringifyFileSize(double value)
@@ -465,6 +590,20 @@ public final class FileUtils
     public static void handleFSError(FSError e)
     {
         fsErrorHandler.get().ifPresent(handler -> handler.handleFSError(e));
+    }
+
+    /**
+     * handleFSErrorAndPropagate will invoke the disk failure policy error handler,
+     * which may or may not stop the daemon or transports. However, if we don't exit,
+     * we still want to propagate the exception to the caller in case they have custom
+     * exception handling
+     *
+     * @param e A filesystem error
+     */
+    public static void handleFSErrorAndPropagate(FSError e)
+    {
+        handleFSError(e);
+        throw propagate(e);
     }
 
     /**
@@ -550,14 +689,46 @@ public final class FileUtils
         write(file, Arrays.asList(lines), StandardOpenOption.TRUNCATE_EXISTING);
     }
 
+    /**
+     * Write lines to a file adding a newline to the end of each supplied line using the provided open options.
+     *
+     * If open option sync or dsync is provided this will not open the file with sync or dsync since it might end up syncing
+     * many times for a lot of lines. Instead it will write all the lines and sync once at the end. Since the file is
+     * never returned there is not much difference from the perspective of the caller.
+     * @param file
+     * @param lines
+     * @param options
+     */
     public static void write(File file, List<String> lines, StandardOpenOption ... options)
     {
-        try
+        Set<StandardOpenOption> optionsSet = new HashSet<>(Arrays.asList(options));
+        //Emulate the old FileSystemProvider.newOutputStream behavior for open options.
+        if (optionsSet.isEmpty())
         {
-            Files.write(file.toPath(),
-                        lines,
-                        CHARSET,
-                        options);
+            optionsSet.add(StandardOpenOption.CREATE);
+            optionsSet.add(StandardOpenOption.TRUNCATE_EXISTING);
+        }
+        boolean sync = optionsSet.remove(StandardOpenOption.SYNC);
+        boolean dsync = optionsSet.remove(StandardOpenOption.DSYNC);
+        optionsSet.add(StandardOpenOption.WRITE);
+
+        Path filePath = file.toPath();
+        try (FileChannel fc = filePath.getFileSystem().provider().newFileChannel(filePath, optionsSet);
+             BufferedWriter writer = new BufferedWriter(new OutputStreamWriter(Channels.newOutputStream(fc), CHARSET.newEncoder())))
+        {
+            for (CharSequence line: lines) {
+                writer.append(line);
+                writer.newLine();
+            }
+
+            if (sync)
+            {
+                SyncUtil.force(fc, true);
+            }
+            else if (dsync)
+            {
+                SyncUtil.force(fc, false);
+            }
         }
         catch (IOException ex)
         {

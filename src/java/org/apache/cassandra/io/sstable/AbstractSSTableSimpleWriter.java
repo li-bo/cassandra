@@ -69,13 +69,14 @@ abstract class AbstractSSTableSimpleWriter implements Closeable
         SerializationHeader header = new SerializationHeader(true, metadata.get(), columns, EncodingStats.NO_STATS);
 
         if (makeRangeAware)
-            return SSTableTxnWriter.createRangeAware(metadata, 0,  ActiveRepairService.UNREPAIRED_SSTABLE, ActiveRepairService.NO_PENDING_REPAIR, formatType, 0, header);
+            return SSTableTxnWriter.createRangeAware(metadata, 0,  ActiveRepairService.UNREPAIRED_SSTABLE, ActiveRepairService.NO_PENDING_REPAIR, false, formatType, 0, header);
 
         return SSTableTxnWriter.create(metadata,
                                        createDescriptor(directory, metadata.keyspace, metadata.name, formatType),
                                        0,
                                        ActiveRepairService.UNREPAIRED_SSTABLE,
                                        ActiveRepairService.NO_PENDING_REPAIR,
+                                       false,
                                        0,
                                        header,
                                        Collections.emptySet());
@@ -115,7 +116,7 @@ abstract class AbstractSSTableSimpleWriter implements Closeable
         return maxGen;
     }
 
-    PartitionUpdate getUpdateFor(ByteBuffer key) throws IOException
+    PartitionUpdate.Builder getUpdateFor(ByteBuffer key) throws IOException
     {
         return getUpdateFor(metadata.get().partitioner.decorateKey(key));
     }
@@ -126,6 +127,6 @@ abstract class AbstractSSTableSimpleWriter implements Closeable
      * @param key they partition key for which the returned update will be.
      * @return an update on partition {@code key} that is tied to this writer.
      */
-    abstract PartitionUpdate getUpdateFor(DecoratedKey key) throws IOException;
+    abstract PartitionUpdate.Builder getUpdateFor(DecoratedKey key) throws IOException;
 }
 

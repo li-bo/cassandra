@@ -123,7 +123,7 @@ public class CompositesSearcher extends CassandraIndexSearcher
                                                                     RowFilter.NONE,
                                                                     DataLimits.NONE,
                                                                     partitionKey,
-                                                                    new ClusteringIndexSliceFilter(Slices.ALL, false));
+                                                                    command.clusteringIndexFilter(partitionKey));
                         entries.add(nextEntry);
                         nextEntry = indexHits.hasNext() ? index.decodeEntry(indexKey, indexHits.next()) : null;
                     }
@@ -170,7 +170,7 @@ public class CompositesSearcher extends CassandraIndexSearcher
                         filterStaleEntries(dataCmd.queryMemtableAndDisk(index.baseCfs, executionController),
                                            indexKey.getKey(),
                                            entries,
-                                           executionController.writeOpOrderGroup(),
+                                           executionController.getWriteContext(),
                                            command.nowInSec());
 
                     if (dataIter.isEmpty())
@@ -198,20 +198,21 @@ public class CompositesSearcher extends CassandraIndexSearcher
         };
     }
 
-    private void deleteAllEntries(final List<IndexEntry> entries, final OpOrder.Group writeOp, final int nowInSec)
+    private void deleteAllEntries(final List<IndexEntry> entries, final WriteContext ctx, final int nowInSec)
     {
         entries.forEach(entry ->
             index.deleteStaleEntry(entry.indexValue,
                                    entry.indexClustering,
                                    new DeletionTime(entry.timestamp, nowInSec),
-                                   writeOp));
+                                   ctx));
     }
 
     // We assume all rows in dataIter belong to the same partition.
+    @SuppressWarnings("resource")
     private UnfilteredRowIterator filterStaleEntries(UnfilteredRowIterator dataIter,
                                                      final ByteBuffer indexValue,
                                                      final List<IndexEntry> entries,
-                                                     final OpOrder.Group writeOp,
+                                                     final WriteContext ctx,
                                                      final int nowInSec)
     {
         // collect stale index entries and delete them when we close this iterator
@@ -245,7 +246,7 @@ public class CompositesSearcher extends CassandraIndexSearcher
                                                                          dataIter.partitionLevelDeletion(),
                                                                          dataIter.isReverseOrder());
             }
-            deleteAllEntries(staleEntries, writeOp, nowInSec);
+            deleteAllEntries(staleEntries, ctx, nowInSec);
         }
         else
         {
@@ -272,27 +273,40 @@ public class CompositesSearcher extends CassandraIndexSearcher
                     while (entriesIdx < entries.size())
                     {
                         IndexEntry entry = entries.get(entriesIdx++);
+                        Clustering indexedEntryClustering = entry.indexedEntryClustering;
                         // The entries are in clustering order. So that the requested entry should be the
                         // next entry, the one at 'entriesIdx'. However, we can have stale entries, entries
                         // that have no corresponding row in the base table typically because of a range
                         // tombstone or partition level deletion. Delete such stale entries.
                         // For static column, we only need to compare the partition key, otherwise we compare
                         // the whole clustering.
-                        int cmp = comparator.compare(entry.indexedEntryClustering, clustering);
+                        int cmp = comparator.compare(indexedEntryClustering, clustering);
                         assert cmp <= 0; // this would means entries are not in clustering order, which shouldn't happen
                         if (cmp == 0)
                             return entry;
-                        else
-                            staleEntries.add(entry);
+
+                        // COMPACT COMPOSITE tables support null values in there clustering key but
+                        // those tables do not support static columns. By consequence if a table
+                        // has some static columns and all its clustering key elements are null
+                        // it means that the partition exists and contains only static data
+                       if (!dataIter.metadata().hasStaticColumns() || !containsOnlyNullValues(indexedEntryClustering))
+                           staleEntries.add(entry);
                     }
                     // entries correspond to the rows we've queried, so we shouldn't have a row that has no corresponding entry.
                     throw new AssertionError();
                 }
 
+                private boolean containsOnlyNullValues(Clustering indexedEntryClustering)
+                {
+                    int i = 0;
+                    for (; i < indexedEntryClustering.size() && indexedEntryClustering.get(i) == null; i++);
+                    return i == indexedEntryClustering.size();
+                }
+
                 @Override
                 public void onPartitionClose()
                 {
-                    deleteAllEntries(staleEntries, writeOp, nowInSec);
+                    deleteAllEntries(staleEntries, ctx, nowInSec);
                 }
             }
             iteratorToReturn = Transformation.apply(dataIter, new Transform());

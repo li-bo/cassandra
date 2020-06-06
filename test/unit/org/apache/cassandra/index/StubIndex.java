@@ -36,7 +36,6 @@ import org.apache.cassandra.exceptions.InvalidRequestException;
 import org.apache.cassandra.index.transactions.IndexTransaction;
 import org.apache.cassandra.schema.IndexMetadata;
 import org.apache.cassandra.utils.Pair;
-import org.apache.cassandra.utils.concurrent.OpOrder;
 
 /**
  * Basic custom index implementation for testing.
@@ -100,7 +99,7 @@ public class StubIndex implements Index
     public Indexer indexerFor(final DecoratedKey key,
                               RegularAndStaticColumns columns,
                               int nowInSec,
-                              OpOrder.Group opGroup,
+                              WriteContext ctx,
                               IndexTransaction.Type transactionType)
     {
         return new Indexer()

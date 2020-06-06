@@ -20,7 +20,6 @@ package org.apache.cassandra.db.partitions;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
-import java.util.Iterator;
 import java.util.List;
 
 import com.google.common.collect.Iterables;
@@ -31,12 +30,12 @@ import org.slf4j.LoggerFactory;
 import org.apache.cassandra.db.*;
 import org.apache.cassandra.db.filter.ColumnFilter;
 import org.apache.cassandra.db.rows.*;
+import org.apache.cassandra.index.IndexRegistry;
 import org.apache.cassandra.io.util.*;
 import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.schema.Schema;
 import org.apache.cassandra.schema.TableId;
 import org.apache.cassandra.schema.TableMetadata;
-import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.btree.BTree;
 import org.apache.cassandra.utils.btree.UpdateFunction;
 
@@ -60,37 +59,11 @@ public class PartitionUpdate extends AbstractBTreePartition
 
     public static final PartitionUpdateSerializer serializer = new PartitionUpdateSerializer();
 
-    private final int createdAtInSec = FBUtilities.nowInSeconds();
-
-    // Records whether this update is "built", i.e. if the build() method has been called, which
-    // happens when the update is read. Further writing is then rejected though a manual call
-    // to allowNewUpdates() allow new writes. We could make that more implicit but only triggers
-    // really requires that so we keep it simple for now).
-    private volatile boolean isBuilt;
-    private boolean canReOpen = true;
-
-    private Holder holder;
-    private BTree.Builder<Row> rowBuilder;
-    private MutableDeletionInfo deletionInfo;
-
-    private final boolean canHaveShadowedData;
-
+    private final Holder holder;
+    private final DeletionInfo deletionInfo;
     private final TableMetadata metadata;
 
-    private PartitionUpdate(TableMetadata metadata,
-                            DecoratedKey key,
-                            RegularAndStaticColumns columns,
-                            MutableDeletionInfo deletionInfo,
-                            int initialRowCapacity,
-                            boolean canHaveShadowedData)
-    {
-        super(key);
-        this.metadata = metadata;
-        this.deletionInfo = deletionInfo;
-        this.holder = new Holder(columns, BTree.empty(), deletionInfo, Rows.EMPTY_STATIC_ROW, EncodingStats.NO_STATS);
-        this.canHaveShadowedData = canHaveShadowedData;
-        rowBuilder = builder(initialRowCapacity);
-    }
+    private final boolean canHaveShadowedData;
 
     private PartitionUpdate(TableMetadata metadata,
                             DecoratedKey key,
@@ -102,27 +75,7 @@ public class PartitionUpdate extends AbstractBTreePartition
         this.metadata = metadata;
         this.holder = holder;
         this.deletionInfo = deletionInfo;
-        this.isBuilt = true;
         this.canHaveShadowedData = canHaveShadowedData;
-    }
-
-    public PartitionUpdate(TableMetadata metadata,
-                           DecoratedKey key,
-                           RegularAndStaticColumns columns,
-                           int initialRowCapacity)
-    {
-        this(metadata, key, columns, MutableDeletionInfo.live(), initialRowCapacity, true);
-    }
-
-    public PartitionUpdate(TableMetadata metadata,
-                           ByteBuffer key,
-                           RegularAndStaticColumns columns,
-                           int initialRowCapacity)
-    {
-        this(metadata,
-             metadata.partitioner.decorateKey(key),
-             columns,
-             initialRowCapacity);
     }
 
     /**
@@ -162,23 +115,39 @@ public class PartitionUpdate extends AbstractBTreePartition
      *
      * @param metadata the metadata for the created update.
      * @param key the partition key for the partition to update.
-     * @param row the row for the update.
+     * @param row the row for the update (may be null).
+     * @param row the static row for the update (may be null).
+     *
+     * @return the newly created partition update containing only {@code row}.
+     */
+    public static PartitionUpdate singleRowUpdate(TableMetadata metadata, DecoratedKey key, Row row, Row staticRow)
+    {
+        MutableDeletionInfo deletionInfo = MutableDeletionInfo.live();
+        Holder holder = new Holder(
+            new RegularAndStaticColumns(
+                staticRow == null ? Columns.NONE : Columns.from(staticRow.columns()),
+                row == null ? Columns.NONE : Columns.from(row.columns())
+            ),
+            row == null ? BTree.empty() : BTree.singleton(row),
+            deletionInfo,
+            staticRow == null ? Rows.EMPTY_STATIC_ROW : staticRow,
+            EncodingStats.NO_STATS
+        );
+        return new PartitionUpdate(metadata, key, holder, deletionInfo, false);
+    }
+
+    /**
+     * Creates an immutable partition update that contains a single row update.
+     *
+     * @param metadata the metadata for the created update.
+     * @param key the partition key for the partition to update.
+     * @param row the row for the update (may be static).
      *
      * @return the newly created partition update containing only {@code row}.
      */
     public static PartitionUpdate singleRowUpdate(TableMetadata metadata, DecoratedKey key, Row row)
     {
-        MutableDeletionInfo deletionInfo = MutableDeletionInfo.live();
-        if (row.isStatic())
-        {
-            Holder holder = new Holder(new RegularAndStaticColumns(Columns.from(row.columns()), Columns.NONE), BTree.empty(), deletionInfo, row, EncodingStats.NO_STATS);
-            return new PartitionUpdate(metadata, key, holder, deletionInfo, false);
-        }
-        else
-        {
-            Holder holder = new Holder(new RegularAndStaticColumns(Columns.NONE, Columns.from(row.columns())), BTree.singleton(row), deletionInfo, Rows.EMPTY_STATIC_ROW, EncodingStats.NO_STATS);
-            return new PartitionUpdate(metadata, key, holder, deletionInfo, false);
-        }
+        return singleRowUpdate(metadata, key, row.isStatic() ? null : row, row.isStatic() ? row : null);
     }
 
     /**
@@ -206,6 +175,7 @@ public class PartitionUpdate extends AbstractBTreePartition
      * Warning: this method does not close the provided iterator, it is up to
      * the caller to close it.
      */
+    @SuppressWarnings("resource")
     public static PartitionUpdate fromIterator(UnfilteredRowIterator iterator, ColumnFilter filter)
     {
         iterator = UnfilteredRowIterators.withOnlyQueriedData(iterator, filter);
@@ -225,6 +195,7 @@ public class PartitionUpdate extends AbstractBTreePartition
      * Warning: this method does not close the provided iterator, it is up to
      * the caller to close it.
      */
+    @SuppressWarnings("resource")
     public static PartitionUpdate fromIterator(RowIterator iterator, ColumnFilter filter)
     {
         iterator = RowIterators.withOnlyQueriedData(iterator, filter);
@@ -246,6 +217,7 @@ public class PartitionUpdate extends AbstractBTreePartition
      *
      * @return the deserialized update or {@code null} if {@code bytes == null}.
      */
+    @SuppressWarnings("resource")
     public static PartitionUpdate fromBytes(ByteBuffer bytes, int version)
     {
         if (bytes == null)
@@ -255,7 +227,7 @@ public class PartitionUpdate extends AbstractBTreePartition
         {
             return serializer.deserialize(new DataInputBuffer(bytes, true),
                                           version,
-                                          SerializationHelper.Flag.LOCAL);
+                                          DeserializationHelper.Flag.LOCAL);
         }
         catch (IOException e)
         {
@@ -314,9 +286,8 @@ public class PartitionUpdate extends AbstractBTreePartition
         if (size == 1)
             return Iterables.getOnlyElement(updates);
 
-        int nowInSecs = FBUtilities.nowInSeconds();
         List<UnfilteredRowIterator> asIterators = Lists.transform(updates, AbstractBTreePartition::unfilteredIterator);
-        return fromIterator(UnfilteredRowIterators.merge(asIterators, nowInSecs), ColumnFilter.all(updates.get(0).metadata()));
+        return fromIterator(UnfilteredRowIterators.merge(asIterators), ColumnFilter.all(updates.get(0).metadata()));
     }
 
     // We override this, because the version in the super-class calls holder(), which build the update preventing
@@ -326,30 +297,6 @@ public class PartitionUpdate extends AbstractBTreePartition
     public DeletionInfo deletionInfo()
     {
         return deletionInfo;
-    }
-
-    /**
-     * Modify this update to set every timestamp for live data to {@code newTimestamp} and
-     * every deletion timestamp to {@code newTimestamp - 1}.
-     *
-     * There is no reason to use that expect on the Paxos code path, where we need ensure that
-     * anything inserted use the ballot timestamp (to respect the order of update decided by
-     * the Paxos algorithm). We use {@code newTimestamp - 1} for deletions because tombstones
-     * always win on timestamp equality and we don't want to delete our own insertions
-     * (typically, when we overwrite a collection, we first set a complex deletion to delete the
-     * previous collection before adding new elements. If we were to set that complex deletion
-     * to the same timestamp that the new elements, it would delete those elements). And since
-     * tombstones always wins on timestamp equality, using -1 guarantees our deletion will still
-     * delete anything from a previous update.
-     */
-    public void updateAllTimestamp(long newTimestamp)
-    {
-        Holder holder = holder();
-        deletionInfo.updateAllTimestamp(newTimestamp - 1);
-        Object[] tree = BTree.<Row>transformAndFilter(holder.tree, (x) -> x.updateAllTimestamp(newTimestamp));
-        Row staticRow = holder.staticRow.updateAllTimestamp(newTimestamp);
-        EncodingStats newStats = EncodingStats.Collector.collect(staticRow, BTree.<Row>iterator(tree), deletionInfo);
-        this.holder = new Holder(holder.columns, tree, deletionInfo, staticRow, newStats);
     }
 
     /**
@@ -376,6 +323,15 @@ public class PartitionUpdate extends AbstractBTreePartition
     public int dataSize()
     {
         int size = 0;
+
+        if (holder.staticRow != null)
+        {
+            for (ColumnData cd : holder.staticRow.columnData())
+            {
+                size += cd.dataSize();
+            }
+        }
+
         for (Row row : this)
         {
             size += row.clustering().dataSize();
@@ -401,57 +357,12 @@ public class PartitionUpdate extends AbstractBTreePartition
 
     protected Holder holder()
     {
-        maybeBuild();
         return holder;
     }
 
     public EncodingStats stats()
     {
         return holder().stats;
-    }
-
-    /**
-     * If a partition update has been read (and is thus unmodifiable), a call to this method
-     * makes the update modifiable again.
-     * <p>
-     * Please note that calling this method won't result in optimal behavior in the sense that
-     * even if very little is added to the update after this call, the whole update will be sorted
-     * again on read. This should thus be used sparingly (and if it turns that we end up using
-     * this often, we should consider optimizing the behavior).
-     */
-    public synchronized void allowNewUpdates()
-    {
-        if (!canReOpen)
-            throw new IllegalStateException("You cannot do more updates on collectCounterMarks has been called");
-
-        // This is synchronized to make extra sure things work properly even if this is
-        // called concurrently with sort() (which should be avoided in the first place, but
-        // better safe than sorry).
-        isBuilt = false;
-        if (rowBuilder == null)
-            rowBuilder = builder(16);
-    }
-
-    private BTree.Builder<Row> builder(int initialCapacity)
-    {
-        return BTree.<Row>builder(metadata().comparator, initialCapacity)
-                    .setQuickResolver((a, b) ->
-                                      Rows.merge(a, b, createdAtInSec));
-    }
-
-    /**
-     * Returns an iterator that iterates over the rows of this update in clustering order.
-     * <p>
-     * Note that this might trigger a sorting of the update, and as such the update will not
-     * be modifiable anymore after this call.
-     *
-     * @return an iterator over the rows of this update.
-     */
-    @Override
-    public Iterator<Row> iterator()
-    {
-        maybeBuild();
-        return super.iterator();
     }
 
     /**
@@ -476,8 +387,6 @@ public class PartitionUpdate extends AbstractBTreePartition
      */
     public long maxTimestamp()
     {
-        maybeBuild();
-
         long maxTimestamp = deletionInfo.maxTimestamp();
         for (Row row : this)
         {
@@ -497,6 +406,24 @@ public class PartitionUpdate extends AbstractBTreePartition
                 }
             }
         }
+
+        if (this.holder.staticRow != null)
+        {
+            for (ColumnData cd : this.holder.staticRow.columnData())
+            {
+                if (cd.column().isSimple())
+                {
+                    maxTimestamp = Math.max(maxTimestamp, ((Cell) cd).timestamp());
+                }
+                else
+                {
+                    ComplexColumnData complexData = (ComplexColumnData) cd;
+                    maxTimestamp = Math.max(maxTimestamp, complexData.complexDeletion().markedForDeleteAt());
+                    for (Cell cell : complexData)
+                        maxTimestamp = Math.max(maxTimestamp, cell.timestamp());
+                }
+            }
+        }
         return maxTimestamp;
     }
 
@@ -509,11 +436,8 @@ public class PartitionUpdate extends AbstractBTreePartition
     public List<CounterMark> collectCounterMarks()
     {
         assert metadata().isCounter();
-        maybeBuild();
         // We will take aliases on the rows of this update, and update them in-place. So we should be sure the
         // update is now immutable for all intent and purposes.
-        canReOpen = false;
-
         List<CounterMark> marks = new ArrayList<>();
         addMarksForRow(staticRow(), marks);
         for (Row row : this)
@@ -521,116 +445,13 @@ public class PartitionUpdate extends AbstractBTreePartition
         return marks;
     }
 
-    private void addMarksForRow(Row row, List<CounterMark> marks)
+    private static void addMarksForRow(Row row, List<CounterMark> marks)
     {
         for (Cell cell : row.cells())
         {
             if (cell.isCounterCell())
                 marks.add(new CounterMark(row, cell.column(), cell.path()));
         }
-    }
-
-    private void assertNotBuilt()
-    {
-        if (isBuilt)
-            throw new IllegalStateException("An update should not be written again once it has been read");
-    }
-
-    public void addPartitionDeletion(DeletionTime deletionTime)
-    {
-        assertNotBuilt();
-        deletionInfo.add(deletionTime);
-    }
-
-    public void add(RangeTombstone range)
-    {
-        assertNotBuilt();
-        deletionInfo.add(range, metadata().comparator);
-    }
-
-    /**
-     * Adds a row to this update.
-     *
-     * There is no particular assumption made on the order of row added to a partition update. It is further
-     * allowed to add the same row (more precisely, multiple row objects for the same clustering).
-     *
-     * Note however that the columns contained in the added row must be a subset of the columns used when
-     * creating this update.
-     *
-     * @param row the row to add.
-     */
-    public void add(Row row)
-    {
-        if (row.isEmpty())
-            return;
-
-        assertNotBuilt();
-
-        if (row.isStatic())
-        {
-            // this assert is expensive, and possibly of limited value; we should consider removing it
-            // or introducing a new class of assertions for test purposes
-            assert columns().statics.containsAll(row.columns()) : columns().statics + " is not superset of " + row.columns();
-            Row staticRow = holder.staticRow.isEmpty()
-                      ? row
-                      : Rows.merge(holder.staticRow, row, createdAtInSec);
-            holder = new Holder(holder.columns, holder.tree, holder.deletionInfo, staticRow, holder.stats);
-        }
-        else
-        {
-            // this assert is expensive, and possibly of limited value; we should consider removing it
-            // or introducing a new class of assertions for test purposes
-            assert columns().regulars.containsAll(row.columns()) : columns().regulars + " is not superset of " + row.columns();
-            rowBuilder.add(row);
-        }
-    }
-
-    private void maybeBuild()
-    {
-        if (isBuilt)
-            return;
-
-        build();
-    }
-
-    private synchronized void build()
-    {
-        if (isBuilt)
-            return;
-
-        Holder holder = this.holder;
-        Object[] cur = holder.tree;
-        Object[] add = rowBuilder.build();
-        Object[] merged = BTree.<Row>merge(cur, add, metadata().comparator,
-                                           UpdateFunction.Simple.of((a, b) -> Rows.merge(a, b, createdAtInSec)));
-
-        assert deletionInfo == holder.deletionInfo;
-        EncodingStats newStats = EncodingStats.Collector.collect(holder.staticRow, BTree.<Row>iterator(merged), deletionInfo);
-
-        this.holder = new Holder(holder.columns, merged, holder.deletionInfo, holder.staticRow, newStats);
-        rowBuilder = null;
-        isBuilt = true;
-    }
-
-    @Override
-    public String toString()
-    {
-        if (isBuilt)
-            return super.toString();
-
-        // We intentionally override AbstractBTreePartition#toString() to avoid iterating over the rows in the
-        // partition, which can result in build() being triggered and lead to errors if the PartitionUpdate is later
-        // modified.
-
-        StringBuilder sb = new StringBuilder();
-        sb.append(String.format("[%s] key=%s columns=%s",
-                                metadata.toString(),
-                                metadata.partitionKeyType.getString(partitionKey().getKey()),
-                                columns()));
-
-        sb.append("\n    deletionInfo=").append(deletionInfo);
-        sb.append(" (not built)");
-        return sb.toString();
     }
 
     /**
@@ -645,6 +466,11 @@ public class PartitionUpdate extends AbstractBTreePartition
     public static SimpleBuilder simpleBuilder(TableMetadata metadata, Object... partitionKeyValues)
     {
         return new SimpleBuilders.PartitionUpdateBuilder(metadata, partitionKeyValues);
+    }
+
+    public void validateIndexedColumns()
+    {
+        IndexRegistry.obtain(metadata()).validate(this);
     }
 
     /**
@@ -710,6 +536,13 @@ public class PartitionUpdate extends AbstractBTreePartition
          * @return the range tombstone builder for the newly added range.
          */
         public RangeTombstoneBuilder addRangeTombstone();
+
+        /**
+         * Adds a new range tombstone to this update
+         *
+         * @return this builder
+         */
+        public SimpleBuilder addRangeTombstone(RangeTombstone rt);
 
         /**
          * Build the update represented by this builder.
@@ -800,7 +633,7 @@ public class PartitionUpdate extends AbstractBTreePartition
             }
         }
 
-        public PartitionUpdate deserialize(DataInputPlus in, int version, SerializationHelper.Flag flag) throws IOException
+        public PartitionUpdate deserialize(DataInputPlus in, int version, DeserializationHelper.Flag flag) throws IOException
         {
             TableMetadata metadata = Schema.instance.getExistingTableMetadata(TableId.deserialize(in));
             UnfilteredRowIteratorSerializer.Header header = UnfilteredRowIteratorSerializer.serializer.deserializeHeader(metadata, null, in, version, flag);
@@ -890,6 +723,207 @@ public class PartitionUpdate extends AbstractBTreePartition
             // for counters however and this won't be needed post-#6506 so that's probably fine.
             assert row instanceof BTreeRow;
             ((BTreeRow)row).setValue(column, path, value);
+        }
+    }
+
+    /**
+     * Builder for PartitionUpdates
+     *
+     * This class is not thread safe, but the PartitionUpdate it produces is (since it is immutable).
+     */
+    public static class Builder
+    {
+        private final TableMetadata metadata;
+        private final DecoratedKey key;
+        private final MutableDeletionInfo deletionInfo;
+        private final boolean canHaveShadowedData;
+        private Object[] tree = BTree.empty();
+        private final BTree.Builder<Row> rowBuilder;
+        private Row staticRow = Rows.EMPTY_STATIC_ROW;
+        private final RegularAndStaticColumns columns;
+        private boolean isBuilt = false;
+
+        public Builder(TableMetadata metadata,
+                       DecoratedKey key,
+                       RegularAndStaticColumns columns,
+                       int initialRowCapacity,
+                       boolean canHaveShadowedData)
+        {
+            this(metadata, key, columns, initialRowCapacity, canHaveShadowedData, Rows.EMPTY_STATIC_ROW, MutableDeletionInfo.live(), BTree.empty());
+        }
+
+        private Builder(TableMetadata metadata,
+                       DecoratedKey key,
+                       RegularAndStaticColumns columns,
+                       int initialRowCapacity,
+                       boolean canHaveShadowedData,
+                       Holder holder)
+        {
+            this(metadata, key, columns, initialRowCapacity, canHaveShadowedData, holder.staticRow, holder.deletionInfo, holder.tree);
+        }
+
+        private Builder(TableMetadata metadata,
+                        DecoratedKey key,
+                        RegularAndStaticColumns columns,
+                        int initialRowCapacity,
+                        boolean canHaveShadowedData,
+                        Row staticRow,
+                        DeletionInfo deletionInfo,
+                        Object[] tree)
+        {
+            this.metadata = metadata;
+            this.key = key;
+            this.columns = columns;
+            this.rowBuilder = rowBuilder(initialRowCapacity);
+            this.canHaveShadowedData = canHaveShadowedData;
+            this.deletionInfo = deletionInfo.mutableCopy();
+            this.staticRow = staticRow;
+            this.tree = tree;
+        }
+
+        public Builder(TableMetadata metadata, DecoratedKey key, RegularAndStaticColumns columnDefinitions, int size)
+        {
+            this(metadata, key, columnDefinitions, size, true);
+        }
+
+        public Builder(PartitionUpdate base, int initialRowCapacity)
+        {
+            this(base.metadata, base.partitionKey, base.columns(), initialRowCapacity, base.canHaveShadowedData, base.holder);
+        }
+
+        public Builder(TableMetadata metadata,
+                        ByteBuffer key,
+                        RegularAndStaticColumns columns,
+                        int initialRowCapacity)
+        {
+            this(metadata, metadata.partitioner.decorateKey(key), columns, initialRowCapacity, true);
+        }
+
+        /**
+         * Adds a row to this update.
+         *
+         * There is no particular assumption made on the order of row added to a partition update. It is further
+         * allowed to add the same row (more precisely, multiple row objects for the same clustering).
+         *
+         * Note however that the columns contained in the added row must be a subset of the columns used when
+         * creating this update.
+         *
+         * @param row the row to add.
+         */
+        public void add(Row row)
+        {
+            if (row.isEmpty())
+                return;
+
+            if (row.isStatic())
+            {
+                // this assert is expensive, and possibly of limited value; we should consider removing it
+                // or introducing a new class of assertions for test purposes
+                assert columns().statics.containsAll(row.columns()) : columns().statics + " is not superset of " + row.columns();
+                staticRow = staticRow.isEmpty()
+                            ? row
+                            : Rows.merge(staticRow, row);
+            }
+            else
+            {
+                // this assert is expensive, and possibly of limited value; we should consider removing it
+                // or introducing a new class of assertions for test purposes
+                assert columns().regulars.containsAll(row.columns()) : columns().regulars + " is not superset of " + row.columns();
+                rowBuilder.add(row);
+            }
+        }
+
+        public void addPartitionDeletion(DeletionTime deletionTime)
+        {
+            deletionInfo.add(deletionTime);
+        }
+
+        public void add(RangeTombstone range)
+        {
+            deletionInfo.add(range, metadata.comparator);
+        }
+
+        public DecoratedKey partitionKey()
+        {
+            return key;
+        }
+
+        public TableMetadata metadata()
+        {
+            return metadata;
+        }
+
+        public PartitionUpdate build()
+        {
+            // assert that we are not calling build() several times
+            assert !isBuilt : "A PartitionUpdate.Builder should only get built once";
+            Object[] add = rowBuilder.build();
+            Object[] merged = BTree.<Row>merge(tree, add, metadata.comparator,
+                                               UpdateFunction.Simple.of(Rows::merge));
+
+            EncodingStats newStats = EncodingStats.Collector.collect(staticRow, BTree.iterator(merged), deletionInfo);
+
+            isBuilt = true;
+            return new PartitionUpdate(metadata,
+                                       partitionKey(),
+                                       new Holder(columns,
+                                                  merged,
+                                                  deletionInfo,
+                                                  staticRow,
+                                                  newStats),
+                                       deletionInfo,
+                                       canHaveShadowedData);
+        }
+
+        public RegularAndStaticColumns columns()
+        {
+            return columns;
+        }
+
+        public DeletionTime partitionLevelDeletion()
+        {
+            return deletionInfo.getPartitionDeletion();
+        }
+
+        private BTree.Builder<Row> rowBuilder(int initialCapacity)
+        {
+            return BTree.<Row>builder(metadata.comparator, initialCapacity)
+                   .setQuickResolver(Rows::merge);
+        }
+        /**
+         * Modify this update to set every timestamp for live data to {@code newTimestamp} and
+         * every deletion timestamp to {@code newTimestamp - 1}.
+         *
+         * There is no reason to use that expect on the Paxos code path, where we need ensure that
+         * anything inserted use the ballot timestamp (to respect the order of update decided by
+         * the Paxos algorithm). We use {@code newTimestamp - 1} for deletions because tombstones
+         * always win on timestamp equality and we don't want to delete our own insertions
+         * (typically, when we overwrite a collection, we first set a complex deletion to delete the
+         * previous collection before adding new elements. If we were to set that complex deletion
+         * to the same timestamp that the new elements, it would delete those elements). And since
+         * tombstones always wins on timestamp equality, using -1 guarantees our deletion will still
+         * delete anything from a previous update.
+         */
+        public Builder updateAllTimestamp(long newTimestamp)
+        {
+            deletionInfo.updateAllTimestamp(newTimestamp - 1);
+            tree = BTree.<Row>transformAndFilter(tree, (x) -> x.updateAllTimestamp(newTimestamp));
+            staticRow = this.staticRow.updateAllTimestamp(newTimestamp);
+            return this;
+        }
+
+        @Override
+        public String toString()
+        {
+            return "Builder{" +
+                   "metadata=" + metadata +
+                   ", key=" + key +
+                   ", deletionInfo=" + deletionInfo +
+                   ", canHaveShadowedData=" + canHaveShadowedData +
+                   ", staticRow=" + staticRow +
+                   ", columns=" + columns +
+                   ", isBuilt=" + isBuilt +
+                   '}';
         }
     }
 }

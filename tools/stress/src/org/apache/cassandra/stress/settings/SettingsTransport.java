@@ -23,7 +23,6 @@ package org.apache.cassandra.stress.settings;
 
 import java.io.Serializable;
 import java.util.Arrays;
-import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -39,28 +38,31 @@ public class SettingsTransport implements Serializable
         this.options = options;
     }
 
-    public EncryptionOptions.ClientEncryptionOptions getEncryptionOptions()
+    public EncryptionOptions getEncryptionOptions()
     {
-        EncryptionOptions.ClientEncryptionOptions encOptions = new EncryptionOptions.ClientEncryptionOptions();
+        EncryptionOptions encOptions = new EncryptionOptions();
         if (options.trustStore.present())
         {
-            encOptions.enabled = true;
-            encOptions.truststore = options.trustStore.value();
-            encOptions.truststore_password = options.trustStorePw.value();
+            encOptions = encOptions
+                         .withEnabled(true)
+                         .withTrustStore(options.trustStore.value())
+                         .withTrustStorePassword(options.trustStorePw.value())
+                         .withAlgorithm(options.alg.value())
+                         .withProtocol(options.protocol.value())
+                         .withCipherSuites(options.ciphers.value().split(","));
             if (options.keyStore.present())
             {
-                encOptions.keystore = options.keyStore.value();
-                encOptions.keystore_password = options.keyStorePw.value();
+                encOptions = encOptions
+                             .withKeyStore(options.keyStore.value())
+                             .withKeyStorePassword(options.keyStorePw.value());
             }
             else
             {
                 // mandatory for SSLFactory.createSSLContext(), see CASSANDRA-9325
-                encOptions.keystore = encOptions.truststore;
-                encOptions.keystore_password = encOptions.truststore_password;
+                encOptions = encOptions
+                             .withKeyStore(encOptions.truststore)
+                             .withKeyStorePassword(encOptions.truststore_password);
             }
-            encOptions.algorithm = options.alg.value();
-            encOptions.protocol = options.protocol.value();
-            encOptions.cipher_suites = options.ciphers.value().split(",");
         }
         return encOptions;
     }
@@ -74,7 +76,7 @@ public class SettingsTransport implements Serializable
         final OptionSimple keyStore = new OptionSimple("keystore=", ".*", null, "SSL: full path to keystore", false);
         final OptionSimple keyStorePw = new OptionSimple("keystore-password=", ".*", null, "SSL: keystore password", false);
         final OptionSimple protocol = new OptionSimple("ssl-protocol=", ".*", "TLS", "SSL: connection protocol to use", false);
-        final OptionSimple alg = new OptionSimple("ssl-alg=", ".*", "SunX509", "SSL: algorithm", false);
+        final OptionSimple alg = new OptionSimple("ssl-alg=", ".*", null, "SSL: algorithm", false);
         final OptionSimple ciphers = new OptionSimple("ssl-ciphers=", ".*", "TLS_RSA_WITH_AES_128_CBC_SHA,TLS_RSA_WITH_AES_256_CBC_SHA", "SSL: comma delimited list of encryption suites to use", false);
 
         @Override

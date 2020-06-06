@@ -19,7 +19,6 @@
 package org.apache.cassandra.streaming;
 
 import java.io.IOException;
-import java.net.InetAddress;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
@@ -28,19 +27,21 @@ import org.apache.cassandra.db.TypeSizes;
 import org.apache.cassandra.io.IVersionedSerializer;
 import org.apache.cassandra.io.util.DataInputPlus;
 import org.apache.cassandra.io.util.DataOutputPlus;
-import org.apache.cassandra.serializers.InetAddressSerializer;
-import org.apache.cassandra.utils.ByteBufferUtil;
+import org.apache.cassandra.locator.InetAddressAndPort;
+import org.apache.cassandra.locator.InetAddressAndPort.Serializer;
+
+import static org.apache.cassandra.locator.InetAddressAndPort.Serializer.inetAddressAndPortSerializer;
 
 public class SessionSummary
 {
-    public final InetAddress coordinator;
-    public final InetAddress peer;
+    public final InetAddressAndPort coordinator;
+    public final InetAddressAndPort peer;
     /** Immutable collection of receiving summaries */
     public final Collection<StreamSummary> receivingSummaries;
     /** Immutable collection of sending summaries*/
     public final Collection<StreamSummary> sendingSummaries;
 
-    public SessionSummary(InetAddress coordinator, InetAddress peer,
+    public SessionSummary(InetAddressAndPort coordinator, InetAddressAndPort peer,
                           Collection<StreamSummary> receivingSummaries,
                           Collection<StreamSummary> sendingSummaries)
     {
@@ -81,8 +82,8 @@ public class SessionSummary
     {
         public void serialize(SessionSummary summary, DataOutputPlus out, int version) throws IOException
         {
-            ByteBufferUtil.writeWithLength(InetAddressSerializer.instance.serialize(summary.coordinator), out);
-            ByteBufferUtil.writeWithLength(InetAddressSerializer.instance.serialize(summary.peer), out);
+            inetAddressAndPortSerializer.serialize(summary.coordinator, out, version);
+            inetAddressAndPortSerializer.serialize(summary.peer, out, version);
 
             out.writeInt(summary.receivingSummaries.size());
             for (StreamSummary streamSummary: summary.receivingSummaries)
@@ -99,8 +100,8 @@ public class SessionSummary
 
         public SessionSummary deserialize(DataInputPlus in, int version) throws IOException
         {
-            InetAddress coordinator = InetAddressSerializer.instance.deserialize(ByteBufferUtil.readWithLength(in));
-            InetAddress peer = InetAddressSerializer.instance.deserialize(ByteBufferUtil.readWithLength(in));
+            InetAddressAndPort coordinator = inetAddressAndPortSerializer.deserialize(in, version);
+            InetAddressAndPort peer = inetAddressAndPortSerializer.deserialize(in, version);
 
             int numRcvd = in.readInt();
             List<StreamSummary> receivingSummaries = new ArrayList<>(numRcvd);
@@ -122,8 +123,8 @@ public class SessionSummary
         public long serializedSize(SessionSummary summary, int version)
         {
             long size = 0;
-            size += ByteBufferUtil.serializedSizeWithLength(InetAddressSerializer.instance.serialize(summary.coordinator));
-            size += ByteBufferUtil.serializedSizeWithLength(InetAddressSerializer.instance.serialize(summary.peer));
+            size += inetAddressAndPortSerializer.serializedSize(summary.coordinator, version);
+            size += inetAddressAndPortSerializer.serializedSize(summary.peer, version);
 
             size += TypeSizes.sizeof(summary.receivingSummaries.size());
             for (StreamSummary streamSummary: summary.receivingSummaries)

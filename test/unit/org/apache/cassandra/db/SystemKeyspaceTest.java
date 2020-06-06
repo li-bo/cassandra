@@ -18,7 +18,6 @@
 package org.apache.cassandra.db;
 
 import java.io.IOException;
-import java.net.InetAddress;
 import java.net.UnknownHostException;
 import java.util.*;
 
@@ -26,11 +25,14 @@ import org.junit.BeforeClass;
 import org.junit.Test;
 
 import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.db.commitlog.CommitLog;
+import org.apache.cassandra.locator.InetAddressAndPort;
 import org.apache.cassandra.schema.SchemaConstants;
 import org.apache.cassandra.cql3.QueryProcessor;
 import org.apache.cassandra.cql3.UntypedResultSet;
 import org.apache.cassandra.dht.ByteOrderedPartitioner.BytesToken;
 import org.apache.cassandra.dht.Token;
+import org.apache.cassandra.schema.SchemaKeyspace;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.CassandraVersion;
@@ -44,6 +46,7 @@ public class SystemKeyspaceTest
     public static void prepSnapshotTracker()
     {
         DatabaseDescriptor.daemonInitialization();
+        CommitLog.instance.start();
 
         if (FBUtilities.isWindows)
             WindowsFailedSnapshotTracker.deleteOldSnapshots();
@@ -53,7 +56,7 @@ public class SystemKeyspaceTest
     public void testLocalTokens()
     {
         // Remove all existing tokens
-        Collection<Token> current = SystemKeyspace.loadTokens().asMap().get(FBUtilities.getLocalAddress());
+        Collection<Token> current = SystemKeyspace.loadTokens().asMap().get(FBUtilities.getLocalAddressAndPort());
         if (current != null && !current.isEmpty())
             SystemKeyspace.updateTokens(current);
 
@@ -74,7 +77,7 @@ public class SystemKeyspaceTest
     public void testNonLocalToken() throws UnknownHostException
     {
         BytesToken token = new BytesToken(ByteBufferUtil.bytes("token3"));
-        InetAddress address = InetAddress.getByName("127.0.0.2");
+        InetAddressAndPort address = InetAddressAndPort.getByName("127.0.0.2");
         SystemKeyspace.updateTokens(address, Collections.<Token>singletonList(token));
         assert SystemKeyspace.loadTokens().get(address).contains(token);
         SystemKeyspace.removeEndpoint(address);
@@ -94,7 +97,7 @@ public class SystemKeyspaceTest
         if (FBUtilities.isWindows)
             assertEquals(expectedCount, getDeferredDeletionCount());
         else
-            assertTrue(getSystemSnapshotFiles().isEmpty());
+            assertTrue(getSystemSnapshotFiles(SchemaConstants.SYSTEM_KEYSPACE_NAME).isEmpty());
     }
 
     private int getDeferredDeletionCount()
@@ -131,7 +134,11 @@ public class SystemKeyspaceTest
 
         // Compare versions again & verify that snapshots were created for all tables in the system ks
         SystemKeyspace.snapshotOnVersionChange();
-        assertEquals(SystemKeyspace.metadata().tables.size(), getSystemSnapshotFiles().size());
+
+        Set<String> snapshottedSystemTables = getSystemSnapshotFiles(SchemaConstants.SYSTEM_KEYSPACE_NAME);
+        SystemKeyspace.metadata().tables.forEach(t -> assertTrue(snapshottedSystemTables.contains(t.name)));
+        Set<String> snapshottedSchemaTables = getSystemSnapshotFiles(SchemaConstants.SCHEMA_KEYSPACE_NAME);
+        SchemaKeyspace.metadata().tables.forEach(t -> assertTrue(snapshottedSchemaTables.contains(t.name)));
 
         // clear out the snapshots & set the previous recorded version equal to the latest, we shouldn't
         // see any new snapshots created this time.
@@ -156,10 +163,10 @@ public class SystemKeyspaceTest
         return (String.format("%s.%s.%s", semver.major - 1, semver.minor, semver.patch));
     }
 
-    private Set<String> getSystemSnapshotFiles()
+    private Set<String> getSystemSnapshotFiles(String keyspace)
     {
         Set<String> snapshottedTableNames = new HashSet<>();
-        for (ColumnFamilyStore cfs : Keyspace.open(SchemaConstants.SYSTEM_KEYSPACE_NAME).getColumnFamilyStores())
+        for (ColumnFamilyStore cfs : Keyspace.open(keyspace).getColumnFamilyStores())
         {
             if (!cfs.getSnapshotDetails().isEmpty())
                 snapshottedTableNames.add(cfs.getTableName());

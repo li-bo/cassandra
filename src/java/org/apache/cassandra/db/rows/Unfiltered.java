@@ -17,8 +17,7 @@
  */
 package org.apache.cassandra.db.rows;
 
-import java.security.MessageDigest;
-
+import org.apache.cassandra.db.Digest;
 import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.db.Clusterable;
 
@@ -39,11 +38,11 @@ public interface Unfiltered extends Clusterable
     public Kind kind();
 
     /**
-     * Digest the atom using the provided {@code MessageDigest}.
+     * Digest the atom using the provided {@link Digest}.
      *
-     * @param digest the {@code MessageDigest} to use.
+     * @param digest the {@see Digest} to use.
      */
-    public void digest(MessageDigest digest);
+    public void digest(Digest digest);
 
     /**
      * Validate the data of this atom.
@@ -55,6 +54,12 @@ public interface Unfiltered extends Clusterable
      */
     public void validateData(TableMetadata metadata);
 
+    /**
+     * Do a quick validation of the deletions of the unfiltered (if any)
+     *
+     * @return true if any deletion is invalid
+     */
+    public boolean hasInvalidDeletions();
     public boolean isEmpty();
 
     public String toString(TableMetadata metadata);

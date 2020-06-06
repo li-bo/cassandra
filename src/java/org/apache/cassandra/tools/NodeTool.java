@@ -17,39 +17,82 @@
  */
 package org.apache.cassandra.tools;
 
-import java.io.*;
-import java.net.InetAddress;
-import java.net.UnknownHostException;
-import java.text.SimpleDateFormat;
-import java.util.*;
-import java.util.Map.Entry;
-
-import com.google.common.base.Joiner;
-import com.google.common.base.Throwables;
-import com.google.common.collect.*;
-
-import io.airlift.airline.*;
-
-import org.apache.cassandra.locator.EndpointSnitchInfoMBean;
-import org.apache.cassandra.tools.nodetool.*;
-import org.apache.cassandra.utils.FBUtilities;
-
 import static com.google.common.base.Throwables.getStackTraceAsString;
 import static com.google.common.collect.Iterables.toArray;
 import static com.google.common.collect.Lists.newArrayList;
 import static java.lang.Integer.parseInt;
 import static java.lang.String.format;
 import static org.apache.commons.lang3.ArrayUtils.EMPTY_STRING_ARRAY;
-import static org.apache.commons.lang3.StringUtils.*;
+import static org.apache.commons.lang3.StringUtils.EMPTY;
+import static org.apache.commons.lang3.StringUtils.isEmpty;
+import static org.apache.commons.lang3.StringUtils.isNotEmpty;
+
+import java.io.Console;
+import java.io.File;
+import java.io.FileNotFoundException;
+import java.io.FileWriter;
+import java.io.IOError;
+import java.io.IOException;
+import java.net.InetAddress;
+import java.net.UnknownHostException;
+import java.text.SimpleDateFormat;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Date;
+import java.util.List;
+import java.util.Map;
+import java.util.Map.Entry;
+import java.util.Scanner;
+import java.util.SortedMap;
+import java.util.function.Consumer;
+
+import com.google.common.base.Joiner;
+import com.google.common.base.Throwables;
+
+import org.apache.cassandra.locator.EndpointSnitchInfoMBean;
+import org.apache.cassandra.tools.nodetool.*;
+import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.tools.nodetool.Sjk;
+
+import com.google.common.collect.Maps;
+
+import io.airlift.airline.Cli;
+import io.airlift.airline.Help;
+import io.airlift.airline.Option;
+import io.airlift.airline.OptionType;
+import io.airlift.airline.ParseArgumentsMissingException;
+import io.airlift.airline.ParseArgumentsUnexpectedException;
+import io.airlift.airline.ParseCommandMissingException;
+import io.airlift.airline.ParseCommandUnrecognizedException;
+import io.airlift.airline.ParseOptionConversionException;
+import io.airlift.airline.ParseOptionMissingException;
+import io.airlift.airline.ParseOptionMissingValueException;
 
 public class NodeTool
 {
+    static
+    {
+        FBUtilities.preventIllegalAccessWarnings();
+    }
+
     private static final String HISTORYFILE = "nodetool.history";
+
+    private final INodeProbeFactory nodeProbeFactory;
 
     public static void main(String... args)
     {
-        List<Class<? extends Runnable>> commands = newArrayList(
-                Help.class,
+        System.exit(new NodeTool(new NodeProbeFactory()).execute(args));
+    }
+
+    public NodeTool(INodeProbeFactory nodeProbeFactory)
+    {
+        this.nodeProbeFactory = nodeProbeFactory;
+    }
+
+    public int execute(String... args)
+    {
+        List<Class<? extends Consumer<INodeProbeFactory>>> commands = newArrayList(
+                CassHelp.class,
                 Info.class,
                 Ring.class,
                 NetStats.class,
@@ -59,6 +102,7 @@ public class NodeTool
                 TableHistograms.class,
                 Cleanup.class,
                 ClearSnapshot.class,
+                ClientStats.class,
                 Compact.class,
                 Scrub.class,
                 Verify.class,
@@ -76,18 +120,23 @@ public class NodeTool
                 EnableGossip.class,
                 DisableGossip.class,
                 EnableHandoff.class,
+                EnableFullQueryLog.class,
+                DisableFullQueryLog.class,
                 GcStats.class,
                 GetBatchlogReplayTrottle.class,
                 GetCompactionThreshold.class,
                 GetCompactionThroughput.class,
+                GetConcurrency.class,
                 GetTimeout.class,
                 GetStreamThroughput.class,
                 GetTraceProbability.class,
                 GetInterDCStreamThroughput.class,
                 GetEndpoints.class,
+                GetSeeds.class,
                 GetSSTables.class,
                 GetMaxHintWindow.class,
                 GossipInfo.class,
+                Import.class,
                 InvalidateKeyCache.class,
                 InvalidateRowCache.class,
                 InvalidateCounterCache.class,
@@ -95,21 +144,28 @@ public class NodeTool
                 Move.class,
                 PauseHandoff.class,
                 ResumeHandoff.class,
+                ProfileLoad.class,
                 ProxyHistograms.class,
                 Rebuild.class,
                 Refresh.class,
                 RemoveNode.class,
                 Assassinate.class,
+                ReloadSeeds.class,
+                ResetFullQueryLog.class,
                 Repair.class,
                 RepairAdmin.class,
                 ReplayBatchlog.class,
                 SetCacheCapacity.class,
+                SetConcurrency.class,
                 SetHintedHandoffThrottleInKB.class,
                 SetBatchlogReplayThrottle.class,
                 SetCompactionThreshold.class,
                 SetCompactionThroughput.class,
                 GetConcurrentCompactors.class,
                 SetConcurrentCompactors.class,
+                GetConcurrentViewBuilders.class,
+                SetConcurrentViewBuilders.class,
+                SetConcurrency.class,
                 SetTimeout.class,
                 SetStreamThroughput.class,
                 SetInterDCStreamThroughput.class,
@@ -132,6 +188,7 @@ public class NodeTool
                 EnableBackup.class,
                 DisableBackup.class,
                 ResetLocalSchema.class,
+                ReloadLocalSchema.class,
                 ReloadTriggers.class,
                 SetCacheKeysToSave.class,
                 DisableHandoff.class,
@@ -141,34 +198,40 @@ public class NodeTool
                 TopPartitions.class,
                 SetLoggingLevel.class,
                 GetLoggingLevels.class,
+                Sjk.class,
                 DisableHintsForDC.class,
                 EnableHintsForDC.class,
                 FailureDetectorInfo.class,
                 RefreshSizeEstimates.class,
                 RelocateSSTables.class,
-                ViewBuildStatus.class
+                ViewBuildStatus.class,
+                ReloadSslCertificates.class,
+                EnableAuditLog.class,
+                DisableAuditLog.class,
+                EnableOldProtocolVersions.class,
+                DisableOldProtocolVersions.class
         );
 
-        Cli.CliBuilder<Runnable> builder = Cli.builder("nodetool");
+        Cli.CliBuilder<Consumer<INodeProbeFactory>> builder = Cli.builder("nodetool");
 
         builder.withDescription("Manage your Cassandra cluster")
-                 .withDefaultCommand(Help.class)
+                 .withDefaultCommand(CassHelp.class)
                  .withCommands(commands);
 
         // bootstrap commands
         builder.withGroup("bootstrap")
                 .withDescription("Monitor/manage node's bootstrap process")
-                .withDefaultCommand(Help.class)
+                .withDefaultCommand(CassHelp.class)
                 .withCommand(BootstrapResume.class);
 
-        Cli<Runnable> parser = builder.build();
+        Cli<Consumer<INodeProbeFactory>> parser = builder.build();
 
         int status = 0;
         try
         {
-            Runnable parse = parser.parse(args);
+            Consumer<INodeProbeFactory> parse = parser.parse(args);
             printHistory(args);
-            parse.run();
+            parse.accept(nodeProbeFactory);
         } catch (IllegalArgumentException |
                 IllegalStateException |
                 ParseArgumentsMissingException |
@@ -187,7 +250,7 @@ public class NodeTool
             status = 2;
         }
 
-        System.exit(status);
+        return status;
     }
 
     private static void printHistory(String... args)
@@ -210,20 +273,28 @@ public class NodeTool
         }
     }
 
-    private static void badUse(Exception e)
+    protected void badUse(Exception e)
     {
         System.out.println("nodetool: " + e.getMessage());
         System.out.println("See 'nodetool help' or 'nodetool help <command>'.");
     }
 
-    private static void err(Throwable e)
+    protected void err(Throwable e)
     {
         System.err.println("error: " + e.getMessage());
         System.err.println("-- StackTrace --");
         System.err.println(getStackTraceAsString(e));
     }
 
-    public static abstract class NodeToolCmd implements Runnable
+    public static class CassHelp extends Help implements Consumer<INodeProbeFactory>
+    {
+        public void accept(INodeProbeFactory nodeProbeFactory)
+        {
+            run();
+        }
+    }
+
+    public static abstract class NodeToolCmd implements Consumer<INodeProbeFactory>
     {
 
         @Option(type = OptionType.GLOBAL, name = {"-h", "--host"}, description = "Node hostname or ip address")
@@ -241,7 +312,17 @@ public class NodeTool
         @Option(type = OptionType.GLOBAL, name = {"-pwf", "--password-file"}, description = "Path to the JMX password file")
         private String passwordFilePath = EMPTY;
 
-        @Override
+		@Option(type = OptionType.GLOBAL, name = { "-pp", "--print-port"}, description = "Operate in 4.0 mode with hosts disambiguated by port number", arity = 0)
+        protected boolean printPort = false;
+
+        private INodeProbeFactory nodeProbeFactory;
+
+        public void accept(INodeProbeFactory nodeProbeFactory)
+        {
+            this.nodeProbeFactory = nodeProbeFactory;
+            run();
+        }
+
         public void run()
         {
             if (isNotEmpty(username)) {
@@ -312,9 +393,9 @@ public class NodeTool
             try
             {
                 if (username.isEmpty())
-                    nodeClient = new NodeProbe(host, parseInt(port));
+                    nodeClient = nodeProbeFactory.create(host, parseInt(port));
                 else
-                    nodeClient = new NodeProbe(host, parseInt(port), username, password);
+                    nodeClient = nodeProbeFactory.create(host, parseInt(port), username, password);
             } catch (IOException | SecurityException e)
             {
                 Throwable rootCause = Throwables.getRootCause(e);
@@ -382,6 +463,29 @@ public class NodeTool
                 String dc = epSnitchInfo.getDatacenter(tokenAndEndPoint.getValue());
                 if (!ownershipByDc.containsKey(dc))
                     ownershipByDc.put(dc, new SetHostStat(resolveIp));
+                ownershipByDc.get(dc).add(tokenAndEndPoint.getKey(), tokenAndEndPoint.getValue(), ownerships);
+            }
+        }
+        catch (UnknownHostException e)
+        {
+            throw new RuntimeException(e);
+        }
+        return ownershipByDc;
+    }
+
+    public static SortedMap<String, SetHostStatWithPort> getOwnershipByDcWithPort(NodeProbe probe, boolean resolveIp,
+                                                                  Map<String, String> tokenToEndpoint,
+                                                                  Map<String, Float> ownerships)
+    {
+        SortedMap<String, SetHostStatWithPort> ownershipByDc = Maps.newTreeMap();
+        EndpointSnitchInfoMBean epSnitchInfo = probe.getEndpointSnitchInfoProxy();
+        try
+        {
+            for (Entry<String, String> tokenAndEndPoint : tokenToEndpoint.entrySet())
+            {
+                String dc = epSnitchInfo.getDatacenter(tokenAndEndPoint.getValue());
+                if (!ownershipByDc.containsKey(dc))
+                    ownershipByDc.put(dc, new SetHostStatWithPort(resolveIp));
                 ownershipByDc.get(dc).add(tokenAndEndPoint.getKey(), tokenAndEndPoint.getValue(), ownerships);
             }
         }

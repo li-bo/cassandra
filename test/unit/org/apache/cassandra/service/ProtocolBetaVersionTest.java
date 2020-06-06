@@ -68,9 +68,9 @@ public class ProtocolBetaVersionTest extends CQLTester
         createTable("CREATE TABLE %s (pk int PRIMARY KEY, v int)");
         assertTrue(betaVersion.isBeta()); // change to another beta version or remove test if no beta version
 
-        try (SimpleClient client = new SimpleClient(nativeAddr.getHostAddress(), nativePort, betaVersion, true, new EncryptionOptions.ClientEncryptionOptions()))
+        try (SimpleClient client = new SimpleClient(nativeAddr.getHostAddress(), nativePort, betaVersion, true, new EncryptionOptions()))
         {
-            client.connect(false);
+            client.connect(false, false);
             for (int i = 0; i < 10; i++)
             {
                 QueryMessage query = new QueryMessage(String.format("INSERT INTO %s.%s (pk, v) VALUES (%s, %s)",
@@ -103,9 +103,9 @@ public class ProtocolBetaVersionTest extends CQLTester
         }
 
         assertTrue(betaVersion.isBeta()); // change to another beta version or remove test if no beta version
-        try (SimpleClient client = new SimpleClient(nativeAddr.getHostAddress(), nativePort, betaVersion, false, new EncryptionOptions.ClientEncryptionOptions()))
+        try (SimpleClient client = new SimpleClient(nativeAddr.getHostAddress(), nativePort, betaVersion, false, new EncryptionOptions()))
         {
-            client.connect(false);
+            client.connect(false, false);
             fail("Exception should have been thrown");
         }
         catch (Exception e)

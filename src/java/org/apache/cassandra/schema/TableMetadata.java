@@ -21,8 +21,13 @@ import java.nio.ByteBuffer;
 import java.util.*;
 import java.util.Objects;
 
+import javax.annotation.Nullable;
+
 import com.google.common.base.MoreObjects;
 import com.google.common.collect.*;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import org.apache.cassandra.auth.DataResource;
 import org.apache.cassandra.config.DatabaseDescriptor;
@@ -31,6 +36,7 @@ import org.apache.cassandra.db.*;
 import org.apache.cassandra.db.marshal.*;
 import org.apache.cassandra.dht.IPartitioner;
 import org.apache.cassandra.exceptions.ConfigurationException;
+import org.apache.cassandra.service.reads.SpeculativeRetryPolicy;
 import org.apache.cassandra.utils.AbstractIterator;
 import org.github.jamm.Unmetered;
 
@@ -38,15 +44,35 @@ import static java.lang.String.format;
 import static java.util.stream.Collectors.toList;
 import static java.util.stream.Collectors.toSet;
 
+import static com.google.common.collect.Iterables.any;
 import static com.google.common.collect.Iterables.transform;
 import static org.apache.cassandra.schema.IndexMetadata.isNameValid;
 
 @Unmetered
 public final class TableMetadata
 {
+    private static final Logger logger = LoggerFactory.getLogger(TableMetadata.class);
+    private static final ImmutableSet<Flag> DEFAULT_CQL_FLAGS = ImmutableSet.of(Flag.COMPOUND);
+    private static final ImmutableSet<Flag> DEPRECATED_CS_FLAGS = ImmutableSet.of(Flag.DENSE, Flag.SUPER);
+
+    public static final String COMPACT_STORAGE_HALT_MESSAGE =
+             "Compact Tables are not allowed in Cassandra starting with 4.0 version. " +
+             "Use `ALTER ... DROP COMPACT STORAGE` command supplied in 3.x/3.11 Cassandra " +
+             "in order to migrate off Compact Storage.";
+
+    private static final String COMPACT_STORAGE_DEPRECATION_MESSAGE =
+             "Incorrect set of flags is was detected in table {}.{}: '{}'. \n" +
+             "Starting with version 4.0, '{}' flags are deprecated and every table has to have COMPOUND flag. \n" +
+             "Forcing the following set of flags: '{}'";
+
     public enum Flag
     {
         SUPER, COUNTER, DENSE, COMPOUND;
+
+        public static boolean isCQLCompatible(Set<Flag> flags)
+        {
+            return !flags.contains(Flag.DENSE) && !flags.contains(Flag.SUPER) && flags.contains(Flag.COMPOUND);
+        }
 
         public static Set<Flag> fromStringSet(Set<String> strings)
         {
@@ -59,15 +85,21 @@ public final class TableMetadata
         }
     }
 
+    public enum Kind
+    {
+        REGULAR, INDEX, VIEW, VIRTUAL
+    }
+
     public final String keyspace;
     public final String name;
     public final TableId id;
 
     public final IPartitioner partitioner;
+    public final Kind kind;
     public final TableParams params;
     public final ImmutableSet<Flag> flags;
 
-    private final boolean isView;
+    @Nullable
     private final String indexName; // derived from table name
 
     /*
@@ -102,18 +134,24 @@ public final class TableMetadata
 
     private TableMetadata(Builder builder)
     {
+        if (!Flag.isCQLCompatible(builder.flags))
+        {
+            flags = ImmutableSet.copyOf(Sets.union(Sets.difference(builder.flags, DEPRECATED_CS_FLAGS), DEFAULT_CQL_FLAGS));
+            logger.warn(COMPACT_STORAGE_DEPRECATION_MESSAGE, builder.keyspace, builder.name,  builder.flags, DEPRECATED_CS_FLAGS, flags);
+        }
+        else
+        {
+            flags = Sets.immutableEnumSet(builder.flags);
+        }
         keyspace = builder.keyspace;
         name = builder.name;
         id = builder.id;
 
         partitioner = builder.partitioner;
+        kind = builder.kind;
         params = builder.params.build();
-        flags = Sets.immutableEnumSet(builder.flags);
-        isView = builder.isView;
 
-        indexName = name.contains(".")
-                  ? name.substring(name.indexOf('.') + 1)
-                  : null;
+        indexName = kind == Kind.INDEX ? name.substring(name.indexOf('.') + 1) : null;
 
         droppedColumns = ImmutableMap.copyOf(builder.droppedColumns);
         Collections.sort(builder.partitionKeyColumns);
@@ -153,23 +191,43 @@ public final class TableMetadata
     {
         return builder(keyspace, name, id)
                .partitioner(partitioner)
+               .kind(kind)
                .params(params)
                .flags(flags)
-               .isView(isView)
                .addColumns(columns())
                .droppedColumns(droppedColumns)
                .indexes(indexes)
                .triggers(triggers);
     }
 
-    public boolean isView()
-    {
-        return isView;
-    }
-
     public boolean isIndex()
     {
-        return indexName != null;
+        return kind == Kind.INDEX;
+    }
+
+    public TableMetadata withSwapped(TableParams params)
+    {
+        return unbuild().params(params).build();
+    }
+
+    public TableMetadata withSwapped(Triggers triggers)
+    {
+        return unbuild().triggers(triggers).build();
+    }
+
+    public TableMetadata withSwapped(Indexes indexes)
+    {
+        return unbuild().indexes(indexes).build();
+    }
+
+    public boolean isView()
+    {
+        return kind == Kind.VIEW;
+    }
+
+    public boolean isVirtual()
+    {
+        return kind == Kind.VIRTUAL;
     }
 
     public Optional<String> indexName()
@@ -376,42 +434,62 @@ public final class TableMetadata
         indexes.validate(this);
     }
 
-    void validateCompatibility(TableMetadata other)
+    void validateCompatibility(TableMetadata previous)
     {
         if (isIndex())
             return;
 
-        if (!other.keyspace.equals(keyspace))
-            except("Keyspace mismatch (found %s; expected %s)", other.keyspace, keyspace);
+        if (!previous.keyspace.equals(keyspace))
+            except("Keyspace mismatch (found %s; expected %s)", keyspace, previous.keyspace);
 
-        if (!other.name.equals(name))
-            except("Table mismatch (found %s; expected %s)", other.name, name);
+        if (!previous.name.equals(name))
+            except("Table mismatch (found %s; expected %s)", name, previous.name);
 
-        if (!other.id.equals(id))
-            except("Table ID mismatch (found %s; expected %s)", other.id, id);
+        if (!previous.id.equals(id))
+            except("Table ID mismatch (found %s; expected %s)", id, previous.id);
 
-        if (!other.flags.equals(flags))
-            except("Table type mismatch (found %s; expected %s)", other.flags, flags);
+        if (!previous.flags.equals(flags))
+            except("Table type mismatch (found %s; expected %s)", flags, previous.flags);
 
-        if (other.partitionKeyColumns.size() != partitionKeyColumns.size())
-            except("Partition keys of different length (found %s; expected %s)", other.partitionKeyColumns.size(), partitionKeyColumns.size());
+        if (previous.partitionKeyColumns.size() != partitionKeyColumns.size())
+        {
+            except("Partition keys of different length (found %s; expected %s)",
+                   partitionKeyColumns.size(),
+                   previous.partitionKeyColumns.size());
+        }
 
         for (int i = 0; i < partitionKeyColumns.size(); i++)
-            if (!other.partitionKeyColumns.get(i).type.isCompatibleWith(partitionKeyColumns.get(i).type))
-                except("Partition key column mismatch (found %s; expected %s)", other.partitionKeyColumns.get(i).type, partitionKeyColumns.get(i).type);
+        {
+            if (!partitionKeyColumns.get(i).type.isCompatibleWith(previous.partitionKeyColumns.get(i).type))
+            {
+                except("Partition key column mismatch (found %s; expected %s)",
+                       partitionKeyColumns.get(i).type,
+                       previous.partitionKeyColumns.get(i).type);
+            }
+        }
 
-        if (other.clusteringColumns.size() != clusteringColumns.size())
-            except("Clustering columns of different length (found %s; expected %s)", other.clusteringColumns.size(), clusteringColumns.size());
+        if (previous.clusteringColumns.size() != clusteringColumns.size())
+        {
+            except("Clustering columns of different length (found %s; expected %s)",
+                   clusteringColumns.size(),
+                   previous.clusteringColumns.size());
+        }
 
         for (int i = 0; i < clusteringColumns.size(); i++)
-            if (!other.clusteringColumns.get(i).type.isCompatibleWith(clusteringColumns.get(i).type))
-                except("Clustering column mismatch (found %s; expected %s)", other.clusteringColumns.get(i).type, clusteringColumns.get(i).type);
-
-        for (ColumnMetadata otherColumn : other.regularAndStaticColumns)
         {
-            ColumnMetadata column = getColumn(otherColumn.name);
-            if (column != null && !otherColumn.type.isCompatibleWith(column.type))
-                except("Column mismatch (found %s; expected %s", otherColumn, column);
+            if (!clusteringColumns.get(i).type.isCompatibleWith(previous.clusteringColumns.get(i).type))
+            {
+                except("Clustering column mismatch (found %s; expected %s)",
+                       clusteringColumns.get(i).type,
+                       previous.clusteringColumns.get(i).type);
+            }
+        }
+
+        for (ColumnMetadata previousColumn : previous.regularAndStaticColumns)
+        {
+            ColumnMetadata column = getColumn(previousColumn.name);
+            if (column != null && !column.type.isCompatibleWith(previousColumn.type))
+                except("Column mismatch (found %s; expected %s)", column, previousColumn);
         }
     }
 
@@ -430,7 +508,7 @@ public final class TableMetadata
      * This method should only be called for superColumn tables and "static
      * compact" ones. For any other table, all column names are UTF8.
      */
-    public AbstractType<?> staticCompactOrSuperTableColumnNameType()
+    AbstractType<?> staticCompactOrSuperTableColumnNameType()
     {
         if (isSuper())
         {
@@ -492,11 +570,7 @@ public final class TableMetadata
 
     public TableMetadata updateIndexTableMetadata(TableParams baseTableParams)
     {
-        TableParams.Builder builder =
-            baseTableParams.unbuild()
-                           .readRepairChance(0.0)
-                           .dcLocalReadRepairChance(0.0)
-                           .gcGraceSeconds(0);
+        TableParams.Builder builder = baseTableParams.unbuild().gcGraceSeconds(0);
 
         // Depends on parent's cache setting, turn on its index table's cache.
         // Row caching is never enabled; see CASSANDRA-5732
@@ -505,9 +579,25 @@ public final class TableMetadata
         return unbuild().params(builder.build()).build();
     }
 
+    boolean referencesUserType(ByteBuffer name)
+    {
+        return any(columns(), c -> c.type.referencesUserType(name));
+    }
+
+    public TableMetadata withUpdatedUserType(UserType udt)
+    {
+        if (!referencesUserType(udt.name))
+            return this;
+
+        Builder builder = unbuild();
+        columns().forEach(c -> builder.alterColumnType(c.name, c.type.withUpdatedUserType(udt)));
+
+        return builder.build();
+    }
+
     private void except(String format, Object... args)
     {
-        throw new ConfigurationException(keyspace + "." + name + ": " +format(format, args));
+        throw new ConfigurationException(keyspace + "." + name + ": " + format(format, args));
     }
 
     @Override
@@ -521,23 +611,62 @@ public final class TableMetadata
 
         TableMetadata tm = (TableMetadata) o;
 
+        return equalsWithoutColumns(tm) && columns.equals(tm.columns);
+    }
+
+    private boolean equalsWithoutColumns(TableMetadata tm)
+    {
         return keyspace.equals(tm.keyspace)
             && name.equals(tm.name)
             && id.equals(tm.id)
             && partitioner.equals(tm.partitioner)
+            && kind == tm.kind
             && params.equals(tm.params)
             && flags.equals(tm.flags)
-            && isView == tm.isView
-            && columns.equals(tm.columns)
             && droppedColumns.equals(tm.droppedColumns)
             && indexes.equals(tm.indexes)
             && triggers.equals(tm.triggers);
     }
 
+    Optional<Difference> compare(TableMetadata other)
+    {
+        return equalsWithoutColumns(other)
+             ? compareColumns(other.columns)
+             : Optional.of(Difference.SHALLOW);
+    }
+
+    private Optional<Difference> compareColumns(Map<ByteBuffer, ColumnMetadata> other)
+    {
+        if (!columns.keySet().equals(other.keySet()))
+            return Optional.of(Difference.SHALLOW);
+
+        boolean differsDeeply = false;
+
+        for (Map.Entry<ByteBuffer, ColumnMetadata> entry : columns.entrySet())
+        {
+            ColumnMetadata thisColumn = entry.getValue();
+            ColumnMetadata thatColumn = other.get(entry.getKey());
+
+            Optional<Difference> difference = thisColumn.compare(thatColumn);
+            if (difference.isPresent())
+            {
+                switch (difference.get())
+                {
+                    case SHALLOW:
+                        return difference;
+                    case DEEP:
+                        differsDeeply = true;
+                }
+            }
+        }
+
+        return differsDeeply ? Optional.of(Difference.DEEP) : Optional.empty();
+    }
+
     @Override
     public int hashCode()
     {
-        return Objects.hash(keyspace, name, id, partitioner, params, flags, isView, columns, droppedColumns, indexes, triggers);
+        return Objects.hash(keyspace, name, id, partitioner, kind, params, flags, columns, droppedColumns, indexes, triggers);
     }
 
     @Override
@@ -553,9 +682,9 @@ public final class TableMetadata
                           .add("table", name)
                           .add("id", id)
                           .add("partitioner", partitioner)
+                          .add("kind", kind)
                           .add("params", params)
                           .add("flags", flags)
-                          .add("isView", isView)
                           .add("columns", columns())
                           .add("droppedColumns", droppedColumns.values())
                           .add("indexes", indexes)
@@ -571,6 +700,7 @@ public final class TableMetadata
         private TableId id;
 
         private IPartitioner partitioner;
+        private Kind kind = Kind.REGULAR;
         private TableParams.Builder params = TableParams.builder();
 
         // Setting compound as default as "normal" CQL tables are compound and that's what we want by default
@@ -583,8 +713,6 @@ public final class TableMetadata
         private final List<ColumnMetadata> partitionKeyColumns = new ArrayList<>();
         private final List<ColumnMetadata> clusteringColumns = new ArrayList<>();
         private final List<ColumnMetadata> regularAndStaticColumns = new ArrayList<>();
-
-        private boolean isView;
 
         private Builder(String keyspace, String name, TableId id)
         {
@@ -619,6 +747,12 @@ public final class TableMetadata
         public Builder partitioner(IPartitioner val)
         {
             partitioner = val;
+            return this;
+        }
+
+        public Builder kind(Kind val)
+        {
+            kind = val;
             return this;
         }
 
@@ -658,12 +792,6 @@ public final class TableMetadata
             return this;
         }
 
-        public Builder dcLocalReadRepairChance(double val)
-        {
-            params.dcLocalReadRepairChance(val);
-            return this;
-        }
-
         public Builder defaultTimeToLive(int val)
         {
             params.defaultTimeToLive(val);
@@ -694,33 +822,27 @@ public final class TableMetadata
             return this;
         }
 
-        public Builder readRepairChance(double val)
-        {
-            params.readRepairChance(val);
-            return this;
-        }
-
         public Builder crcCheckChance(double val)
         {
             params.crcCheckChance(val);
             return this;
         }
 
-        public Builder speculativeRetry(SpeculativeRetryParam val)
+        public Builder speculativeRetry(SpeculativeRetryPolicy val)
         {
             params.speculativeRetry(val);
+            return this;
+        }
+
+        public Builder additionalWritePolicy(SpeculativeRetryPolicy val)
+        {
+            params.additionalWritePolicy(val);
             return this;
         }
 
         public Builder extensions(Map<String, ByteBuffer> val)
         {
             params.extensions(val);
-            return this;
-        }
-
-        public Builder isView(boolean val)
-        {
-            isView = val;
             return this;
         }
 
@@ -833,7 +955,7 @@ public final class TableMetadata
             return this;
         }
 
-        public Builder addColumns(Iterable<ColumnMetadata> columns)
+        Builder addColumns(Iterable<ColumnMetadata> columns)
         {
             columns.forEach(this::addColumn);
             return this;
@@ -852,14 +974,14 @@ public final class TableMetadata
         public Builder recordDeprecatedSystemColumn(String name, AbstractType<?> type)
         {
             // As we play fast and loose with the removal timestamp, make sure this is misued for a non system table.
-            assert SchemaConstants.isSystemKeyspace(keyspace);
+            assert SchemaConstants.isLocalSystemKeyspace(keyspace);
             recordColumnDrop(ColumnMetadata.regularColumn(keyspace, this.name, name, type), Long.MAX_VALUE);
             return this;
         }
 
         public Builder recordColumnDrop(ColumnMetadata column, long timeMicros)
         {
-            droppedColumns.put(column.name.bytes, new DroppedColumn(column, timeMicros));
+            droppedColumns.put(column.name.bytes, new DroppedColumn(column.withNewType(column.type.expandUserTypes()), timeMicros));
             return this;
         }
 
@@ -925,7 +1047,7 @@ public final class TableMetadata
             return this;
         }
 
-        public Builder alterColumnType(ColumnIdentifier name, AbstractType<?> type)
+        Builder alterColumnType(ColumnIdentifier name, AbstractType<?> type)
         {
             ColumnMetadata column = columns.get(name.bytes);
             if (column == null)
@@ -961,9 +1083,11 @@ public final class TableMetadata
      * Currently this is only used by views with normal base column as PK column
      * so updates to other columns do not make the row live when the base column
      * is not live. See CASSANDRA-11500.
+     *
+     * TODO: does not belong here, should be gone
      */
     public boolean enforceStrictLiveness()
     {
-        return isView && Keyspace.open(keyspace).viewManager.getByName(name).enforceStrictLiveness();
+        return isView() && Keyspace.open(keyspace).viewManager.getByName(name).enforceStrictLiveness();
     }
 }

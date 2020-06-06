@@ -18,10 +18,7 @@
 package org.apache.cassandra.db;
 
 import java.nio.ByteBuffer;
-import java.security.MessageDigest;
 import java.util.Objects;
-
-import org.apache.cassandra.utils.FBUtilities;
 
 public abstract class AbstractClusteringPrefix implements ClusteringPrefix
 {
@@ -41,15 +38,15 @@ public abstract class AbstractClusteringPrefix implements ClusteringPrefix
         return size;
     }
 
-    public void digest(MessageDigest digest)
+    public void digest(Digest digest)
     {
         for (int i = 0; i < size(); i++)
         {
             ByteBuffer bb = get(i);
             if (bb != null)
-                digest.update(bb.duplicate());
+                digest.update(bb);
         }
-        FBUtilities.updateWithByte(digest, kind().ordinal());
+        digest.updateWithByte(kind().ordinal());
     }
 
     @Override

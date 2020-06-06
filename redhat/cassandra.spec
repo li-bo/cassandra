@@ -8,7 +8,9 @@
 
 %global username cassandra
 
-%define relname apache-cassandra-%{version}
+# input of ~alphaN, ~betaN, ~rcN package versions need to retain upstream '-alphaN, etc' version for sources
+%define upstream_version %(echo %{version} | sed -r 's/~/-/g')
+%define relname apache-cassandra-%{upstream_version}
 
 Name:          cassandra
 Version:       %{version}
@@ -22,6 +24,7 @@ Source0:       %{relname}-src.tar.gz
 BuildRoot:     %{_tmppath}/%{relname}root-%(%{__id_u} -n)
 
 BuildRequires: ant >= 1.9
+BuildRequires: ant-junit >= 1.9
 
 Requires:      jre >= 1.8.0
 Requires:      python(abi) >= 2.7
@@ -45,7 +48,7 @@ Cassandra is a distributed (peer-to-peer) system for the management and storage 
 %build
 export LANG=en_US.UTF-8
 export JAVA_TOOL_OPTIONS="-Dfile.encoding=UTF-8"
-ant clean jar -Dversion=%{version}
+ant clean jar -Dversion=%{upstream_version}
 
 %install
 %{__rm} -rf %{buildroot}
@@ -67,20 +70,20 @@ mkdir -p %{buildroot}/var/log/%{username}
 ( cd pylib && python2.7 setup.py install --no-compile --root %{buildroot}; )
 
 # patches for data and log paths
-patch -p1 < debian/patches/001cassandra_yaml_dirs.dpatch
-patch -p1 < debian/patches/002cassandra_logdir_fix.dpatch
+patch -p1 < debian/patches/cassandra_yaml_dirs.diff
+patch -p1 < debian/patches/cassandra_logdir_fix.diff
 # uncomment hints_directory path
 sed -i 's/^# hints_directory:/hints_directory:/' conf/cassandra.yaml
 
 # remove batch, powershell, and other files not being installed
-rm conf/*.ps1
-rm bin/*.bat
-rm bin/*.orig
-rm bin/*.ps1
-rm bin/cassandra.in.sh
-rm lib/sigar-bin/*winnt*  # strip segfaults on dll..
-rm tools/bin/*.bat
-rm tools/bin/cassandra.in.sh
+rm -f conf/*.ps1
+rm -f bin/*.bat
+rm -f bin/*.orig
+rm -f bin/*.ps1
+rm -f bin/cassandra.in.sh
+rm -f lib/sigar-bin/*winnt*  # strip segfaults on dll..
+rm -f tools/bin/*.bat
+rm -f tools/bin/cassandra.in.sh
 
 # copy default configs
 cp -pr conf/* %{buildroot}/%{_sysconfdir}/%{username}/default.conf/
@@ -97,13 +100,16 @@ cp -pr lib/* %{buildroot}/usr/share/%{username}/lib/
 # copy stress jar
 cp -p build/tools/lib/stress.jar %{buildroot}/usr/share/%{username}/
 
+# copy fqltool jar
+cp -p build/tools/lib/fqltool.jar %{buildroot}/usr/share/%{username}/
+
 # copy binaries
 mv bin/cassandra %{buildroot}/usr/sbin/
 cp -p bin/* %{buildroot}/usr/bin/
 cp -p tools/bin/* %{buildroot}/usr/bin/
 
 # copy cassandra jar
-cp build/apache-cassandra-%{version}.jar %{buildroot}/usr/share/%{username}/
+cp build/apache-cassandra-%{upstream_version}.jar %{buildroot}/usr/share/%{username}/
 
 %clean
 %{__rm} -rf %{buildroot}
@@ -116,11 +122,13 @@ exit 0
 
 %files
 %defattr(0644,root,root,0755)
-%doc CHANGES.txt LICENSE.txt README.asc NEWS.txt NOTICE.txt
+%doc CHANGES.txt LICENSE.txt README.asc NEWS.txt NOTICE.txt CASSANDRA-14092.txt
+%attr(755,root,root) %{_bindir}/auditlogviewer
 %attr(755,root,root) %{_bindir}/cassandra-stress
 %attr(755,root,root) %{_bindir}/cqlsh
 %attr(755,root,root) %{_bindir}/cqlsh.py
 %attr(755,root,root) %{_bindir}/debug-cql
+%attr(755,root,root) %{_bindir}/fqltool
 %attr(755,root,root) %{_bindir}/nodetool
 %attr(755,root,root) %{_bindir}/sstableloader
 %attr(755,root,root) %{_bindir}/sstablescrub
@@ -130,10 +138,10 @@ exit 0
 %attr(755,root,root) %{_bindir}/stop-server
 %attr(755,root,root) %{_sbindir}/cassandra
 %attr(755,root,root) /%{_sysconfdir}/rc.d/init.d/%{username}
-%attr(755,root,root) /%{_sysconfdir}/default/%{username}
-%attr(755,root,root) /%{_sysconfdir}/security/limits.d/%{username}.conf
-%attr(755,root,root) /usr/share/%{username}*
-%attr(755,root,root) %config(noreplace) /%{_sysconfdir}/%{username}
+%{_sysconfdir}/default/%{username}
+%{_sysconfdir}/security/limits.d/%{username}.conf
+/usr/share/%{username}*
+%config(noreplace) /%{_sysconfdir}/%{username}
 %attr(755,%{username},%{username}) %config(noreplace) /var/lib/%{username}/*
 %attr(755,%{username},%{username}) /var/log/%{username}*
 %attr(755,%{username},%{username}) /var/run/%{username}*
@@ -172,6 +180,8 @@ This package contains extra tools for working with Cassandra clusters.
 %attr(755,root,root) %{_bindir}/sstableofflinerelevel
 %attr(755,root,root) %{_bindir}/sstablerepairedset
 %attr(755,root,root) %{_bindir}/sstablesplit
+%attr(755,root,root) %{_bindir}/auditlogviewer
+%attr(755,root,root) %{_bindir}/fqltool
 
 
 %changelog

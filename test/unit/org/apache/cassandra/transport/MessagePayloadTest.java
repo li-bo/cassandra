@@ -29,13 +29,13 @@ import org.junit.Assert;
 import org.junit.BeforeClass;
 import org.junit.Test;
 
+import org.apache.cassandra.config.EncryptionOptions;
 import org.apache.cassandra.cql3.BatchQueryOptions;
 import org.apache.cassandra.cql3.CQLStatement;
 import org.apache.cassandra.cql3.QueryHandler;
 import org.apache.cassandra.cql3.QueryOptions;
 import org.apache.cassandra.cql3.QueryProcessor;
 import org.apache.cassandra.cql3.statements.BatchStatement;
-import org.apache.cassandra.cql3.statements.ParsedStatement;
 import org.apache.cassandra.cql3.CQLTester;
 import org.apache.cassandra.exceptions.RequestExecutionException;
 import org.apache.cassandra.exceptions.RequestValidationException;
@@ -48,7 +48,6 @@ import org.apache.cassandra.transport.messages.QueryMessage;
 import org.apache.cassandra.transport.messages.ResultMessage;
 import org.apache.cassandra.utils.MD5Digest;
 
-import static org.apache.cassandra.config.EncryptionOptions.ClientEncryptionOptions;
 import static org.apache.cassandra.utils.ByteBufferUtil.bytes;
 
 public class MessagePayloadTest extends CQLTester
@@ -127,10 +126,10 @@ public class MessagePayloadTest extends CQLTester
                                                    nativePort,
                                                    ProtocolVersion.V5,
                                                    true,
-                                                   new ClientEncryptionOptions());
+                                                   new EncryptionOptions());
             try
             {
-                client.connect(false);
+                client.connect(false, false);
 
                 Map<String, ByteBuffer> reqMap;
                 Map<String, ByteBuffer> respMap;
@@ -162,7 +161,7 @@ public class MessagePayloadTest extends CQLTester
                 payloadEquals(reqMap, requestPayload);
                 payloadEquals(respMap, prepareResponse.getCustomPayload());
 
-                ExecuteMessage executeMessage = new ExecuteMessage(prepareResponse.statementId, QueryOptions.DEFAULT);
+                ExecuteMessage executeMessage = new ExecuteMessage(prepareResponse.statementId, prepareResponse.resultMetadataId, QueryOptions.DEFAULT);
                 reqMap = Collections.singletonMap("foo", bytes(44));
                 responsePayload = respMap = Collections.singletonMap("bar", bytes(44));
                 executeMessage.setCustomPayload(reqMap);
@@ -206,7 +205,7 @@ public class MessagePayloadTest extends CQLTester
             SimpleClient client = new SimpleClient(nativeAddr.getHostAddress(), nativePort);
             try
             {
-                client.connect(false);
+                client.connect(false, false);
 
                 Map<String, ByteBuffer> reqMap;
                 Map<String, ByteBuffer> respMap;
@@ -231,7 +230,7 @@ public class MessagePayloadTest extends CQLTester
                 payloadEquals(reqMap, requestPayload);
                 payloadEquals(respMap, prepareResponse.getCustomPayload());
 
-                ExecuteMessage executeMessage = new ExecuteMessage(prepareResponse.statementId, QueryOptions.DEFAULT);
+                ExecuteMessage executeMessage = new ExecuteMessage(prepareResponse.statementId, prepareResponse.resultMetadataId, QueryOptions.DEFAULT);
                 reqMap = Collections.singletonMap("foo", bytes(44));
                 responsePayload = respMap = Collections.singletonMap("bar", bytes(44));
                 executeMessage.setCustomPayload(reqMap);
@@ -275,7 +274,7 @@ public class MessagePayloadTest extends CQLTester
             SimpleClient client = new SimpleClient(nativeAddr.getHostAddress(), nativePort, ProtocolVersion.V3);
             try
             {
-                client.connect(false);
+                client.connect(false, false);
 
                 Map<String, ByteBuffer> reqMap;
 
@@ -315,7 +314,7 @@ public class MessagePayloadTest extends CQLTester
                 prepareMessage.setCustomPayload(null);
                 ResultMessage.Prepared prepareResponse = (ResultMessage.Prepared) client.execute(prepareMessage);
 
-                ExecuteMessage executeMessage = new ExecuteMessage(prepareResponse.statementId, QueryOptions.DEFAULT);
+                ExecuteMessage executeMessage = new ExecuteMessage(prepareResponse.statementId, prepareResponse.resultMetadataId, QueryOptions.DEFAULT);
                 reqMap = Collections.singletonMap("foo", bytes(44));
                 responsePayload = Collections.singletonMap("bar", bytes(44));
                 executeMessage.setCustomPayload(reqMap);
@@ -368,9 +367,14 @@ public class MessagePayloadTest extends CQLTester
 
     public static class TestQueryHandler implements QueryHandler
     {
-        public ParsedStatement.Prepared getPrepared(MD5Digest id)
+        public QueryProcessor.Prepared getPrepared(MD5Digest id)
         {
             return QueryProcessor.instance.getPrepared(id);
+        }
+
+        public CQLStatement parse(String query, QueryState state, QueryOptions options)
+        {
+            return QueryProcessor.instance.parse(query, state, options);
         }
 
         public ResultMessage.Prepared prepare(String query,
@@ -389,7 +393,7 @@ public class MessagePayloadTest extends CQLTester
             return result;
         }
 
-        public ResultMessage process(String query,
+        public ResultMessage process(CQLStatement statement,
                                      QueryState state,
                                      QueryOptions options,
                                      Map<String, ByteBuffer> customPayload,
@@ -398,7 +402,7 @@ public class MessagePayloadTest extends CQLTester
         {
             if (customPayload != null)
                 requestPayload = customPayload;
-            ResultMessage result = QueryProcessor.instance.process(query, state, options, customPayload, queryStartNanoTime);
+            ResultMessage result = QueryProcessor.instance.process(statement, state, options, customPayload, queryStartNanoTime);
             if (customPayload != null)
             {
                 result.setCustomPayload(responsePayload);

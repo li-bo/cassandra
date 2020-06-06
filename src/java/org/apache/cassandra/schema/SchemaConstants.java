@@ -18,12 +18,15 @@
 
 package org.apache.cassandra.schema;
 
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
-import java.util.*;
+import java.util.Arrays;
+import java.util.List;
+import java.util.Set;
+import java.util.UUID;
 import java.util.regex.Pattern;
 
 import com.google.common.collect.ImmutableSet;
+
+import org.apache.cassandra.db.Digest;
 
 public final class SchemaConstants
 {
@@ -37,12 +40,12 @@ public final class SchemaConstants
     public static final String DISTRIBUTED_KEYSPACE_NAME = "system_distributed";
 
     /* system keyspace names (the ones with LocalStrategy replication strategy) */
-    public static final Set<String> SYSTEM_KEYSPACE_NAMES = ImmutableSet.of(SYSTEM_KEYSPACE_NAME, SCHEMA_KEYSPACE_NAME);
+    public static final Set<String> LOCAL_SYSTEM_KEYSPACE_NAMES =
+        ImmutableSet.of(SYSTEM_KEYSPACE_NAME, SCHEMA_KEYSPACE_NAME);
 
     /* replicate system keyspace names (the ones with a "true" replication strategy) */
-    public static final Set<String> REPLICATED_SYSTEM_KEYSPACE_NAMES = ImmutableSet.of(TRACE_KEYSPACE_NAME,
-                                                                                       AUTH_KEYSPACE_NAME,
-                                                                                       DISTRIBUTED_KEYSPACE_NAME);
+    public static final Set<String> REPLICATED_SYSTEM_KEYSPACE_NAMES =
+        ImmutableSet.of(TRACE_KEYSPACE_NAME, AUTH_KEYSPACE_NAME, DISTRIBUTED_KEYSPACE_NAME);
     /**
      * longest permissible KS or CF name.  Our main concern is that filename not be more than 255 characters;
      * the filename will contain both the KS and CF names. Since non-schema-name components only take up
@@ -63,21 +66,22 @@ public final class SchemaConstants
 
     static
     {
-        try
-        {
-            emptyVersion = UUID.nameUUIDFromBytes(MessageDigest.getInstance("MD5").digest());
-        }
-        catch (NoSuchAlgorithmException e)
-        {
-            throw new AssertionError();
-        }
+        emptyVersion = UUID.nameUUIDFromBytes(Digest.forSchema().digest());
     }
 
     /**
      * @return whether or not the keyspace is a really system one (w/ LocalStrategy, unmodifiable, hardcoded)
      */
-    public static boolean isSystemKeyspace(String keyspaceName)
+    public static boolean isLocalSystemKeyspace(String keyspaceName)
     {
-        return SYSTEM_KEYSPACE_NAMES.contains(keyspaceName.toLowerCase());
+        return LOCAL_SYSTEM_KEYSPACE_NAMES.contains(keyspaceName.toLowerCase());
+    }
+
+    /**
+     * @return whether or not the keyspace is a replicated system ks (system_auth, system_traces, system_distributed)
+     */
+    public static boolean isReplicatedSystemKeyspace(String keyspaceName)
+    {
+        return REPLICATED_SYSTEM_KEYSPACE_NAMES.contains(keyspaceName.toLowerCase());
     }
 }

@@ -19,7 +19,6 @@ package org.apache.cassandra.db;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
-import java.security.MessageDigest;
 import java.util.*;
 
 import org.apache.cassandra.cache.IMeasurableMemory;
@@ -217,11 +216,11 @@ public interface ClusteringPrefix extends IMeasurableMemory, Clusterable
     public ByteBuffer get(int i);
 
     /**
-     * Adds the data of this clustering prefix to the provided digest.
+     * Adds the data of this clustering prefix to the provided Digest instance.
      *
-     * @param digest the digest to which to add this prefix.
+     * @param digest the Digest instance to which to add this prefix.
      */
-    public void digest(MessageDigest digest);
+    public void digest(Digest digest);
 
     /**
      * The size of the data hold by this prefix.
@@ -265,6 +264,12 @@ public interface ClusteringPrefix extends IMeasurableMemory, Clusterable
      * @return the values for this prefix as an array.
      */
     public ByteBuffer[] getRawValues();
+
+    /**
+     * If the prefix contains byte buffers that can be minimized (see {@link ByteBufferUtil#minimalBufferFor(ByteBuffer)}),
+     * this will return a copy of the prefix with minimized values, otherwise it returns itself.
+     */
+    public ClusteringPrefix minimize();
 
     public static class Serializer
     {

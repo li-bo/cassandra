@@ -18,19 +18,16 @@
 package org.apache.cassandra.db.commitlog;
 
 import java.io.*;
-import java.lang.management.ManagementFactory;
 import java.nio.ByteBuffer;
 import java.util.*;
+import java.util.function.Function;
 import java.util.zip.CRC32;
-import javax.management.MBeanServer;
-import javax.management.ObjectName;
 
 import com.google.common.annotations.VisibleForTesting;
 import org.apache.commons.lang3.StringUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import org.apache.cassandra.config.Config;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.config.ParameterizedClass;
 import org.apache.cassandra.db.*;
@@ -49,6 +46,7 @@ import org.apache.cassandra.security.EncryptionContext;
 import org.apache.cassandra.service.StorageService;
 import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.JVMStabilityInspector;
+import org.apache.cassandra.utils.MBeanWrapper;
 
 import static org.apache.cassandra.db.commitlog.CommitLogSegment.Allocation;
 import static org.apache.cassandra.db.commitlog.CommitLogSegment.CommitLogSegmentFileComparator;
@@ -66,10 +64,6 @@ public class CommitLog implements CommitLogMBean
 
     public static final CommitLog instance = CommitLog.construct();
 
-    // we only permit records HALF the size of a commit log, to ensure we don't spin allocating many mostly
-    // empty segments when writing large records
-    final long MAX_MUTATION_SIZE = DatabaseDescriptor.getMaxMutationSize();
-
     final public AbstractCommitLogSegmentManager segmentManager;
 
     public final CommitLogArchiver archiver;
@@ -77,25 +71,24 @@ public class CommitLog implements CommitLogMBean
     final AbstractCommitLogService executor;
 
     volatile Configuration configuration;
+    private boolean started = false;
 
     private static CommitLog construct()
     {
-        CommitLog log = new CommitLog(CommitLogArchiver.construct());
+        CommitLog log = new CommitLog(CommitLogArchiver.construct(), DatabaseDescriptor.getCommitLogSegmentMgrProvider());
 
-        MBeanServer mbs = ManagementFactory.getPlatformMBeanServer();
-        try
-        {
-            mbs.registerMBean(log, new ObjectName("org.apache.cassandra.db:type=Commitlog"));
-        }
-        catch (Exception e)
-        {
-            throw new RuntimeException(e);
-        }
-        return log.start();
+        MBeanWrapper.instance.registerMBean(log, "org.apache.cassandra.db:type=Commitlog");
+        return log;
     }
 
     @VisibleForTesting
     CommitLog(CommitLogArchiver archiver)
+    {
+        this(archiver, DatabaseDescriptor.getCommitLogSegmentMgrProvider());
+    }
+
+    @VisibleForTesting
+    CommitLog(CommitLogArchiver archiver, Function<CommitLog, AbstractCommitLogSegmentManager> segmentManagerProvider)
     {
         this.configuration = new Configuration(DatabaseDescriptor.getCommitLogCompression(),
                                                DatabaseDescriptor.getEncryptionContext());
@@ -104,22 +97,45 @@ public class CommitLog implements CommitLogMBean
         this.archiver = archiver;
         metrics = new CommitLogMetrics();
 
-        executor = DatabaseDescriptor.getCommitLogSync() == Config.CommitLogSync.batch
-                ? new BatchCommitLogService(this)
-                : new PeriodicCommitLogService(this);
+        switch (DatabaseDescriptor.getCommitLogSync())
+        {
+            case periodic:
+                executor = new PeriodicCommitLogService(this);
+                break;
+            case batch:
+                executor = new BatchCommitLogService(this);
+                break;
+            case group:
+                executor = new GroupCommitLogService(this);
+                break;
+            default:
+                throw new IllegalArgumentException("Unknown commitlog service type: " + DatabaseDescriptor.getCommitLogSync());
+        }
 
-        segmentManager = DatabaseDescriptor.isCDCEnabled()
-                         ? new CommitLogSegmentManagerCDC(this, DatabaseDescriptor.getCommitLogLocation())
-                         : new CommitLogSegmentManagerStandard(this, DatabaseDescriptor.getCommitLogLocation());
+        segmentManager = segmentManagerProvider.apply(this);
 
         // register metrics
         metrics.attach(executor, segmentManager);
     }
 
-    CommitLog start()
+    /**
+     * Tries to start the CommitLog if not already started.
+     */
+    synchronized public CommitLog start()
     {
-        segmentManager.start();
-        executor.start();
+        if (started)
+            return this;
+
+        try
+        {
+            segmentManager.start();
+            executor.start();
+            started = true;
+        } catch (Throwable t)
+        {
+            started = false;
+            throw t;
+        }
         return this;
     }
 
@@ -135,7 +151,7 @@ public class CommitLog implements CommitLogMBean
 
         // submit all files for this segment manager for archiving prior to recovery - CASSANDRA-6904
         // The files may have already been archived by normal CommitLog operation. This may cause errors in this
-        // archiving pass, which we should not treat as serious. 
+        // archiving pass, which we should not treat as serious.
         for (File file : new File(segmentManager.storageDirectory).listFiles(unmanagedFilesFilter))
         {
             archiver.maybeArchive(file.getPath(), file.getName());
@@ -222,9 +238,9 @@ public class CommitLog implements CommitLogMBean
     /**
      * Forces a disk flush on the commit log files that need it.  Blocking.
      */
-    public void sync() throws IOException
+    public void sync(boolean flush) throws IOException
     {
-        segmentManager.sync();
+        segmentManager.sync(flush);
     }
 
     /**
@@ -245,19 +261,13 @@ public class CommitLog implements CommitLogMBean
     {
         assert mutation != null;
 
+        mutation.validateSize(MessagingService.current_version, ENTRY_OVERHEAD_SIZE);
+
         try (DataOutputBuffer dob = DataOutputBuffer.scratchBuffer.get())
         {
             Mutation.serializer.serialize(mutation, dob, MessagingService.current_version);
             int size = dob.getLength();
-
             int totalSize = size + ENTRY_OVERHEAD_SIZE;
-            if (totalSize > MAX_MUTATION_SIZE)
-            {
-                throw new IllegalArgumentException(String.format("Mutation of %s is too large for the maximum size of %s",
-                                                                 FBUtilities.prettyPrintMemory(totalSize),
-                                                                 FBUtilities.prettyPrintMemory(MAX_MUTATION_SIZE)));
-            }
-
             Allocation alloc = segmentManager.allocate(mutation, totalSize);
 
             CRC32 checksum = new CRC32();
@@ -364,8 +374,9 @@ public class CommitLog implements CommitLogMBean
 
     public List<String> getActiveSegmentNames()
     {
-        List<String> segmentNames = new ArrayList<>();
-        for (CommitLogSegment seg : segmentManager.getActiveSegments())
+        Collection<CommitLogSegment> segments = segmentManager.getActiveSegments();
+        List<String> segmentNames = new ArrayList<>(segments.size());
+        for (CommitLogSegment seg : segments)
             segmentNames.add(seg.getName());
         return segmentNames;
     }
@@ -401,9 +412,14 @@ public class CommitLog implements CommitLogMBean
 
     /**
      * Shuts down the threads used by the commit log, blocking until completion.
+     * TODO this should accept a timeout, and throw TimeoutException
      */
-    public void shutdownBlocking() throws InterruptedException
+    synchronized public void shutdownBlocking() throws InterruptedException
     {
+        if (!started)
+            return;
+
+        started = false;
         executor.shutdown();
         executor.awaitTermination();
         segmentManager.shutdown();
@@ -414,7 +430,8 @@ public class CommitLog implements CommitLogMBean
      * FOR TESTING PURPOSES
      * @return the number of files recovered
      */
-    public int resetUnsafe(boolean deleteSegments) throws IOException
+    @VisibleForTesting
+    synchronized public int resetUnsafe(boolean deleteSegments) throws IOException
     {
         stopUnsafe(deleteSegments);
         resetConfiguration();
@@ -424,7 +441,8 @@ public class CommitLog implements CommitLogMBean
     /**
      * FOR TESTING PURPOSES.
      */
-    public void resetConfiguration()
+    @VisibleForTesting
+    synchronized public void resetConfiguration()
     {
         configuration = new Configuration(DatabaseDescriptor.getCommitLogCompression(),
                                           DatabaseDescriptor.getEncryptionContext());
@@ -433,8 +451,10 @@ public class CommitLog implements CommitLogMBean
     /**
      * FOR TESTING PURPOSES
      */
-    public void stopUnsafe(boolean deleteSegments)
+    @VisibleForTesting
+    synchronized public void stopUnsafe(boolean deleteSegments)
     {
+        started = false;
         executor.shutdown();
         try
         {
@@ -454,8 +474,10 @@ public class CommitLog implements CommitLogMBean
     /**
      * FOR TESTING PURPOSES
      */
-    public int restartUnsafe() throws IOException
+    @VisibleForTesting
+    synchronized public int restartUnsafe() throws IOException
     {
+        started = false;
         return start().recoverSegmentsOnDisk();
     }
 

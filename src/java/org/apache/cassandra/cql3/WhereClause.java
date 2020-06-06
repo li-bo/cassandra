@@ -15,18 +15,24 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
 package org.apache.cassandra.cql3;
 
 import java.util.List;
+import java.util.Objects;
 
 import com.google.common.collect.ImmutableList;
 
+import org.antlr.runtime.RecognitionException;
+import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.cql3.restrictions.CustomIndexExpression;
+
+import static java.lang.String.join;
+
+import static com.google.common.collect.Iterables.concat;
+import static com.google.common.collect.Iterables.transform;
 
 public final class WhereClause
 {
-
     private static final WhereClause EMPTY = new WhereClause(new Builder());
 
     public final List<Relation> relations;
@@ -34,9 +40,8 @@ public final class WhereClause
 
     private WhereClause(Builder builder)
     {
-        this.relations = builder.relations.build();
-        this.expressions = builder.expressions.build();
-
+        relations = builder.relations.build();
+        expressions = builder.expressions.build();
     }
 
     public static WhereClause empty()
@@ -47,6 +52,57 @@ public final class WhereClause
     public boolean containsCustomExpressions()
     {
         return !expressions.isEmpty();
+    }
+
+    /**
+     * Renames identifiers in all relations
+     * @param from the old identifier
+     * @param to the new identifier
+     * @return a new WhereClause with with "from" replaced by "to" in all relations
+     */
+    public WhereClause renameIdentifier(ColumnMetadata.Raw from, ColumnMetadata.Raw to)
+    {
+        WhereClause.Builder builder = new WhereClause.Builder();
+
+        relations.stream()
+                 .map(r -> r.renameIdentifier(from, to))
+                 .forEach(builder::add);
+
+        expressions.forEach(builder::add);
+
+        return builder.build();
+    }
+
+    public static WhereClause parse(String cql) throws RecognitionException
+    {
+        return CQLFragmentParser.parseAnyUnhandled(CqlParser::whereClause, cql).build();
+    }
+
+    @Override
+    public String toString()
+    {
+        return join(" AND ",
+                    concat(transform(relations, Relation::toString),
+                           transform(expressions, CustomIndexExpression::toString)));
+    }
+
+    @Override
+    public boolean equals(Object o)
+    {
+        if (this == o)
+            return true;
+
+        if (!(o instanceof WhereClause))
+            return false;
+
+        WhereClause wc = (WhereClause) o;
+        return relations.equals(wc.relations) && expressions.equals(wc.expressions);
+    }
+
+    @Override
+    public int hashCode()
+    {
+        return Objects.hash(relations, expressions);
     }
 
     public static final class Builder

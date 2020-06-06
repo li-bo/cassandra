@@ -32,6 +32,12 @@ import java.util.stream.Stream;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+
+import com.fasterxml.jackson.core.JsonFactory;
+import com.fasterxml.jackson.core.JsonGenerator;
+import com.fasterxml.jackson.core.util.DefaultPrettyPrinter;
+import com.fasterxml.jackson.core.util.DefaultPrettyPrinter.Indenter;
+import com.fasterxml.jackson.core.util.MinimalPrettyPrinter;
 import org.apache.cassandra.db.*;
 import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.db.marshal.CollectionType;
@@ -51,11 +57,6 @@ import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.transport.ProtocolVersion;
 import org.apache.cassandra.utils.ByteBufferUtil;
-import org.codehaus.jackson.JsonFactory;
-import org.codehaus.jackson.JsonGenerator;
-import org.codehaus.jackson.impl.Indenter;
-import org.codehaus.jackson.util.DefaultPrettyPrinter.NopIndenter;
-import org.codehaus.jackson.util.DefaultPrettyPrinter;
 
 public final class JsonTransformer
 {
@@ -78,36 +79,55 @@ public final class JsonTransformer
 
     private long currentPosition = 0;
 
-    private JsonTransformer(JsonGenerator json, ISSTableScanner currentScanner, boolean rawTime, TableMetadata metadata)
+    private JsonTransformer(JsonGenerator json, ISSTableScanner currentScanner, boolean rawTime, TableMetadata metadata, boolean isJsonLines)
     {
         this.json = json;
         this.metadata = metadata;
         this.currentScanner = currentScanner;
         this.rawTime = rawTime;
 
-        DefaultPrettyPrinter prettyPrinter = new DefaultPrettyPrinter();
-        prettyPrinter.indentObjectsWith(objectIndenter);
-        prettyPrinter.indentArraysWith(arrayIndenter);
-        json.setPrettyPrinter(prettyPrinter);
+        if (isJsonLines)
+        {
+            MinimalPrettyPrinter minimalPrettyPrinter = new MinimalPrettyPrinter();
+            minimalPrettyPrinter.setRootValueSeparator("\n");
+            json.setPrettyPrinter(minimalPrettyPrinter);
+        }
+        else
+        {
+            DefaultPrettyPrinter prettyPrinter = new DefaultPrettyPrinter();
+            prettyPrinter.indentObjectsWith(objectIndenter);
+            prettyPrinter.indentArraysWith(arrayIndenter);
+            json.setPrettyPrinter(prettyPrinter);
+        }
     }
 
     public static void toJson(ISSTableScanner currentScanner, Stream<UnfilteredRowIterator> partitions, boolean rawTime, TableMetadata metadata, OutputStream out)
             throws IOException
     {
-        try (JsonGenerator json = jsonFactory.createJsonGenerator(new OutputStreamWriter(out, StandardCharsets.UTF_8)))
+        try (JsonGenerator json = jsonFactory.createGenerator(new OutputStreamWriter(out, StandardCharsets.UTF_8)))
         {
-            JsonTransformer transformer = new JsonTransformer(json, currentScanner, rawTime, metadata);
+            JsonTransformer transformer = new JsonTransformer(json, currentScanner, rawTime, metadata, false);
             json.writeStartArray();
             partitions.forEach(transformer::serializePartition);
             json.writeEndArray();
         }
     }
 
+    public static void toJsonLines(ISSTableScanner currentScanner, Stream<UnfilteredRowIterator> partitions, boolean rawTime, TableMetadata metadata, OutputStream out)
+            throws IOException
+    {
+        try (JsonGenerator json = jsonFactory.createGenerator(new OutputStreamWriter(out, StandardCharsets.UTF_8)))
+        {
+            JsonTransformer transformer = new JsonTransformer(json, currentScanner, rawTime, metadata, true);
+            partitions.forEach(transformer::serializePartition);
+        }
+    }
+
     public static void keysToJson(ISSTableScanner currentScanner, Stream<DecoratedKey> keys, boolean rawTime, TableMetadata metadata, OutputStream out) throws IOException
     {
-        try (JsonGenerator json = jsonFactory.createJsonGenerator(new OutputStreamWriter(out, StandardCharsets.UTF_8)))
+        try (JsonGenerator json = jsonFactory.createGenerator(new OutputStreamWriter(out, StandardCharsets.UTF_8)))
         {
-            JsonTransformer transformer = new JsonTransformer(json, currentScanner, rawTime, metadata);
+            JsonTransformer transformer = new JsonTransformer(json, currentScanner, rawTime, metadata, false);
             json.writeStartArray();
             keys.forEach(transformer::serializePartitionKey);
             json.writeEndArray();
@@ -193,34 +213,37 @@ public final class JsonTransformer
 
             json.writeEndObject();
 
-            if (partition.hasNext() || partition.staticRow() != null)
+            json.writeFieldName("rows");
+            json.writeStartArray();
+            updatePosition();
+
+            if (partition.staticRow() != null)
             {
-                json.writeFieldName("rows");
-                json.writeStartArray();
-                updatePosition();
                 if (!partition.staticRow().isEmpty())
                     serializeRow(partition.staticRow());
-
-                Unfiltered unfiltered;
                 updatePosition();
-                while (partition.hasNext())
-                {
-                    unfiltered = partition.next();
-                    if (unfiltered instanceof Row)
-                    {
-                        serializeRow((Row) unfiltered);
-                    }
-                    else if (unfiltered instanceof RangeTombstoneMarker)
-                    {
-                        serializeTombstone((RangeTombstoneMarker) unfiltered);
-                    }
-                    updatePosition();
-                }
-                json.writeEndArray();
-
-                json.writeEndObject();
             }
+
+            Unfiltered unfiltered;
+            while (partition.hasNext())
+            {
+                unfiltered = partition.next();
+                if (unfiltered instanceof Row)
+                {
+                    serializeRow((Row) unfiltered);
+                }
+                else if (unfiltered instanceof RangeTombstoneMarker)
+                {
+                    serializeTombstone((RangeTombstoneMarker) unfiltered);
+                }
+                updatePosition();
+            }
+
+            json.writeEndArray();
+
+            json.writeEndObject();
         }
+
         catch (IOException e)
         {
             String key = metadata.partitionKeyType.getString(partition.partitionKey().getKey());
@@ -344,7 +367,7 @@ public final class JsonTransformer
                 }
                 else
                 {
-                    json.writeString(column.cellValueType().getString(clustering.get(i)));
+                    json.writeRawValue(column.cellValueType().toJSONString(clustering.get(i), ProtocolVersion.CURRENT));
                 }
             }
             json.writeEndArray();
@@ -501,7 +524,7 @@ public final class JsonTransformer
      * A specialized {@link Indenter} that enables a 'compact' mode which puts all subsequent json values on the same
      * line. This is manipulated via {@link CompactIndenter#setCompact(boolean)}
      */
-    private static final class CompactIndenter extends NopIndenter
+    private static final class CompactIndenter extends DefaultPrettyPrinter.NopIndenter
     {
 
         private static final int INDENT_LEVELS = 16;

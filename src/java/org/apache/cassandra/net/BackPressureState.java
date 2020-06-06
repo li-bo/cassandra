@@ -17,7 +17,7 @@
  */
 package org.apache.cassandra.net;
 
-import java.net.InetAddress;
+import org.apache.cassandra.locator.InetAddressAndPort;
 
 /**
  * Interface meant to track the back-pressure state per replica host.
@@ -27,7 +27,7 @@ public interface BackPressureState
     /**
      * Called when a message is sent to a replica.
      */
-    void onMessageSent(MessageOut<?> message);
+    void onMessageSent(Message<?> message);
 
     /**
      * Called when a response is received from a replica.
@@ -47,5 +47,5 @@ public interface BackPressureState
     /**
      * Returns the host this state refers to.
      */
-    InetAddress getHost();
+    InetAddressAndPort getHost();
 }

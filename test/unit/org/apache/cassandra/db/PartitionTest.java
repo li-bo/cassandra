@@ -19,12 +19,14 @@
 package org.apache.cassandra.db;
 
 import java.io.IOException;
-import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.Arrays;
 
+import org.junit.Assert;
 import org.junit.BeforeClass;
 import org.junit.Test;
+
+import org.apache.cassandra.db.rows.UnfilteredRowIterator;
 import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.db.rows.EncodingStats;
 import org.apache.cassandra.db.rows.UnfilteredRowIterators;
@@ -42,6 +44,7 @@ import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.FBUtilities;
 
 import static junit.framework.Assert.assertTrue;
+import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 
@@ -137,33 +140,34 @@ public class PartitionTest
             ImmutableBTreePartition p1 = Util.getOnlyPartitionUnfiltered(cmd1);
             ImmutableBTreePartition p2 = Util.getOnlyPartitionUnfiltered(cmd2);
 
-            MessageDigest digest1 = MessageDigest.getInstance("MD5");
-            MessageDigest digest2 = MessageDigest.getInstance("MD5");
-            UnfilteredRowIterators.digest(p1.unfilteredIterator(), digest1, version);
-            UnfilteredRowIterators.digest(p2.unfilteredIterator(), digest2, version);
-            assertFalse(Arrays.equals(digest1.digest(), digest2.digest()));
+            byte[] digest1 = getDigest(p1.unfilteredIterator(), version);
+            byte[] digest2 = getDigest(p2.unfilteredIterator(), version);
+            assertFalse(Arrays.equals(digest1, digest2));
 
             p1 = Util.getOnlyPartitionUnfiltered(Util.cmd(cfs, "key2").build());
             p2 = Util.getOnlyPartitionUnfiltered(Util.cmd(cfs, "key2").build());
-            digest1 = MessageDigest.getInstance("MD5");
-            digest2 = MessageDigest.getInstance("MD5");
-            UnfilteredRowIterators.digest(p1.unfilteredIterator(), digest1, version);
-            UnfilteredRowIterators.digest(p2.unfilteredIterator(), digest2, version);
-            assertTrue(Arrays.equals(digest1.digest(), digest2.digest()));
+            digest1 = getDigest(p1.unfilteredIterator(), version);
+            digest2 = getDigest(p2.unfilteredIterator(), version);
+            assertArrayEquals(digest1, digest2);
 
             p1 = Util.getOnlyPartitionUnfiltered(Util.cmd(cfs, "key2").build());
             RowUpdateBuilder.deleteRow(cfs.metadata(), 6, "key2", "c").applyUnsafe();
             p2 = Util.getOnlyPartitionUnfiltered(Util.cmd(cfs, "key2").build());
-            digest1 = MessageDigest.getInstance("MD5");
-            digest2 = MessageDigest.getInstance("MD5");
-            UnfilteredRowIterators.digest(p1.unfilteredIterator(), digest1, version);
-            UnfilteredRowIterators.digest(p2.unfilteredIterator(), digest2, version);
-            assertFalse(Arrays.equals(digest1.digest(), digest2.digest()));
+            digest1 = getDigest(p1.unfilteredIterator(), version);
+            digest2 = getDigest(p2.unfilteredIterator(), version);
+            assertFalse(Arrays.equals(digest1, digest2));
         }
         finally
         {
             cfs.truncateBlocking();
         }
+    }
+
+    private byte[] getDigest(UnfilteredRowIterator partition, int version)
+    {
+        Digest digest = Digest.forReadResponse();
+        UnfilteredRowIterators.digest(partition, digest, version);
+        return digest.digest();
     }
 
     @Test

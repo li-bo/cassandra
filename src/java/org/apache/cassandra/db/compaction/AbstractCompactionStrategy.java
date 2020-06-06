@@ -20,14 +20,12 @@ package org.apache.cassandra.db.compaction;
 import java.util.*;
 
 import com.google.common.annotations.VisibleForTesting;
-import com.google.common.base.Throwables;
 import com.google.common.collect.ImmutableMap;
-import com.google.common.base.Predicate;
-import com.google.common.collect.Iterables;
 
 import org.apache.cassandra.db.Directories;
 import org.apache.cassandra.db.SerializationHeader;
 import org.apache.cassandra.index.Index;
+import org.apache.cassandra.db.lifecycle.LifecycleNewTracker;
 import org.apache.cassandra.io.sstable.Descriptor;
 import org.apache.cassandra.io.sstable.SSTableMultiWriter;
 import org.apache.cassandra.io.sstable.SimpleSSTableMultiWriter;
@@ -36,7 +34,6 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import org.apache.cassandra.db.ColumnFamilyStore;
-import org.apache.cassandra.db.Memtable;
 import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
 import org.apache.cassandra.dht.Range;
 import org.apache.cassandra.dht.Token;
@@ -44,8 +41,8 @@ import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.io.sstable.Component;
 import org.apache.cassandra.io.sstable.ISSTableScanner;
 import org.apache.cassandra.io.sstable.metadata.MetadataCollector;
+import org.apache.cassandra.io.sstable.metadata.StatsMetadata;
 import org.apache.cassandra.schema.CompactionParams;
-import org.apache.cassandra.utils.JVMStabilityInspector;
 
 /**
  * Pluggable compaction strategy determines how SSTables get merged.
@@ -115,8 +112,6 @@ public abstract class AbstractCompactionStrategy
             uncheckedTombstoneCompaction = optionValue == null ? DEFAULT_UNCHECKED_TOMBSTONE_COMPACTION_OPTION : Boolean.parseBoolean(optionValue);
             optionValue = options.get(LOG_ALL_OPTION);
             logAll = optionValue == null ? DEFAULT_LOG_ALL_OPTION : Boolean.parseBoolean(optionValue);
-            if (!shouldBeEnabled())
-                this.disable();
         }
         catch (ConfigurationException e)
         {
@@ -213,62 +208,21 @@ public abstract class AbstractCompactionStrategy
      */
     public abstract long getMaxSSTableBytes();
 
-    @Deprecated
-    public void enable()
-    {
-    }
-
-    @Deprecated
-    public void disable()
-    {
-    }
-
-    /**
-     * @return whether or not MeteredFlusher should be able to trigger memtable flushes for this CF.
-     */
-    public boolean isAffectedByMeteredFlusher()
-    {
-        return true;
-    }
-
-    /**
-     * If not affected by MeteredFlusher (and handling flushing on its own), override to tell MF how much
-     * space to reserve for this CF, i.e., how much space to subtract from `memtable_total_space_in_mb` when deciding
-     * if other memtables should be flushed or not.
-     */
-    public long getMemtableReservedSize()
-    {
-        return 0;
-    }
-
-    /**
-     * Handle a flushed memtable.
-     *
-     * @param memtable the flushed memtable
-     * @param sstables the written sstables. can be null or empty if the memtable was clean.
-     */
-    public void replaceFlushed(Memtable memtable, Collection<SSTableReader> sstables)
-    {
-        cfs.getTracker().replaceFlushed(memtable, sstables);
-        if (sstables != null && !sstables.isEmpty())
-            CompactionManager.instance.submitBackground(cfs);
-    }
-
     /**
      * Filters SSTables that are to be blacklisted from the given collection
      *
      * @param originalCandidates The collection to check for blacklisted SSTables
      * @return list of the SSTables with blacklisted ones filtered out
      */
-    public static Iterable<SSTableReader> filterSuspectSSTables(Iterable<SSTableReader> originalCandidates)
+    public static List<SSTableReader> filterSuspectSSTables(Iterable<SSTableReader> originalCandidates)
     {
-        return Iterables.filter(originalCandidates, new Predicate<SSTableReader>()
+        List<SSTableReader> filtered = new ArrayList<>();
+        for (SSTableReader sstable : originalCandidates)
         {
-            public boolean apply(SSTableReader sstable)
-            {
-                return !sstable.isMarkedSuspect();
-            }
-        });
+            if (!sstable.isMarkedSuspect())
+                filtered.add(sstable);
+        }
+        return filtered;
     }
 
 
@@ -326,11 +280,30 @@ public abstract class AbstractCompactionStrategy
 
     public abstract void removeSSTable(SSTableReader sstable);
 
+    public void removeSSTables(Iterable<SSTableReader> removed)
+    {
+        for (SSTableReader sstable : removed)
+            removeSSTable(sstable);
+    }
+
     /**
      * Returns the sstables managed by this strategy instance
      */
     @VisibleForTesting
     protected abstract Set<SSTableReader> getSSTables();
+
+    /**
+     * Called when the metadata has changed for an sstable - for example if the level changed
+     *
+     * Not called when repair status changes (which is also metadata), because this results in the
+     * sstable getting removed from the compaction strategy instance.
+     *
+     * @param oldMetadata
+     * @param sstable
+     */
+    public void metadataChanged(StatsMetadata oldMetadata, SSTableReader sstable)
+    {
+    }
 
     public static class ScannerList implements AutoCloseable
     {
@@ -343,8 +316,8 @@ public abstract class AbstractCompactionStrategy
         public long getTotalBytesScanned()
         {
             long bytesScanned = 0L;
-            for (ISSTableScanner scanner : scanners)
-                bytesScanned += scanner.getBytesScanned();
+            for (int i=0, isize=scanners.size(); i<isize; i++)
+                bytesScanned += scanners.get(i).getBytesScanned();
 
             return bytesScanned;
         }
@@ -352,8 +325,8 @@ public abstract class AbstractCompactionStrategy
         public long getTotalCompressedSize()
         {
             long compressedSize = 0;
-            for (ISSTableScanner scanner : scanners)
-                compressedSize += scanner.getCompressedLengthInBytes();
+            for (int i=0, isize=scanners.size(); i<isize; i++)
+                compressedSize += scanners.get(i).getCompressedLengthInBytes();
 
             return compressedSize;
         }
@@ -363,8 +336,10 @@ public abstract class AbstractCompactionStrategy
             double compressed = 0.0;
             double uncompressed = 0.0;
 
-            for (ISSTableScanner scanner : scanners)
+            for (int i=0, isize=scanners.size(); i<isize; i++)
             {
+                @SuppressWarnings("resource")
+                ISSTableScanner scanner = scanners.get(i);
                 compressed += scanner.getCompressedLengthInBytes();
                 uncompressed += scanner.getLengthInBytes();
             }
@@ -396,7 +371,7 @@ public abstract class AbstractCompactionStrategy
      */
     protected boolean worthDroppingTombstones(SSTableReader sstable, int gcBefore)
     {
-        if (disableTombstoneCompactions || CompactionController.NEVER_PURGE_TOMBSTONES)
+        if (disableTombstoneCompactions || CompactionController.NEVER_PURGE_TOMBSTONES || cfs.getNeverPurgeTombstones())
             return false;
         // since we use estimations to calculate, there is a chance that compaction will not drop tombstones actually.
         // if that happens we will end up in infinite compaction loop, so first we check enough if enough time has
@@ -437,8 +412,8 @@ public abstract class AbstractCompactionStrategy
                 ranges.add(new Range<>(overlap.first.getToken(), overlap.last.getToken()));
             long remainingKeys = keys - sstable.estimatedKeysForRanges(ranges);
             // next, calculate what percentage of columns we have within those keys
-            long columns = sstable.getEstimatedColumnCount().mean() * remainingKeys;
-            double remainingColumnsRatio = ((double) columns) / (sstable.getEstimatedColumnCount().count() * sstable.getEstimatedColumnCount().mean());
+            long columns = sstable.getEstimatedCellPerPartitionCount().mean() * remainingKeys;
+            double remainingColumnsRatio = ((double) columns) / (sstable.getEstimatedCellPerPartitionCount().count() * sstable.getEstimatedCellPerPartitionCount().mean());
 
             // return if we still expect to have droppable tombstones in rest of columns
             return remainingColumnsRatio * droppableRatio > tombstoneThreshold;
@@ -517,15 +492,6 @@ public abstract class AbstractCompactionStrategy
         return uncheckedOptions;
     }
 
-    @Deprecated
-    public boolean shouldBeEnabled()
-    {
-        String optionValue = options.get(COMPACTION_ENABLED);
-
-        return optionValue == null || Boolean.parseBoolean(optionValue);
-    }
-
-
     /**
      * Method for grouping similar SSTables together, This will be used by
      * anti-compaction to determine which SSTables should be anitcompacted
@@ -539,7 +505,7 @@ public abstract class AbstractCompactionStrategy
         Collections.sort(sortedSSTablesToGroup, SSTableReader.sstableComparator);
 
         Collection<Collection<SSTableReader>> groupedSSTables = new ArrayList<>();
-        Collection<SSTableReader> currGroup = new ArrayList<>();
+        Collection<SSTableReader> currGroup = new ArrayList<>(groupSize);
 
         for (SSTableReader sstable : sortedSSTablesToGroup)
         {
@@ -547,7 +513,7 @@ public abstract class AbstractCompactionStrategy
             if (currGroup.size() == groupSize)
             {
                 groupedSSTables.add(currGroup);
-                currGroup = new ArrayList<>();
+                currGroup = new ArrayList<>(groupSize);
             }
         }
 
@@ -565,12 +531,13 @@ public abstract class AbstractCompactionStrategy
                                                        long keyCount,
                                                        long repairedAt,
                                                        UUID pendingRepair,
+                                                       boolean isTransient,
                                                        MetadataCollector meta,
                                                        SerializationHeader header,
                                                        Collection<Index> indexes,
-                                                       LifecycleTransaction txn)
+                                                       LifecycleNewTracker lifecycleNewTracker)
     {
-        return SimpleSSTableMultiWriter.create(descriptor, keyCount, repairedAt, pendingRepair, cfs.metadata, meta, header, indexes, txn);
+        return SimpleSSTableMultiWriter.create(descriptor, keyCount, repairedAt, pendingRepair, isTransient, cfs.metadata, meta, header, indexes, lifecycleNewTracker);
     }
 
     public boolean supportsEarlyOpen()

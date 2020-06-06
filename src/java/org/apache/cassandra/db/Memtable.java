@@ -53,7 +53,6 @@ import org.apache.cassandra.service.ActiveRepairService;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.ObjectSizes;
-import org.apache.cassandra.service.StorageService;
 import org.apache.cassandra.utils.concurrent.OpOrder;
 import org.apache.cassandra.utils.memory.HeapPool;
 import org.apache.cassandra.utils.memory.MemtableAllocator;
@@ -78,10 +77,6 @@ public class Memtable implements Comparable<Memtable>
             case heap_buffers:
                 return new SlabPool(heapLimit, 0, DatabaseDescriptor.getMemtableCleanupThreshold(), new ColumnFamilyStore.FlushLargestColumnFamily());
             case offheap_buffers:
-                if (!FileUtils.isCleanerAvailable)
-                {
-                    throw new IllegalStateException("Could not free direct byte buffer: offheap_buffers is not a safe memtable_allocation_type without this ability, please adjust your config. This feature is only guaranteed to work on an Oracle JVM. Refusing to start.");
-                }
                 return new SlabPool(heapLimit, offHeapLimit, DatabaseDescriptor.getMemtableCleanupThreshold(), new ColumnFamilyStore.FlushLargestColumnFamily());
             case offheap_objects:
                 return new NativePool(heapLimit, offHeapLimit, DatabaseDescriptor.getMemtableCleanupThreshold(), new ColumnFamilyStore.FlushLargestColumnFamily());
@@ -96,7 +91,7 @@ public class Memtable implements Comparable<Memtable>
     private final AtomicLong liveDataSize = new AtomicLong(0);
     private final AtomicLong currentOperations = new AtomicLong(0);
 
-    // the write barrier for directing writes to this memtable during a switch
+    // the write barrier for directing writes to this memtable or the next during a switch
     private volatile OpOrder.Barrier writeBarrier;
     // the precise upper bound of CommitLogPosition owned by this memtable
     private volatile AtomicReference<CommitLogPosition> commitLogUpperBound;
@@ -296,20 +291,17 @@ public class Memtable implements Comparable<Memtable>
 
     public List<FlushRunnable> flushRunnables(LifecycleTransaction txn)
     {
-        List<Range<Token>> localRanges = Range.sort(StorageService.instance.getLocalRanges(cfs.keyspace.getName()));
-
-        if (!cfs.getPartitioner().splitter().isPresent() || localRanges.isEmpty())
-            return Collections.singletonList(new FlushRunnable(txn));
-
-        return createFlushRunnables(localRanges, txn);
+        return createFlushRunnables(txn);
     }
 
-    private List<FlushRunnable> createFlushRunnables(List<Range<Token>> localRanges, LifecycleTransaction txn)
+    private List<FlushRunnable> createFlushRunnables(LifecycleTransaction txn)
     {
-        assert cfs.getPartitioner().splitter().isPresent();
+        DiskBoundaries diskBoundaries = cfs.getDiskBoundaries();
+        List<PartitionPosition> boundaries = diskBoundaries.positions;
+        List<Directories.DataDirectory> locations = diskBoundaries.directories;
+        if (boundaries == null)
+            return Collections.singletonList(new FlushRunnable(txn));
 
-        Directories.DataDirectory[] locations = cfs.getDirectories().getWriteableLocations();
-        List<PartitionPosition> boundaries = StorageService.getDiskBoundaries(localRanges, cfs.getPartitioner(), locations);
         List<FlushRunnable> runnables = new ArrayList<>(boundaries.size());
         PartitionPosition rangeStart = cfs.getPartitioner().getMinimumToken().minKeyBound();
         try
@@ -317,7 +309,7 @@ public class Memtable implements Comparable<Memtable>
             for (int i = 0; i < boundaries.size(); i++)
             {
                 PartitionPosition t = boundaries.get(i);
-                runnables.add(new FlushRunnable(rangeStart, t, locations[i], txn));
+                runnables.add(new FlushRunnable(rangeStart, t, locations.get(i), txn));
                 rangeStart = t;
             }
             return runnables;
@@ -457,7 +449,7 @@ public class Memtable implements Comparable<Memtable>
 
         private void writeSortedContents()
         {
-            logger.debug("Writing {}, flushed range = ({}, {}]", Memtable.this.toString(), from, to);
+            logger.info("Writing {}, flushed range = ({}, {}]", Memtable.this.toString(), from, to);
 
             boolean trackContention = logger.isTraceEnabled();
             int heavilyContendedRowCount = 0;
@@ -473,7 +465,7 @@ public class Memtable implements Comparable<Memtable>
                 if (isBatchLogTable && !partition.partitionLevelDeletion().isLive() && partition.hasRows())
                     continue;
 
-                if (trackContention && partition.usePessimisticLocking())
+                if (trackContention && partition.useLock())
                     heavilyContendedRowCount++;
 
                 if (!partition.isEmpty())
@@ -486,10 +478,10 @@ public class Memtable implements Comparable<Memtable>
             }
 
             long bytesFlushed = writer.getFilePointer();
-            logger.debug("Completed flushing {} ({}) for commitlog position {}",
-                                                                              writer.getFilename(),
-                                                                              FBUtilities.prettyPrintMemory(bytesFlushed),
-                                                                              commitLogUpperBound);
+            logger.info("Completed flushing {} ({}) for commitlog position {}",
+                         writer.getFilename(),
+                         FBUtilities.prettyPrintMemory(bytesFlushed),
+                         commitLogUpperBound);
             // Update the metrics
             cfs.metric.bytesFlushed.inc(bytesFlushed);
 
@@ -509,6 +501,7 @@ public class Memtable implements Comparable<Memtable>
                                                 toFlush.size(),
                                                 ActiveRepairService.UNREPAIRED_SSTABLE,
                                                 ActiveRepairService.NO_PENDING_REPAIR,
+                                                false,
                                                 sstableMetadataCollector,
                                                 new SerializationHeader(true, cfs.metadata(), columns, stats), txn);
         }

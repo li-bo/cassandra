@@ -31,11 +31,12 @@ import com.google.common.collect.Iterables;
 import org.junit.BeforeClass;
 import org.junit.Test;
 
-import junit.framework.Assert;
+import org.junit.Assert;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.Memtable;
 import org.apache.cassandra.db.PartitionPosition;
+import org.apache.cassandra.db.commitlog.CommitLog;
 import org.apache.cassandra.dht.AbstractBounds;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.schema.MockSchema;
@@ -52,6 +53,7 @@ public class ViewTest
     public static void setUp()
     {
         DatabaseDescriptor.daemonInitialization();
+        CommitLog.instance.start();
         MockSchema.cleanup();
     }
 

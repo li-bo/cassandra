@@ -49,11 +49,11 @@ public class LeveledManifest
     private static final Logger logger = LoggerFactory.getLogger(LeveledManifest.class);
 
     /**
-     * limit the number of L0 sstables we do at once, because compaction bloom filter creation
-     * uses a pessimistic estimate of how many keys overlap (none), so we risk wasting memory
-     * or even OOMing when compacting highly overlapping sstables
+     * if we have more than MAX_COMPACTING_L0 sstables in L0, we will run a round of STCS with at most
+     * cfs.getMaxCompactionThreshold() sstables.
      */
     private static final int MAX_COMPACTING_L0 = 32;
+
     /**
      * If we go this many rounds without compacting
      * in the highest level, we start bringing in sstables from
@@ -163,6 +163,7 @@ public class LeveledManifest
             // The add(..):ed sstable will be sent to level 0
             try
             {
+                logger.debug("Could not add sstable {} in level {} - dropping to 0", reader, reader.getSSTableLevel());
                 reader.descriptor.getMetadataSerializer().mutateLevel(reader.descriptor, 0);
                 reader.reloadSSTableMetadata();
             }
@@ -170,8 +171,28 @@ public class LeveledManifest
             {
                 logger.error("Could not change sstable level - adding it at level 0 anyway, we will find it at restart.", e);
             }
-            generations[0].add(reader);
+            if (!contains(reader))
+            {
+                generations[0].add(reader);
+            }
+            else
+            {
+                // An SSTable being added multiple times to this manifest indicates a programming error, but we don't
+                // throw an AssertionError because this shouldn't break the compaction strategy. Instead we log it
+                // together with a RuntimeException so the stack is print for troubleshooting if this ever happens.
+                logger.warn("SSTable {} is already present on leveled manifest and should not be re-added.", reader, new RuntimeException());
+            }
         }
+    }
+
+    private boolean contains(SSTableReader reader)
+    {
+        for (int i = 0; i < generations.length; i++)
+        {
+            if (generations[i].contains(reader))
+                return true;
+        }
+        return false;
     }
 
     public synchronized void replace(Collection<SSTableReader> removed, Collection<SSTableReader> added)
@@ -326,12 +347,12 @@ public class LeveledManifest
         // L2: 12  [ideal: 100]
         //
         // The problem is that L0 has a much higher score (almost 250) than L1 (11), so what we'll
-        // do is compact a batch of MAX_COMPACTING_L0 sstables with all 117 L1 sstables, and put the
-        // result (say, 120 sstables) in L1. Then we'll compact the next batch of MAX_COMPACTING_L0,
+        // do is compact a batch of cfs.getMaximumCompactionThreshold() sstables with all 117 L1 sstables, and put the
+        // result (say, 120 sstables) in L1. Then we'll compact the next batch of cfs.getMaxCompactionThreshold(),
         // and so forth.  So we spend most of our i/o rewriting the L1 data with each batch.
         //
         // If we could just do *all* L0 a single time with L1, that would be ideal.  But we can't
-        // -- see the javadoc for MAX_COMPACTING_L0.
+        // since we might run out of memory
         //
         // LevelDB's way around this is to simply block writes if L0 compaction falls behind.
         // We don't have that luxury.
@@ -647,7 +668,7 @@ public class LeveledManifest
             // 1a. add sstables to the candidate set until we have at least maxSSTableSizeInMB
             // 1b. prefer choosing older sstables as candidates, to newer ones
             // 1c. any L0 sstables that overlap a candidate, will also become candidates
-            // 2. At most MAX_COMPACTING_L0 sstables from L0 will be compacted at once
+            // 2. At most max_threshold sstables from L0 will be compacted at once
             // 3. If total candidate size is less than maxSSTableSizeInMB, we won't bother compacting with L1,
             //    and the result of the compaction will stay in L0 instead of being promoted (see promote())
             //
@@ -673,10 +694,10 @@ public class LeveledManifest
                     remaining.remove(newCandidate);
                 }
 
-                if (candidates.size() > MAX_COMPACTING_L0)
+                if (candidates.size() > cfs.getMaximumCompactionThreshold())
                 {
-                    // limit to only the MAX_COMPACTING_L0 oldest candidates
-                    candidates = new HashSet<>(ageSortedSSTables(candidates).subList(0, MAX_COMPACTING_L0));
+                    // limit to only the cfs.getMaximumCompactionThreshold() oldest candidates
+                    candidates = new HashSet<>(ageSortedSSTables(candidates).subList(0, cfs.getMaximumCompactionThreshold()));
                     break;
                 }
             }
@@ -742,10 +763,11 @@ public class LeveledManifest
         return sstables;
     }
 
-    private List<SSTableReader> ageSortedSSTables(Collection<SSTableReader> candidates)
+    @VisibleForTesting
+    List<SSTableReader> ageSortedSSTables(Collection<SSTableReader> candidates)
     {
         List<SSTableReader> ageSortedCandidates = new ArrayList<>(candidates);
-        Collections.sort(ageSortedCandidates, SSTableReader.maxTimestampComparator);
+        Collections.sort(ageSortedCandidates, SSTableReader.maxTimestampAscending);
         return ageSortedCandidates;
     }
 
@@ -798,9 +820,9 @@ public class LeveledManifest
             tasks += estimated[i];
         }
 
-        if (!DatabaseDescriptor.getDisableSTCSInL0() && getLevel(0).size() > MAX_COMPACTING_L0)
+        if (!DatabaseDescriptor.getDisableSTCSInL0() && getLevel(0).size() > cfs.getMaximumCompactionThreshold())
         {
-            int l0compactions = getLevel(0).size() / MAX_COMPACTING_L0;
+            int l0compactions = getLevel(0).size() / cfs.getMaximumCompactionThreshold();
             tasks += l0compactions;
             estimated[0] += l0compactions;
         }
@@ -842,6 +864,14 @@ public class LeveledManifest
             sstables.addAll(generation);
         }
         return sstables;
+    }
+
+    public synchronized void newLevel(SSTableReader sstable, int oldLevel)
+    {
+        boolean removed = generations[oldLevel].remove(sstable);
+        assert removed : "Could not remove " + sstable +" from " + oldLevel;
+        add(sstable);
+        lastCompactedKeys[oldLevel] = sstable.last;
     }
 
     public static class CompactionCandidate

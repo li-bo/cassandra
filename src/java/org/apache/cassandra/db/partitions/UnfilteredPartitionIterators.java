@@ -19,7 +19,6 @@ package org.apache.cassandra.db.partitions;
 
 import java.io.IOError;
 import java.io.IOException;
-import java.security.MessageDigest;
 import java.util.*;
 
 import org.apache.cassandra.db.*;
@@ -47,7 +46,9 @@ public abstract class UnfilteredPartitionIterators
     public interface MergeListener
     {
         public UnfilteredRowIterators.MergeListener getRowMergeListener(DecoratedKey partitionKey, List<UnfilteredRowIterator> versions);
-        public void close();
+        public default void close() {}
+
+        public static MergeListener NOOP = (partitionKey, versions) -> UnfilteredRowIterators.MergeListener.NOOP;
     }
 
     @SuppressWarnings("resource") // The created resources are returned right away
@@ -100,9 +101,9 @@ public abstract class UnfilteredPartitionIterators
         return FilteredPartitions.filter(iterator, nowInSec);
     }
 
-    public static UnfilteredPartitionIterator merge(final List<? extends UnfilteredPartitionIterator> iterators, final int nowInSec, final MergeListener listener)
+    @SuppressWarnings("resource")
+    public static UnfilteredPartitionIterator merge(final List<? extends UnfilteredPartitionIterator> iterators, final MergeListener listener)
     {
-        assert listener != null;
         assert !iterators.isEmpty();
 
         final TableMetadata metadata = iterators.get(0).metadata();
@@ -124,16 +125,28 @@ public abstract class UnfilteredPartitionIterators
                 toMerge.set(idx, current);
             }
 
+            @SuppressWarnings("resource")
             protected UnfilteredRowIterator getReduced()
             {
-                UnfilteredRowIterators.MergeListener rowListener = listener.getRowMergeListener(partitionKey, toMerge);
+                UnfilteredRowIterators.MergeListener rowListener = listener == null
+                                                                 ? null
+                                                                 : listener.getRowMergeListener(partitionKey, toMerge);
+
+                // Make a single empty iterator object to merge, we don't need toMerge.size() copiess
+                UnfilteredRowIterator empty = null;
 
                 // Replace nulls by empty iterators
                 for (int i = 0; i < toMerge.size(); i++)
+                {
                     if (toMerge.get(i) == null)
-                        toMerge.set(i, EmptyIterators.unfilteredRow(metadata, partitionKey, isReverseOrder));
+                    {
+                        if (null == empty)
+                            empty = EmptyIterators.unfilteredRow(metadata, partitionKey, isReverseOrder);
+                        toMerge.set(i, empty);
+                    }
+                }
 
-                return UnfilteredRowIterators.merge(toMerge, nowInSec, rowListener);
+                return UnfilteredRowIterators.merge(toMerge, rowListener);
             }
 
             protected void onKeyChange()
@@ -165,12 +178,15 @@ public abstract class UnfilteredPartitionIterators
             public void close()
             {
                 merged.close();
-                listener.close();
+
+                if (listener != null)
+                    listener.close();
             }
         };
     }
 
-    public static UnfilteredPartitionIterator mergeLazily(final List<? extends UnfilteredPartitionIterator> iterators, final int nowInSec)
+    @SuppressWarnings("resource")
+    public static UnfilteredPartitionIterator mergeLazily(final List<? extends UnfilteredPartitionIterator> iterators)
     {
         assert !iterators.isEmpty();
 
@@ -194,7 +210,7 @@ public abstract class UnfilteredPartitionIterators
                 {
                     protected UnfilteredRowIterator initializeIterator()
                     {
-                        return UnfilteredRowIterators.merge(toMerge, nowInSec);
+                        return UnfilteredRowIterators.merge(toMerge);
                     }
                 };
             }
@@ -233,20 +249,19 @@ public abstract class UnfilteredPartitionIterators
     /**
      * Digests the the provided iterator.
      *
+     * Caller must close the provided iterator.
+     *
      * @param iterator the iterator to digest.
-     * @param digest the {@code MessageDigest} to use for the digest.
+     * @param digest the {@link Digest} to use.
      * @param version the messaging protocol to use when producing the digest.
      */
-    public static void digest(UnfilteredPartitionIterator iterator, MessageDigest digest, int version)
+    public static void digest(UnfilteredPartitionIterator iterator, Digest digest, int version)
     {
-        try (UnfilteredPartitionIterator iter = iterator)
+        while (iterator.hasNext())
         {
-            while (iter.hasNext())
+            try (UnfilteredRowIterator partition = iterator.next())
             {
-                try (UnfilteredRowIterator partition = iter.next())
-                {
-                    UnfilteredRowIterators.digest(partition, digest, version);
-                }
+                UnfilteredRowIterators.digest(partition, digest, version);
             }
         }
     }
@@ -296,7 +311,7 @@ public abstract class UnfilteredPartitionIterators
             out.writeBoolean(false);
         }
 
-        public UnfilteredPartitionIterator deserialize(final DataInputPlus in, final int version, final TableMetadata metadata, final ColumnFilter selection, final SerializationHelper.Flag flag) throws IOException
+        public UnfilteredPartitionIterator deserialize(final DataInputPlus in, final int version, final TableMetadata metadata, final ColumnFilter selection, final DeserializationHelper.Flag flag) throws IOException
         {
             // Skip now unused isForThrift boolean
             in.readBoolean();

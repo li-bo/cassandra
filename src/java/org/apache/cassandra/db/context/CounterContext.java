@@ -18,7 +18,6 @@
 package org.apache.cassandra.db.context;
 
 import java.nio.ByteBuffer;
-import java.security.MessageDigest;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -168,7 +167,7 @@ public class CounterContext
         return state.context;
     }
 
-    private static int headerLength(ByteBuffer context)
+    public static int headerLength(ByteBuffer context)
     {
         return HEADER_SIZE_LENGTH + Math.abs(context.getShort(context.position())) * HEADER_ELT_LENGTH;
     }
@@ -629,7 +628,7 @@ public class CounterContext
 
         ByteBuffer marked = ByteBuffer.allocate(context.remaining());
         marked.putShort(marked.position(), (short) (count * -1));
-        ByteBufferUtil.arrayCopy(context,
+        ByteBufferUtil.copyBytes(context,
                                  context.position() + HEADER_SIZE_LENGTH,
                                  marked,
                                  marked.position() + HEADER_SIZE_LENGTH,
@@ -668,7 +667,7 @@ public class CounterContext
             cleared.putShort(cleared.position() + HEADER_SIZE_LENGTH + i * HEADER_ELT_LENGTH, globalShardIndexes.get(i));
 
         int origHeaderLength = headerLength(context);
-        ByteBufferUtil.arrayCopy(context,
+        ByteBufferUtil.copyBytes(context,
                                  context.position() + origHeaderLength,
                                  cleared,
                                  cleared.position() + headerLength(cleared),
@@ -681,20 +680,6 @@ public class CounterContext
     {
         if ((context.remaining() - headerLength(context)) % STEP_LENGTH != 0)
             throw new MarshalException("Invalid size for a counter context");
-    }
-
-    /**
-     * Update a MessageDigest with the content of a context.
-     * Note that this skips the header entirely since the header information
-     * has local meaning only, while digests are meant for comparison across
-     * nodes. This means in particular that we always have:
-     *  updateDigest(ctx) == updateDigest(clearAllLocal(ctx))
-     */
-    public void updateDigest(MessageDigest message, ByteBuffer context)
-    {
-        ByteBuffer dup = context.duplicate();
-        dup.position(context.position() + headerLength(context));
-        message.update(dup);
     }
 
     /**

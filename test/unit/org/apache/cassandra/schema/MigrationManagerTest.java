@@ -22,6 +22,7 @@ import java.io.File;
 import java.nio.ByteBuffer;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.Optional;
 import java.util.function.Supplier;
 
 import com.google.common.collect.ImmutableMap;
@@ -40,6 +41,7 @@ import org.apache.cassandra.cql3.UntypedResultSet;
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.Directories;
 import org.apache.cassandra.db.Keyspace;
+import org.apache.cassandra.db.Mutation;
 import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
 import org.apache.cassandra.db.marshal.ByteType;
 import org.apache.cassandra.db.marshal.BytesType;
@@ -47,9 +49,10 @@ import org.apache.cassandra.db.marshal.UTF8Type;
 import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.io.sstable.Component;
 import org.apache.cassandra.io.sstable.Descriptor;
-import org.apache.cassandra.locator.OldNetworkTopologyStrategy;
+import org.apache.cassandra.locator.NetworkTopologyStrategy;
 import org.apache.cassandra.utils.FBUtilities;
 
+import static java.util.Collections.singleton;
 import static org.apache.cassandra.Util.throwAssert;
 import static org.apache.cassandra.cql3.CQLTester.assertRows;
 import static org.apache.cassandra.cql3.CQLTester.row;
@@ -100,9 +103,8 @@ public class MigrationManagerTest
                          .addPartitionKeyColumn("keys", BytesType.instance)
                          .addClusteringColumn("col", BytesType.instance)
                          .comment("No comment")
-                         .readRepairChance(0.5)
                          .gcGraceSeconds(100000)
-                         .compaction(CompactionParams.scts(ImmutableMap.of("min_threshold", "500", "max_threshold", "500")));
+                         .compaction(CompactionParams.stcs(ImmutableMap.of("min_threshold", "500", "max_threshold", "500")));
 
         for (int i = 0; i < 5; i++)
         {
@@ -206,7 +208,7 @@ public class MigrationManagerTest
         store.forceBlockingFlush();
         assertTrue(store.getDirectories().sstableLister(Directories.OnTxnErr.THROW).list().size() > 0);
 
-        MigrationManager.announceTableDrop(ks.name, cfm.name);
+        MigrationManager.announceTableDrop(ks.name, cfm.name, false);
 
         assertFalse(Schema.instance.getKeyspaceMetadata(ks.name).tables.get(cfm.name).isPresent());
 
@@ -386,7 +388,7 @@ public class MigrationManagerTest
         }
 
         Map<String, String> replicationMap = new HashMap<>();
-        replicationMap.put(ReplicationParams.CLASS, OldNetworkTopologyStrategy.class.getName());
+        replicationMap.put(ReplicationParams.CLASS, NetworkTopologyStrategy.class.getName());
         replicationMap.put("replication_factor", "1");
 
         KeyspaceMetadata newKs = KeyspaceMetadata.create(cf.keyspace, KeyspaceParams.create(true, replicationMap));
@@ -565,6 +567,53 @@ public class MigrationManagerTest
         table1.validateCompatibility(table2);
     }
 
+    @Test
+    public void testEvolveSystemKeyspaceNew()
+    {
+        TableMetadata table = addTestTable("ks0", "t", "");
+        KeyspaceMetadata keyspace = KeyspaceMetadata.create("ks0", KeyspaceParams.simple(1), Tables.of(table));
+
+        Optional<Mutation> mutation = MigrationManager.evolveSystemKeyspace(keyspace, 0);
+        assertTrue(mutation.isPresent());
+
+        Schema.instance.merge(singleton(mutation.get()));
+        assertEquals(keyspace, Schema.instance.getKeyspaceMetadata("ks0"));
+    }
+
+    @Test
+    public void testEvolveSystemKeyspaceExistsUpToDate()
+    {
+        TableMetadata table = addTestTable("ks1", "t", "");
+        KeyspaceMetadata keyspace = KeyspaceMetadata.create("ks1", KeyspaceParams.simple(1), Tables.of(table));
+
+        // create the keyspace, verify it's there
+        Schema.instance.merge(singleton(SchemaKeyspace.makeCreateKeyspaceMutation(keyspace, 0).build()));
+        assertEquals(keyspace, Schema.instance.getKeyspaceMetadata("ks1"));
+
+        Optional<Mutation> mutation = MigrationManager.evolveSystemKeyspace(keyspace, 0);
+        assertFalse(mutation.isPresent());
+    }
+
+    @Test
+    public void testEvolveSystemKeyspaceChanged()
+    {
+        TableMetadata table0 = addTestTable("ks2", "t", "");
+        KeyspaceMetadata keyspace0 = KeyspaceMetadata.create("ks2", KeyspaceParams.simple(1), Tables.of(table0));
+
+        // create the keyspace, verify it's there
+        Schema.instance.merge(singleton(SchemaKeyspace.makeCreateKeyspaceMutation(keyspace0, 0).build()));
+        assertEquals(keyspace0, Schema.instance.getKeyspaceMetadata("ks2"));
+
+        TableMetadata table1 = table0.unbuild().comment("comment").build();
+        KeyspaceMetadata keyspace1 = KeyspaceMetadata.create("ks2", KeyspaceParams.simple(1), Tables.of(table1));
+
+        Optional<Mutation> mutation = MigrationManager.evolveSystemKeyspace(keyspace1, 1);
+        assertTrue(mutation.isPresent());
+
+        Schema.instance.merge(singleton(mutation.get()));
+        assertEquals(keyspace1, Schema.instance.getKeyspaceMetadata("ks2"));
+    }
+
     private TableMetadata addTestTable(String ks, String cf, String comment)
     {
         return
@@ -573,7 +622,6 @@ public class MigrationManagerTest
                          .addClusteringColumn("col", UTF8Type.instance)
                          .addRegularColumn("val", UTF8Type.instance)
                          .comment(comment)
-                         .readRepairChance(0.0)
                          .build();
     }
 }

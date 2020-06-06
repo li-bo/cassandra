@@ -25,7 +25,7 @@ import org.apache.commons.lang3.StringUtils;
 import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.cql3.ColumnIdentifier;
-import org.apache.cassandra.cql3.statements.IndexTarget;
+import org.apache.cassandra.cql3.statements.schema.IndexTarget;
 import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.schema.IndexMetadata;
 import org.apache.cassandra.utils.Pair;
@@ -77,13 +77,16 @@ public class TargetParser
         }
 
         // if it's not a CQL table, we can't assume that the column name is utf8, so
-        // in that case we have to do a linear scan of the table's columns to get the matching one
-        if (metadata.isCQLTable())
-            return Pair.create(metadata.getColumn(new ColumnIdentifier(columnName, true)), targetType);
-        else
-            for (ColumnMetadata column : metadata.columns())
-                if (column.name.toString().equals(columnName))
-                    return Pair.create(column, targetType);
+        // in that case we have to do a linear scan of the cfm's columns to get the matching one.
+        // After dropping compact storage (see CASSANDRA-10857), we can't distinguish between the
+        // former compact/thrift table, so we have to fall back to linear scan in both cases.
+        ColumnMetadata cd = metadata.getColumn(new ColumnIdentifier(columnName, true));
+        if (cd != null)
+            return Pair.create(cd, targetType);
+
+        for (ColumnMetadata column : metadata.columns())
+            if (column.name.toString().equals(columnName))
+                return Pair.create(column, targetType);
 
         return null;
     }

@@ -18,6 +18,7 @@
 package org.apache.cassandra.index.sasi;
 
 import java.io.FileWriter;
+import java.io.IOException;
 import java.io.Writer;
 import java.nio.ByteBuffer;
 import java.nio.file.FileSystems;
@@ -30,6 +31,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.stream.Collectors;
 
 import org.apache.cassandra.SchemaLoader;
 import org.apache.cassandra.cql3.CQLTester;
@@ -38,10 +40,11 @@ import org.apache.cassandra.cql3.QueryProcessor;
 import org.apache.cassandra.cql3.UntypedResultSet;
 import org.apache.cassandra.index.Index;
 import org.apache.cassandra.schema.ColumnMetadata;
+import org.apache.cassandra.schema.Schema;
 import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.cql3.Term;
-import org.apache.cassandra.cql3.statements.IndexTarget;
+import org.apache.cassandra.cql3.statements.schema.IndexTarget;
 import org.apache.cassandra.db.*;
 import org.apache.cassandra.db.filter.ColumnFilter;
 import org.apache.cassandra.db.filter.DataLimits;
@@ -56,12 +59,18 @@ import org.apache.cassandra.dht.Murmur3Partitioner;
 import org.apache.cassandra.dht.Range;
 import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.exceptions.InvalidRequestException;
+import org.apache.cassandra.index.sasi.analyzer.AbstractAnalyzer;
+import org.apache.cassandra.index.sasi.analyzer.DelimiterAnalyzer;
+import org.apache.cassandra.index.sasi.analyzer.NoOpAnalyzer;
+import org.apache.cassandra.index.sasi.analyzer.NonTokenizingAnalyzer;
+import org.apache.cassandra.index.sasi.analyzer.StandardAnalyzer;
 import org.apache.cassandra.index.sasi.conf.ColumnIndex;
 import org.apache.cassandra.index.sasi.disk.OnDiskIndexBuilder;
 import org.apache.cassandra.index.sasi.exceptions.TimeQuotaExceededException;
 import org.apache.cassandra.index.sasi.memory.IndexMemtable;
 import org.apache.cassandra.index.sasi.plan.QueryController;
 import org.apache.cassandra.index.sasi.plan.QueryPlan;
+import org.apache.cassandra.io.sstable.IndexSummaryManager;
 import org.apache.cassandra.io.sstable.SSTable;
 import org.apache.cassandra.schema.IndexMetadata;
 import org.apache.cassandra.schema.KeyspaceParams;
@@ -75,9 +84,11 @@ import com.google.common.collect.Lists;
 import com.google.common.collect.Sets;
 import com.google.common.util.concurrent.Uninterruptibles;
 
-import junit.framework.Assert;
+import org.junit.Assert;
 
 import org.junit.*;
+
+import static java.util.concurrent.TimeUnit.MILLISECONDS;
 
 public class SASIIndexTest
 {
@@ -767,7 +778,7 @@ public class SASIIndexTest
     {
         ColumnFamilyStore store = Keyspace.open(KS_NAME).getColumnFamilyStore(CF_NAME);
 
-        Mutation rm1 = new Mutation(KS_NAME, decoratedKey(AsciiType.instance.decompose("key1")));
+        Mutation.PartitionUpdateCollector rm1 = new Mutation.PartitionUpdateCollector(KS_NAME, decoratedKey(AsciiType.instance.decompose("key1")));
         rm1.add(PartitionUpdate.singleRowUpdate(store.metadata(),
                                                 rm1.key(),
                                                 buildRow(buildCell(store.metadata(),
@@ -775,7 +786,7 @@ public class SASIIndexTest
                                                                    AsciiType.instance.decompose("jason"),
                                                                    System.currentTimeMillis()))));
 
-        Mutation rm2 = new Mutation(KS_NAME, decoratedKey(AsciiType.instance.decompose("key2")));
+        Mutation.PartitionUpdateCollector rm2 = new Mutation.PartitionUpdateCollector(KS_NAME, decoratedKey(AsciiType.instance.decompose("key2")));
         rm2.add(PartitionUpdate.singleRowUpdate(store.metadata(),
                                                 rm2.key(),
                                                 buildRow(buildCell(store.metadata(),
@@ -783,7 +794,7 @@ public class SASIIndexTest
                                                                    AsciiType.instance.decompose("pavel"),
                                                                    System.currentTimeMillis()))));
 
-        Mutation rm3 = new Mutation(KS_NAME, decoratedKey(AsciiType.instance.decompose("key3")));
+        Mutation.PartitionUpdateCollector rm3 = new Mutation.PartitionUpdateCollector(KS_NAME, decoratedKey(AsciiType.instance.decompose("key3")));
         rm3.add(PartitionUpdate.singleRowUpdate(store.metadata(),
                                                 rm3.key(),
                                                 buildRow(buildCell(store.metadata(),
@@ -791,9 +802,9 @@ public class SASIIndexTest
                                                                    AsciiType.instance.decompose("Aleksey"),
                                                                    System.currentTimeMillis()))));
 
-        rm1.apply();
-        rm2.apply();
-        rm3.apply();
+        rm1.build().apply();
+        rm2.build().apply();
+        rm3.build().apply();
 
         if (forceFlush)
             store.forceBlockingFlush();
@@ -891,6 +902,81 @@ public class SASIIndexTest
 
         rows = getIndexed(store, 10, buildExpression(age, Operator.EQ, Int32Type.instance.decompose(40)));
         Assert.assertTrue(rows.toString(), Arrays.equals(new String[]{ "key9" }, rows.toArray(new String[rows.size()])));
+    }
+
+    @Test
+    public void testIndexRedistribution() throws IOException
+    {
+        Map<String, Pair<String, Integer>> part1 = new HashMap<String, Pair<String, Integer>>()
+        {{
+            put("key01", Pair.create("a", 33));
+            put("key02", Pair.create("a", 41));
+        }};
+
+        Map<String, Pair<String, Integer>> part2 = new HashMap<String, Pair<String, Integer>>()
+        {{
+            put("key03", Pair.create("a", 22));
+            put("key04", Pair.create("a", 45));
+        }};
+
+        Map<String, Pair<String, Integer>> part3 = new HashMap<String, Pair<String, Integer>>()
+        {{
+            put("key05", Pair.create("a", 32));
+            put("key06", Pair.create("a", 38));
+        }};
+
+        Map<String, Pair<String, Integer>> part4 = new HashMap<String, Pair<String, Integer>>()
+        {{
+            put("key07", Pair.create("a", 36));
+            put("key08", Pair.create("a", 36));
+        }};
+
+        Map<String, Pair<String, Integer>> part5 = new HashMap<String, Pair<String, Integer>>()
+        {{
+            put("key09", Pair.create("a", 21));
+            put("key10", Pair.create("a", 35));
+        }};
+
+        ColumnFamilyStore store = loadData(part1, 1000, true);
+        loadData(part2, true);
+        loadData(part3, true);
+
+        final ByteBuffer firstName = UTF8Type.instance.decompose("first_name");
+
+        Set<String> rows = getIndexed(store, 100, buildExpression(firstName, Operator.LIKE_CONTAINS, UTF8Type.instance.decompose("a")));
+        Assert.assertEquals(rows.toString(), 6, rows.size());
+
+        loadData(part4, true);
+        rows = getIndexed(store, 100, buildExpression(firstName, Operator.LIKE_CONTAINS, UTF8Type.instance.decompose("a")));
+        Assert.assertEquals(rows.toString(), 8, rows.size());
+
+        loadData(part5, true);
+
+        int minIndexInterval = store.metadata().params.minIndexInterval;
+        try
+        {
+            redistributeSummaries(10, store, firstName, minIndexInterval * 2);
+            redistributeSummaries(10, store, firstName, minIndexInterval * 4);
+            redistributeSummaries(10, store, firstName, minIndexInterval * 8);
+            redistributeSummaries(10, store, firstName, minIndexInterval * 16);
+        } finally
+        {
+            setMinIndexInterval(minIndexInterval);
+        }
+    }
+
+    private void redistributeSummaries(int expected, ColumnFamilyStore store, ByteBuffer firstName, int minIndexInterval) throws IOException
+    {
+        setMinIndexInterval(minIndexInterval);
+        IndexSummaryManager.instance.redistributeSummaries();
+        store.forceBlockingFlush();
+
+        Set<String> rows = getIndexed(store, 100, buildExpression(firstName, Operator.LIKE_CONTAINS, UTF8Type.instance.decompose("a")));
+        Assert.assertEquals(rows.toString(), expected, rows.size());
+    }
+
+    private void setMinIndexInterval(int minIndexInterval) {
+        QueryProcessor.executeOnceInternal(String.format("ALTER TABLE %s.%s WITH min_index_interval = %d;", KS_NAME, CF_NAME, minIndexInterval));
     }
 
     @Test
@@ -1013,25 +1099,30 @@ public class SASIIndexTest
 
         int previousCount = 0;
 
-        do
+        try
         {
-            // this loop figures out if number of search results monotonically increasing
-            // to make sure that concurrent updates don't interfere with reads, uses first_name and age
-            // indexes to test correctness of both Trie and SkipList ColumnIndex implementations.
+            do
+            {
+                // this loop figures out if number of search results monotonically increasing
+                // to make sure that concurrent updates don't interfere with reads, uses first_name and age
+                // indexes to test correctness of both Trie and SkipList ColumnIndex implementations.
 
+                Set<DecoratedKey> rows = getPaged(store, 100, buildExpression(firstName, Operator.LIKE_CONTAINS, UTF8Type.instance.decompose("a")),
+                                                  buildExpression(age, Operator.EQ, Int32Type.instance.decompose(26)));
+
+                Assert.assertTrue(previousCount <= rows.size());
+                previousCount = rows.size();
+            }
+            while (updates.get() < writeCount);
+
+            // to make sure that after all of the writes are done we can read all "count" worth of rows
             Set<DecoratedKey> rows = getPaged(store, 100, buildExpression(firstName, Operator.LIKE_CONTAINS, UTF8Type.instance.decompose("a")),
-                                                          buildExpression(age, Operator.EQ, Int32Type.instance.decompose(26)));
-
-            Assert.assertTrue(previousCount <= rows.size());
-            previousCount = rows.size();
+                            buildExpression(age, Operator.EQ, Int32Type.instance.decompose(26)));
+            Assert.assertEquals(writeCount, rows.size());
+        } finally {
+            scheduler.shutdownNow();
+            Assert.assertTrue(scheduler.awaitTermination(1, TimeUnit.MINUTES));
         }
-        while (updates.get() < writeCount);
-
-        // to make sure that after all of the right are done we can read all "count" worth of rows
-        Set<DecoratedKey> rows = getPaged(store, 100, buildExpression(firstName, Operator.LIKE_CONTAINS, UTF8Type.instance.decompose("a")),
-                                                      buildExpression(age, Operator.EQ, Int32Type.instance.decompose(26)));
-
-        Assert.assertEquals(writeCount, rows.size());
     }
 
     @Test
@@ -1095,13 +1186,13 @@ public class SASIIndexTest
         final ByteBuffer firstName = UTF8Type.instance.decompose("first_name");
         final ByteBuffer age = UTF8Type.instance.decompose("age");
 
-        Mutation rm = new Mutation(KS_NAME, decoratedKey(AsciiType.instance.decompose("key1")));
+        Mutation.PartitionUpdateCollector rm = new Mutation.PartitionUpdateCollector(KS_NAME, decoratedKey(AsciiType.instance.decompose("key1")));
         update(rm, new ArrayList<Cell>()
         {{
             add(buildCell(age, LongType.instance.decompose(26L), System.currentTimeMillis()));
             add(buildCell(firstName, AsciiType.instance.decompose("pavel"), System.currentTimeMillis()));
         }});
-        rm.apply();
+        rm.build().apply();
 
         store.forceBlockingFlush();
 
@@ -1127,25 +1218,25 @@ public class SASIIndexTest
 
         final ByteBuffer comment = UTF8Type.instance.decompose("comment");
 
-        Mutation rm = new Mutation(KS_NAME, decoratedKey("key1"));
+        Mutation.PartitionUpdateCollector rm = new Mutation.PartitionUpdateCollector(KS_NAME, decoratedKey("key1"));
         update(rm, comment, UTF8Type.instance.decompose("ⓈⓅⒺⒸⒾⒶⓁ ⒞⒣⒜⒭⒮ and normal ones"), System.currentTimeMillis());
-        rm.apply();
+        rm.build().apply();
 
-        rm = new Mutation(KS_NAME, decoratedKey("key2"));
+        rm = new Mutation.PartitionUpdateCollector(KS_NAME, decoratedKey("key2"));
         update(rm, comment, UTF8Type.instance.decompose("龍馭鬱"), System.currentTimeMillis());
-        rm.apply();
+        rm.build().apply();
 
-        rm = new Mutation(KS_NAME, decoratedKey("key3"));
+        rm = new Mutation.PartitionUpdateCollector(KS_NAME, decoratedKey("key3"));
         update(rm, comment, UTF8Type.instance.decompose("インディアナ"), System.currentTimeMillis());
-        rm.apply();
+        rm.build().apply();
 
-        rm = new Mutation(KS_NAME, decoratedKey("key4"));
+        rm = new Mutation.PartitionUpdateCollector(KS_NAME, decoratedKey("key4"));
         update(rm, comment, UTF8Type.instance.decompose("レストラン"), System.currentTimeMillis());
-        rm.apply();
+        rm.build().apply();
 
-        rm = new Mutation(KS_NAME, decoratedKey("key5"));
+        rm = new Mutation.PartitionUpdateCollector(KS_NAME, decoratedKey("key5"));
         update(rm, comment, UTF8Type.instance.decompose("ベンジャミン ウエスト"), System.currentTimeMillis());
-        rm.apply();
+        rm.build().apply();
 
         if (forceFlush)
             store.forceBlockingFlush();
@@ -1203,21 +1294,21 @@ public class SASIIndexTest
 
         final ByteBuffer comment = UTF8Type.instance.decompose("comment_suffix_split");
 
-        Mutation rm = new Mutation(KS_NAME, decoratedKey("key1"));
+        Mutation.PartitionUpdateCollector rm = new Mutation.PartitionUpdateCollector(KS_NAME, decoratedKey("key1"));
         update(rm, comment, UTF8Type.instance.decompose("龍馭鬱"), System.currentTimeMillis());
-        rm.apply();
+        rm.build().apply();
 
-        rm = new Mutation(KS_NAME, decoratedKey("key2"));
+        rm = new Mutation.PartitionUpdateCollector(KS_NAME, decoratedKey("key2"));
         update(rm, comment, UTF8Type.instance.decompose("インディアナ"), System.currentTimeMillis());
-        rm.apply();
+        rm.build().apply();
 
-        rm = new Mutation(KS_NAME, decoratedKey("key3"));
+        rm = new Mutation.PartitionUpdateCollector(KS_NAME, decoratedKey("key3"));
         update(rm, comment, UTF8Type.instance.decompose("レストラン"), System.currentTimeMillis());
-        rm.apply();
+        rm.build().apply();
 
-        rm = new Mutation(KS_NAME, decoratedKey("key4"));
+        rm = new Mutation.PartitionUpdateCollector(KS_NAME, decoratedKey("key4"));
         update(rm, comment, UTF8Type.instance.decompose("ベンジャミン ウエスト"), System.currentTimeMillis());
-        rm.apply();
+        rm.build().apply();
 
         if (forceFlush)
             store.forceBlockingFlush();
@@ -1272,9 +1363,9 @@ public class SASIIndexTest
 
             final ByteBuffer bigValue = UTF8Type.instance.decompose(new String(randomBytes));
 
-            Mutation rm = new Mutation(KS_NAME, decoratedKey("key1"));
+            Mutation.PartitionUpdateCollector rm = new Mutation.PartitionUpdateCollector(KS_NAME, decoratedKey("key1"));
             update(rm, comment, bigValue, System.currentTimeMillis());
-            rm.apply();
+            rm.build().apply();
 
             Set<String> rows;
 
@@ -1332,7 +1423,7 @@ public class SASIIndexTest
 
         try (ReadExecutionController controller = command.executionController())
         {
-            Set<String> rows = getKeys(new QueryPlan(store, command, DatabaseDescriptor.getRangeRpcTimeout()).execute(controller));
+            Set<String> rows = getKeys(new QueryPlan(store, command, DatabaseDescriptor.getRangeRpcTimeout(MILLISECONDS)).execute(controller));
             Assert.assertTrue(rows.toString(), Arrays.equals(new String[] { "key1", "key2", "key3", "key4" }, rows.toArray(new String[rows.size()])));
         }
     }
@@ -1352,37 +1443,37 @@ public class SASIIndexTest
 
         final ByteBuffer fullName = UTF8Type.instance.decompose("/output/full-name/");
 
-        Mutation rm = new Mutation(KS_NAME, decoratedKey("key1"));
+        Mutation.PartitionUpdateCollector rm = new Mutation.PartitionUpdateCollector(KS_NAME, decoratedKey("key1"));
         update(rm, fullName, UTF8Type.instance.decompose("美加 八田"), System.currentTimeMillis());
-        rm.apply();
+        rm.build().apply();
 
-        rm = new Mutation(KS_NAME, decoratedKey("key2"));
+        rm = new Mutation.PartitionUpdateCollector(KS_NAME, decoratedKey("key2"));
         update(rm, fullName, UTF8Type.instance.decompose("仁美 瀧澤"), System.currentTimeMillis());
-        rm.apply();
+        rm.build().apply();
 
-        rm = new Mutation(KS_NAME, decoratedKey("key3"));
+        rm = new Mutation.PartitionUpdateCollector(KS_NAME, decoratedKey("key3"));
         update(rm, fullName, UTF8Type.instance.decompose("晃宏 高須"), System.currentTimeMillis());
-        rm.apply();
+        rm.build().apply();
 
-        rm = new Mutation(KS_NAME, decoratedKey("key4"));
+        rm = new Mutation.PartitionUpdateCollector(KS_NAME, decoratedKey("key4"));
         update(rm, fullName, UTF8Type.instance.decompose("弘孝 大竹"), System.currentTimeMillis());
-        rm.apply();
+        rm.build().apply();
 
-        rm = new Mutation(KS_NAME, decoratedKey("key5"));
+        rm = new Mutation.PartitionUpdateCollector(KS_NAME, decoratedKey("key5"));
         update(rm, fullName, UTF8Type.instance.decompose("満枝 榎本"), System.currentTimeMillis());
-        rm.apply();
+        rm.build().apply();
 
-        rm = new Mutation(KS_NAME, decoratedKey("key6"));
+        rm = new Mutation.PartitionUpdateCollector(KS_NAME, decoratedKey("key6"));
         update(rm, fullName, UTF8Type.instance.decompose("飛鳥 上原"), System.currentTimeMillis());
-        rm.apply();
+        rm.build().apply();
 
-        rm = new Mutation(KS_NAME, decoratedKey("key7"));
+        rm = new Mutation.PartitionUpdateCollector(KS_NAME, decoratedKey("key7"));
         update(rm, fullName, UTF8Type.instance.decompose("大輝 鎌田"), System.currentTimeMillis());
-        rm.apply();
+        rm.build().apply();
 
-        rm = new Mutation(KS_NAME, decoratedKey("key8"));
+        rm = new Mutation.PartitionUpdateCollector(KS_NAME, decoratedKey("key8"));
         update(rm, fullName, UTF8Type.instance.decompose("利久 寺地"), System.currentTimeMillis());
-        rm.apply();
+        rm.build().apply();
 
         store.forceBlockingFlush();
 
@@ -1408,17 +1499,17 @@ public class SASIIndexTest
 
         final ByteBuffer comment = UTF8Type.instance.decompose("address");
 
-        Mutation rm = new Mutation(KS_NAME, decoratedKey("key1"));
+        Mutation.PartitionUpdateCollector rm = new Mutation.PartitionUpdateCollector(KS_NAME, decoratedKey("key1"));
         update(rm, comment, UTF8Type.instance.decompose("577 Rogahn Valleys Apt. 178"), System.currentTimeMillis());
-        rm.apply();
+        rm.build().apply();
 
-        rm = new Mutation(KS_NAME, decoratedKey("key2"));
+        rm = new Mutation.PartitionUpdateCollector(KS_NAME, decoratedKey("key2"));
         update(rm, comment, UTF8Type.instance.decompose("89809 Beverly Course Suite 089"), System.currentTimeMillis());
-        rm.apply();
+        rm.build().apply();
 
-        rm = new Mutation(KS_NAME, decoratedKey("key3"));
+        rm = new Mutation.PartitionUpdateCollector(KS_NAME, decoratedKey("key3"));
         update(rm, comment, UTF8Type.instance.decompose("165 clydie oval apt. 399"), System.currentTimeMillis());
-        rm.apply();
+        rm.build().apply();
 
         if (forceFlush)
             store.forceBlockingFlush();
@@ -1483,42 +1574,42 @@ public class SASIIndexTest
 
         final ByteBuffer name = UTF8Type.instance.decompose("first_name_prefix");
 
-        Mutation rm;
+        Mutation.PartitionUpdateCollector rm;
 
-        rm = new Mutation(KS_NAME, decoratedKey("key1"));
+        rm = new Mutation.PartitionUpdateCollector(KS_NAME, decoratedKey("key1"));
         update(rm, name, UTF8Type.instance.decompose("Pavel"), System.currentTimeMillis());
-        rm.apply();
+        rm.build().apply();
 
-        rm = new Mutation(KS_NAME, decoratedKey("key2"));
+        rm = new Mutation.PartitionUpdateCollector(KS_NAME, decoratedKey("key2"));
         update(rm, name, UTF8Type.instance.decompose("Jordan"), System.currentTimeMillis());
-        rm.apply();
+        rm.build().apply();
 
-        rm = new Mutation(KS_NAME, decoratedKey("key3"));
+        rm = new Mutation.PartitionUpdateCollector(KS_NAME, decoratedKey("key3"));
         update(rm, name, UTF8Type.instance.decompose("Mikhail"), System.currentTimeMillis());
-        rm.apply();
+        rm.build().apply();
 
-        rm = new Mutation(KS_NAME, decoratedKey("key4"));
+        rm = new Mutation.PartitionUpdateCollector(KS_NAME, decoratedKey("key4"));
         update(rm, name, UTF8Type.instance.decompose("Michael"), System.currentTimeMillis());
-        rm.apply();
+        rm.build().apply();
 
-        rm = new Mutation(KS_NAME, decoratedKey("key5"));
+        rm = new Mutation.PartitionUpdateCollector(KS_NAME, decoratedKey("key5"));
         update(rm, name, UTF8Type.instance.decompose("Johnny"), System.currentTimeMillis());
-        rm.apply();
+        rm.build().apply();
 
         // first flush would make interval for name - 'johnny' -> 'pavel'
         store.forceBlockingFlush();
 
-        rm = new Mutation(KS_NAME, decoratedKey("key6"));
+        rm = new Mutation.PartitionUpdateCollector(KS_NAME, decoratedKey("key6"));
         update(rm, name, UTF8Type.instance.decompose("Jason"), System.currentTimeMillis());
-        rm.apply();
+        rm.build().apply();
 
-        rm = new Mutation(KS_NAME, decoratedKey("key7"));
+        rm = new Mutation.PartitionUpdateCollector(KS_NAME, decoratedKey("key7"));
         update(rm, name, UTF8Type.instance.decompose("Vijay"), System.currentTimeMillis());
-        rm.apply();
+        rm.build().apply();
 
-        rm = new Mutation(KS_NAME, decoratedKey("key8")); // this name is going to be tokenized
+        rm = new Mutation.PartitionUpdateCollector(KS_NAME, decoratedKey("key8")); // this name is going to be tokenized
         update(rm, name, UTF8Type.instance.decompose("Jean-Claude"), System.currentTimeMillis());
-        rm.apply();
+        rm.build().apply();
 
         // this flush is going to produce range - 'jason' -> 'vijay'
         store.forceBlockingFlush();
@@ -1819,18 +1910,18 @@ public class SASIIndexTest
 
         UntypedResultSet.Row row1 = iterator.next();
         Assert.assertEquals(20160401L, row1.getLong("date"));
-        Assert.assertEquals(24.46, row1.getDouble("value"));
+        Assert.assertEquals(24.46, row1.getDouble("value"), 0.0);
         Assert.assertEquals(2, row1.getInt("variance"));
 
 
         UntypedResultSet.Row row2 = iterator.next();
         Assert.assertEquals(20160402L, row2.getLong("date"));
-        Assert.assertEquals(25.62, row2.getDouble("value"));
+        Assert.assertEquals(25.62, row2.getDouble("value"), 0.0);
         Assert.assertEquals(5, row2.getInt("variance"));
 
         UntypedResultSet.Row row3 = iterator.next();
         Assert.assertEquals(20160403L, row3.getLong("date"));
-        Assert.assertEquals(24.96, row3.getDouble("value"));
+        Assert.assertEquals(24.96, row3.getDouble("value"), 0.0);
         Assert.assertEquals(4, row3.getInt("variance"));
 
 
@@ -1842,7 +1933,7 @@ public class SASIIndexTest
 
         row1 = results.one();
         Assert.assertEquals(20160402L, row1.getLong("date"));
-        Assert.assertEquals(1.04, row1.getDouble("value"));
+        Assert.assertEquals(1.04, row1.getDouble("value"), 0.0);
         Assert.assertEquals(7, row1.getInt("variance"));
 
         // Only non statc columns filtering
@@ -1855,26 +1946,26 @@ public class SASIIndexTest
         row1 = iterator.next();
         Assert.assertEquals("TEMPERATURE", row1.getString("sensor_type"));
         Assert.assertEquals(20160401L, row1.getLong("date"));
-        Assert.assertEquals(24.46, row1.getDouble("value"));
+        Assert.assertEquals(24.46, row1.getDouble("value"), 0.0);
         Assert.assertEquals(2, row1.getInt("variance"));
 
 
         row2 = iterator.next();
         Assert.assertEquals("TEMPERATURE", row2.getString("sensor_type"));
         Assert.assertEquals(20160402L, row2.getLong("date"));
-        Assert.assertEquals(25.62, row2.getDouble("value"));
+        Assert.assertEquals(25.62, row2.getDouble("value"), 0.0);
         Assert.assertEquals(5, row2.getInt("variance"));
 
         row3 = iterator.next();
         Assert.assertEquals("TEMPERATURE", row3.getString("sensor_type"));
         Assert.assertEquals(20160403L, row3.getLong("date"));
-        Assert.assertEquals(24.96, row3.getDouble("value"));
+        Assert.assertEquals(24.96, row3.getDouble("value"), 0.0);
         Assert.assertEquals(4, row3.getInt("variance"));
 
         UntypedResultSet.Row row4 = iterator.next();
         Assert.assertEquals("PRESSURE", row4.getString("sensor_type"));
         Assert.assertEquals(20160402L, row4.getLong("date"));
-        Assert.assertEquals(1.04, row4.getDouble("value"));
+        Assert.assertEquals(1.04, row4.getDouble("value"), 0.0);
         Assert.assertEquals(7, row4.getInt("variance"));
     }
 
@@ -2332,6 +2423,76 @@ public class SASIIndexTest
         Assert.assertEquals(index.searchMemtable(expression).getCount(), 0);
     }
 
+    @Test
+    public void testAnalyzerValidation()
+    {
+        final String TABLE_NAME = "analyzer_validation";
+        QueryProcessor.executeOnceInternal(String.format("CREATE TABLE %s.%s (" +
+                                                         "  pk text PRIMARY KEY, " +
+                                                         "  ascii_v ascii, " +
+                                                         "  bigint_v bigint, " +
+                                                         "  blob_v blob, " +
+                                                         "  boolean_v boolean, " +
+                                                         "  date_v date, " +
+                                                         "  decimal_v decimal, " +
+                                                         "  double_v double, " +
+                                                         "  float_v float, " +
+                                                         "  inet_v inet, " +
+                                                         "  int_v int, " +
+                                                         "  smallint_v smallint, " +
+                                                         "  text_v text, " +
+                                                         "  time_v time, " +
+                                                         "  timestamp_v timestamp, " +
+                                                         "  timeuuid_v timeuuid, " +
+                                                         "  tinyint_v tinyint, " +
+                                                         "  uuid_v uuid, " +
+                                                         "  varchar_v varchar, " +
+                                                         "  varint_v varint" +
+                                                         ");",
+                                                         KS_NAME,
+                                                         TABLE_NAME));
+
+        Columns regulars = Schema.instance.getTableMetadata(KS_NAME, TABLE_NAME).regularColumns();
+        List<String> allColumns = regulars.stream().map(ColumnMetadata::toString).collect(Collectors.toList());
+        List<String> textColumns = Arrays.asList("text_v", "ascii_v", "varchar_v");
+
+        new HashMap<Class<? extends AbstractAnalyzer>, List<String>>()
+        {{
+            put(StandardAnalyzer.class, textColumns);
+            put(NonTokenizingAnalyzer.class, textColumns);
+            put(DelimiterAnalyzer.class, textColumns);
+            put(NoOpAnalyzer.class, allColumns);
+        }}
+        .forEach((analyzer, supportedColumns) -> {
+            for (String column : allColumns)
+            {
+                String query = String.format("CREATE CUSTOM INDEX ON %s.%s(%s) " +
+                                             "USING 'org.apache.cassandra.index.sasi.SASIIndex' " +
+                                             "WITH OPTIONS = {'analyzer_class': '%s', 'mode':'PREFIX'};",
+                                             KS_NAME, TABLE_NAME, column, analyzer.getName());
+
+                if (supportedColumns.contains(column))
+                {
+                    QueryProcessor.executeOnceInternal(query);
+                }
+                else
+                {
+                    try
+                    {
+                        QueryProcessor.executeOnceInternal(query);
+                        Assert.fail("Expected ConfigurationException");
+                    }
+                    catch (ConfigurationException e)
+                    {
+                        // expected
+                        Assert.assertTrue("Unexpected error message " + e.getMessage(),
+                                          e.getMessage().contains("does not support type"));
+                    }
+                }
+            }
+        });
+    }
+
     private static ColumnFamilyStore loadData(Map<String, Pair<String, Integer>> data, boolean forceFlush)
     {
         return loadData(data, System.currentTimeMillis(), forceFlush);
@@ -2422,7 +2583,7 @@ public class SASIIndexTest
 
     private static Mutation newMutation(String key, String firstName, String lastName, int age, long timestamp)
     {
-        Mutation rm = new Mutation(KS_NAME, decoratedKey(AsciiType.instance.decompose(key)));
+        Mutation.PartitionUpdateCollector rm = new Mutation.PartitionUpdateCollector(KS_NAME, decoratedKey(AsciiType.instance.decompose(key)));
         List<Cell> cells = new ArrayList<>(3);
 
         if (age >= 0)
@@ -2433,7 +2594,7 @@ public class SASIIndexTest
             cells.add(buildCell(ByteBufferUtil.bytes("last_name"), UTF8Type.instance.decompose(lastName), timestamp));
 
         update(rm, cells);
-        return rm;
+        return rm.build();
     }
 
     private static Set<String> getKeys(final UnfilteredPartitionIterator rows)
@@ -2526,14 +2687,14 @@ public class SASIIndexTest
         return new Expression(name, op, value);
     }
 
-    private static void update(Mutation rm, ByteBuffer name, ByteBuffer value, long timestamp)
+    private static void update(Mutation.PartitionUpdateCollector rm, ByteBuffer name, ByteBuffer value, long timestamp)
     {
         TableMetadata metadata = Keyspace.open(KS_NAME).getColumnFamilyStore(CF_NAME).metadata();
         rm.add(PartitionUpdate.singleRowUpdate(metadata, rm.key(), buildRow(buildCell(metadata, name, value, timestamp))));
     }
 
 
-    private static void update(Mutation rm, List<Cell> cells)
+    private static void update(Mutation.PartitionUpdateCollector rm, List<Cell> cells)
     {
         TableMetadata metadata = Keyspace.open(KS_NAME).getColumnFamilyStore(CF_NAME).metadata();
         rm.add(PartitionUpdate.singleRowUpdate(metadata, rm.key(), buildRow(cells)));

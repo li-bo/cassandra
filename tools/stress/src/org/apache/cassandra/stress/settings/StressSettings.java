@@ -88,7 +88,7 @@ public class StressSettings implements Serializable
         {
             String currentNode = node.randomNode();
             SimpleClient client = new SimpleClient(currentNode, port.nativePort);
-            client.connect(false);
+            client.connect(false, false);
             client.execute("USE \"" + schema.keyspace + "\";", org.apache.cassandra.db.ConsistencyLevel.ONE);
             return client;
         }
@@ -134,7 +134,7 @@ public class StressSettings implements Serializable
                 if (client != null)
                     return client;
 
-                EncryptionOptions.ClientEncryptionOptions encOptions = transport.getEncryptionOptions();
+                EncryptionOptions encOptions = transport.getEncryptionOptions();
                 JavaDriverClient c = new JavaDriverClient(this, currentNode, port.nativePort, encOptions);
                 c.connect(mode.compression());
                 if (keyspace != null)

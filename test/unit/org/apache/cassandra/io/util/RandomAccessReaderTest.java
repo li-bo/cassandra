@@ -36,6 +36,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 
+import org.junit.Assert;
 import org.junit.BeforeClass;
 import org.junit.Test;
 
@@ -266,7 +267,7 @@ public class RandomAccessReaderTest
 
     private static File writeFile(Parameters params) throws IOException
     {
-        final File f = File.createTempFile("testReadFully", "1");
+        final File f = FileUtils.createTempFile("testReadFully", "1");
         f.deleteOnExit();
 
         try(SequentialWriter writer = new SequentialWriter(f))
@@ -319,7 +320,7 @@ public class RandomAccessReaderTest
     @Test
     public void testReadBytes() throws IOException
     {
-        File f = File.createTempFile("testReadBytes", "1");
+        File f = FileUtils.createTempFile("testReadBytes", "1");
         final String expected = "The quick brown fox jumps over the lazy dog";
 
         try(SequentialWriter writer = new SequentialWriter(f))
@@ -348,7 +349,7 @@ public class RandomAccessReaderTest
     @Test
     public void testReset() throws IOException
     {
-        File f = File.createTempFile("testMark", "1");
+        File f = FileUtils.createTempFile("testMark", "1");
         final String expected = "The quick brown fox jumps over the lazy dog";
         final int numIterations = 10;
 
@@ -424,7 +425,7 @@ public class RandomAccessReaderTest
 
     private static void testSeek(int numThreads) throws IOException, InterruptedException
     {
-        final File f = File.createTempFile("testMark", "1");
+        final File f = FileUtils.createTempFile("testMark", "1");
         final byte[] expected = new byte[1 << 16];
 
         long seed = System.nanoTime();
@@ -494,7 +495,7 @@ public class RandomAccessReaderTest
                     executor.submit(worker);
 
                 executor.shutdown();
-                executor.awaitTermination(1, TimeUnit.MINUTES);
+                Assert.assertTrue(executor.awaitTermination(1, TimeUnit.MINUTES));
             }
         }
     }

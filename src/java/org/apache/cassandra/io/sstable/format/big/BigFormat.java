@@ -21,11 +21,14 @@ import java.util.Collection;
 import java.util.Set;
 import java.util.UUID;
 
+import com.google.common.base.Preconditions;
+
+import org.apache.cassandra.io.sstable.SSTable;
 import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.schema.TableMetadataRef;
 import org.apache.cassandra.db.RowIndexEntry;
 import org.apache.cassandra.db.SerializationHeader;
-import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
+import org.apache.cassandra.db.lifecycle.LifecycleNewTracker;
 import org.apache.cassandra.io.sstable.Component;
 import org.apache.cassandra.io.sstable.Descriptor;
 import org.apache.cassandra.io.sstable.format.*;
@@ -85,13 +88,15 @@ public class BigFormat implements SSTableFormat
                                   long keyCount,
                                   long repairedAt,
                                   UUID pendingRepair,
+                                  boolean isTransient,
                                   TableMetadataRef metadata,
                                   MetadataCollector metadataCollector,
                                   SerializationHeader header,
                                   Collection<SSTableFlushObserver> observers,
-                                  LifecycleTransaction txn)
+                                  LifecycleNewTracker lifecycleNewTracker)
         {
-            return new BigTableWriter(descriptor, keyCount, repairedAt, pendingRepair, metadata, metadataCollector, header, observers, txn);
+            SSTable.validateRepairedMetadata(repairedAt, pendingRepair, isTransient);
+            return new BigTableWriter(descriptor, keyCount, repairedAt, pendingRepair, isTransient, metadata, metadataCollector, header, observers, lifecycleNewTracker);
         }
     }
 
@@ -119,8 +124,9 @@ public class BigFormat implements SSTableFormat
         //             store rows natively
         // mb (3.0.7, 3.7): commit log lower bound included
         // mc (3.0.8, 3.9): commit log intervals included
+        // md (3.0.18, 3.11.4): corrected sstable min/max clustering
 
-        // na (4.0.0): uncompressed chunks, pending repair session
+        // na (4.0.0): uncompressed chunks, pending repair session, isTransient, checksummed sstable metadata file, new Bloomfilter format
         //
         // NOTE: when adding a new version, please add that to LegacySSTableTest, too.
 
@@ -128,8 +134,17 @@ public class BigFormat implements SSTableFormat
         public final int correspondingMessagingVersion;
         private final boolean hasCommitLogLowerBound;
         private final boolean hasCommitLogIntervals;
+        private final boolean hasAccurateMinMax;
         public final boolean hasMaxCompressedLength;
         private final boolean hasPendingRepair;
+        private final boolean hasMetadataChecksum;
+        private final boolean hasIsTransient;
+
+        /**
+         * CASSANDRA-9067: 4.0 bloom filter representation changed (two longs just swapped)
+         * have no 'static' bits caused by using the same upper bits for both bloom filter and token distribution.
+         */
+        private final boolean hasOldBfFormat;
 
         BigVersion(String version)
         {
@@ -140,8 +155,12 @@ public class BigFormat implements SSTableFormat
 
             hasCommitLogLowerBound = version.compareTo("mb") >= 0;
             hasCommitLogIntervals = version.compareTo("mc") >= 0;
+            hasAccurateMinMax = version.compareTo("md") >= 0;
             hasMaxCompressedLength = version.compareTo("na") >= 0;
             hasPendingRepair = version.compareTo("na") >= 0;
+            hasIsTransient = version.compareTo("na") >= 0;
+            hasMetadataChecksum = version.compareTo("na") >= 0;
+            hasOldBfFormat = version.compareTo("na") < 0;
         }
 
         @Override
@@ -168,12 +187,29 @@ public class BigFormat implements SSTableFormat
         }
 
         @Override
+        public boolean hasIsTransient()
+        {
+            return hasIsTransient;
+        }
+
+        @Override
         public int correspondingMessagingVersion()
         {
             return correspondingMessagingVersion;
         }
 
         @Override
+        public boolean hasMetadataChecksum()
+        {
+            return hasMetadataChecksum;
+        }
+
+        @Override
+        public boolean hasAccurateMinMax()
+        {
+            return hasAccurateMinMax;
+        }
+
         public boolean isCompatible()
         {
             return version.compareTo(earliest_supported_version) >= 0 && version.charAt(0) <= current_version.charAt(0);
@@ -189,6 +225,12 @@ public class BigFormat implements SSTableFormat
         public boolean hasMaxCompressedLength()
         {
             return hasMaxCompressedLength;
+        }
+
+        @Override
+        public boolean hasOldBfFormat()
+        {
+            return hasOldBfFormat;
         }
     }
 }

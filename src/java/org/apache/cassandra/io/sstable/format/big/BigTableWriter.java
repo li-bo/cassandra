@@ -21,6 +21,8 @@ import java.io.*;
 import java.nio.ByteBuffer;
 import java.util.*;
 
+import org.apache.cassandra.db.compaction.OperationType;
+import org.apache.cassandra.db.lifecycle.LifecycleNewTracker;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -28,11 +30,11 @@ import org.apache.cassandra.cache.ChunkCache;
 import org.apache.cassandra.config.Config;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.*;
-import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
 import org.apache.cassandra.db.rows.*;
 import org.apache.cassandra.db.transform.Transformation;
 import org.apache.cassandra.io.FSWriteError;
 import org.apache.cassandra.io.compress.CompressedSequentialWriter;
+import org.apache.cassandra.io.compress.ICompressor;
 import org.apache.cassandra.io.sstable.*;
 import org.apache.cassandra.io.sstable.format.SSTableFlushObserver;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
@@ -42,6 +44,7 @@ import org.apache.cassandra.io.sstable.metadata.MetadataComponent;
 import org.apache.cassandra.io.sstable.metadata.MetadataType;
 import org.apache.cassandra.io.sstable.metadata.StatsMetadata;
 import org.apache.cassandra.io.util.*;
+import org.apache.cassandra.schema.CompressionParams;
 import org.apache.cassandra.schema.TableMetadataRef;
 import org.apache.cassandra.utils.*;
 import org.apache.cassandra.utils.concurrent.Transactional;
@@ -68,22 +71,25 @@ public class BigTableWriter extends SSTableWriter
                           long keyCount,
                           long repairedAt,
                           UUID pendingRepair,
+                          boolean isTransient,
                           TableMetadataRef metadata,
                           MetadataCollector metadataCollector, 
                           SerializationHeader header,
                           Collection<SSTableFlushObserver> observers,
-                          LifecycleTransaction txn)
+                          LifecycleNewTracker lifecycleNewTracker)
     {
-        super(descriptor, keyCount, repairedAt, pendingRepair, metadata, metadataCollector, header, observers);
-        txn.trackNew(this); // must track before any files are created
+        super(descriptor, keyCount, repairedAt, pendingRepair, isTransient, metadata, metadataCollector, header, observers);
+        lifecycleNewTracker.trackNew(this); // must track before any files are created
 
         if (compression)
         {
+            final CompressionParams compressionParams = compressionFor(lifecycleNewTracker.opType());
+
             dataFile = new CompressedSequentialWriter(new File(getFilename()),
                                              descriptor.filenameFor(Component.COMPRESSION_INFO),
                                              new File(descriptor.filenameFor(Component.DIGEST)),
                                              writerOption,
-                                             metadata().params.compression,
+                                             compressionParams,
                                              metadataCollector);
         }
         else
@@ -99,6 +105,45 @@ public class BigTableWriter extends SSTableWriter
         iwriter = new IndexWriter(keyCount);
 
         columnIndexWriter = new ColumnIndex(this.header, dataFile, descriptor.version, this.observers, getRowIndexEntrySerializer().indexInfoSerializer());
+    }
+
+    /**
+     * Given an OpType, determine the correct Compression Parameters
+     * @param opType
+     * @return {@link org.apache.cassandra.schema.CompressionParams}
+     */
+    private CompressionParams compressionFor(final OperationType opType)
+    {
+        CompressionParams compressionParams = metadata().params.compression;
+        final ICompressor compressor = compressionParams.getSstableCompressor();
+
+        if (null != compressor && opType == OperationType.FLUSH)
+        {
+            // When we are flushing out of the memtable throughput of the compressor is critical as flushes,
+            // especially of large tables, can queue up and potentially block writes.
+            // This optimization allows us to fall back to a faster compressor if a particular
+            // compression algorithm indicates we should. See CASSANDRA-15379 for more details.
+            switch (DatabaseDescriptor.getFlushCompression())
+            {
+                // It is relatively easier to insert a Noop compressor than to disable compressed writing
+                // entirely as the "compression" member field is provided outside the scope of this class.
+                // It may make sense in the future to refactor the ownership of the compression flag so that
+                // We can bypass the CompressedSequentialWriter in this case entirely.
+                case none:
+                    compressionParams = CompressionParams.NOOP;
+                    break;
+                case fast:
+                    if (!compressor.recommendedUses().contains(ICompressor.Uses.FAST_COMPRESSION))
+                    {
+                        // The default compressor is generally fast (LZ4 with 16KiB block size)
+                        compressionParams = CompressionParams.DEFAULT;
+                        break;
+                    }
+                case table:
+                default:
+            }
+        }
+        return compressionParams;
     }
 
     public void mark()
@@ -439,7 +484,7 @@ public class BigTableWriter extends SSTableWriter
             builder = new FileHandle.Builder(descriptor.filenameFor(Component.PRIMARY_INDEX)).mmapped(DatabaseDescriptor.getIndexAccessMode() == Config.DiskAccessMode.mmap);
             chunkCache.ifPresent(builder::withChunkCache);
             summary = new IndexSummaryBuilder(keyCount, metadata().params.minIndexInterval, Downsampling.BASE_SAMPLING_LEVEL);
-            bf = FilterFactory.getFilter(keyCount, metadata().params.bloomFilterFpChance, true);
+            bf = FilterFactory.getFilter(keyCount, metadata().params.bloomFilterFpChance);
             // register listeners to be alerted when the data files are flushed
             indexFile.setPostFlushListener(() -> summary.markIndexSynced(indexFile.getLastFlushOffset()));
             dataFile.setPostFlushListener(() -> summary.markDataSynced(dataFile.getLastFlushOffset()));
@@ -484,7 +529,7 @@ public class BigTableWriter extends SSTableWriter
                      DataOutputStreamPlus stream = new BufferedDataOutputStreamPlus(fos))
                 {
                     // bloom filter
-                    FilterFactory.serialize(bf, stream);
+                    BloomFilterSerializer.serialize((BloomFilter) bf, stream);
                     stream.flush();
                     SyncUtil.sync(fos);
                 }

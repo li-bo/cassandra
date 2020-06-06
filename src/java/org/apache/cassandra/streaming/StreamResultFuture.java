@@ -17,18 +17,18 @@
  */
 package org.apache.cassandra.streaming;
 
-import java.net.InetAddress;
-import java.net.InetSocketAddress;
-import java.net.SocketAddress;
-import java.util.*;
+import java.util.Collection;
+import java.util.UUID;
 import java.util.concurrent.ConcurrentLinkedQueue;
 
 import com.google.common.util.concurrent.AbstractFuture;
 import com.google.common.util.concurrent.Futures;
+import com.google.common.util.concurrent.MoreExecutors;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import io.netty.channel.Channel;
+import org.apache.cassandra.locator.InetAddressAndPort;
 import org.apache.cassandra.utils.FBUtilities;
 
 /**
@@ -68,19 +68,19 @@ public final class StreamResultFuture extends AbstractFuture<StreamState>
         this.coordinator = coordinator;
 
         // if there is no session to listen to, we immediately set result for returning
-        if (!coordinator.isReceiving() && !coordinator.hasActiveSessions())
+        if (!coordinator.isFollower() && !coordinator.hasActiveSessions())
             set(getCurrentState());
     }
 
-    private StreamResultFuture(UUID planId, StreamOperation streamOperation, boolean keepSSTableLevels, UUID pendingRepair, PreviewKind previewKind)
+    private StreamResultFuture(UUID planId, StreamOperation streamOperation, UUID pendingRepair, PreviewKind previewKind)
     {
-        this(planId, streamOperation, new StreamCoordinator(0, keepSSTableLevels, new DefaultConnectionFactory(), false, pendingRepair, previewKind));
+        this(planId, streamOperation, new StreamCoordinator(streamOperation, 0, new DefaultConnectionFactory(), true, false, pendingRepair, previewKind));
     }
 
-    static StreamResultFuture init(UUID planId, StreamOperation streamOperation, Collection<StreamEventHandler> listeners,
-                                   StreamCoordinator coordinator)
+    public static StreamResultFuture createInitiator(UUID planId, StreamOperation streamOperation, Collection<StreamEventHandler> listeners,
+                                                     StreamCoordinator coordinator)
     {
-        StreamResultFuture future = createAndRegister(planId, streamOperation, coordinator);
+        StreamResultFuture future = createAndRegisterInitiator(planId, streamOperation, coordinator);
         if (listeners != null)
         {
             for (StreamEventHandler listener : listeners)
@@ -100,33 +100,35 @@ public final class StreamResultFuture extends AbstractFuture<StreamState>
         return future;
     }
 
-    public static synchronized StreamResultFuture initReceivingSide(int sessionIndex,
-                                                                    UUID planId,
-                                                                    StreamOperation streamOperation,
-                                                                    InetAddress from,
-                                                                    Channel channel,
-                                                                    boolean keepSSTableLevel,
-                                                                    UUID pendingRepair,
-                                                                    PreviewKind previewKind)
+    public static synchronized StreamResultFuture createFollower(int sessionIndex,
+                                                                 UUID planId,
+                                                                 StreamOperation streamOperation,
+                                                                 InetAddressAndPort from,
+                                                                 Channel channel,
+                                                                 UUID pendingRepair,
+                                                                 PreviewKind previewKind)
     {
         StreamResultFuture future = StreamManager.instance.getReceivingStream(planId);
         if (future == null)
         {
-            logger.info("[Stream #{} ID#{}] Creating new streaming plan for {}", planId, sessionIndex, streamOperation.getDescription());
+            logger.info("[Stream #{} ID#{}] Creating new streaming plan for {} from {} channel.remote {} channel.local {}" +
+                        " channel.id {}", planId, sessionIndex, streamOperation.getDescription(),
+                        from, channel.remoteAddress(), channel.localAddress(), channel.id());
 
             // The main reason we create a StreamResultFuture on the receiving side is for JMX exposure.
-            future = new StreamResultFuture(planId, streamOperation, keepSSTableLevel, pendingRepair, previewKind);
-            StreamManager.instance.registerReceiving(future);
+            future = new StreamResultFuture(planId, streamOperation, pendingRepair, previewKind);
+            StreamManager.instance.registerFollower(future);
         }
         future.attachConnection(from, sessionIndex, channel);
-        logger.info("[Stream #{}, ID#{}] Received streaming plan for {}", planId, sessionIndex, streamOperation.getDescription());
+        logger.info("[Stream #{}, ID#{}] Received streaming plan for {} from {} channel.remote {} channel.local {} channel.id {}",
+                    planId, sessionIndex, streamOperation.getDescription(), from, channel.remoteAddress(), channel.localAddress(), channel.id());
         return future;
     }
 
-    private static StreamResultFuture createAndRegister(UUID planId, StreamOperation streamOperation, StreamCoordinator coordinator)
+    private static StreamResultFuture createAndRegisterInitiator(UUID planId, StreamOperation streamOperation, StreamCoordinator coordinator)
     {
         StreamResultFuture future = new StreamResultFuture(planId, streamOperation, coordinator);
-        StreamManager.instance.register(future);
+        StreamManager.instance.registerInitiator(future);
         return future;
     }
 
@@ -135,18 +137,15 @@ public final class StreamResultFuture extends AbstractFuture<StreamState>
         return coordinator;
     }
 
-    private void attachConnection(InetAddress from, int sessionIndex, Channel channel)
+    private void attachConnection(InetAddressAndPort from, int sessionIndex, Channel channel)
     {
-        SocketAddress addr = channel.remoteAddress();
-        InetAddress connecting = (addr instanceof InetSocketAddress ? ((InetSocketAddress) addr).getAddress() : from);
-        StreamSession session = coordinator.getOrCreateSessionById(from, sessionIndex, connecting);
+        StreamSession session = coordinator.getOrCreateSessionById(from, sessionIndex);
         session.init(this);
-        session.attach(channel);
     }
 
     public void addEventListener(StreamEventHandler listener)
     {
-        Futures.addCallback(this, listener);
+        Futures.addCallback(this, listener, MoreExecutors.directExecutor());
         eventListeners.add(listener);
     }
 
@@ -212,7 +211,7 @@ public final class StreamResultFuture extends AbstractFuture<StreamState>
 
     private synchronized void maybeComplete()
     {
-        if (!coordinator.hasActiveSessions())
+        if (finishedAllSessions())
         {
             StreamState finalState = getCurrentState();
             if (finalState.hasFailedSession())
@@ -228,8 +227,18 @@ public final class StreamResultFuture extends AbstractFuture<StreamState>
         }
     }
 
-    StreamSession getSession(InetAddress peer, int sessionIndex)
+    StreamSession getSession(InetAddressAndPort peer, int sessionIndex)
     {
         return coordinator.getSessionById(peer, sessionIndex);
+    }
+
+    /**
+     * We can't use {@link StreamCoordinator#hasActiveSessions()} directly because {@link this#maybeComplete()}
+     * relies on the snapshotted state from {@link StreamCoordinator} and not the {@link StreamSession} state
+     * directly (CASSANDRA-15667), otherwise inconsistent snapshotted states may lead to completion races.
+     */
+    private boolean finishedAllSessions()
+    {
+        return coordinator.getAllSessionInfo().stream().allMatch(s -> s.state.isFinalState());
     }
 }

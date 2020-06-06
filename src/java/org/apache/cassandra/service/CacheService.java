@@ -18,7 +18,6 @@
 package org.apache.cassandra.service;
 
 import java.io.IOException;
-import java.lang.management.ManagementFactory;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Iterator;
@@ -26,9 +25,6 @@ import java.util.List;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Future;
-
-import javax.management.MBeanServer;
-import javax.management.ObjectName;
 
 import com.google.common.util.concurrent.Futures;
 
@@ -38,7 +34,6 @@ import org.slf4j.LoggerFactory;
 import org.apache.cassandra.cache.*;
 import org.apache.cassandra.cache.AutoSavingCache.CacheSerializer;
 import org.apache.cassandra.concurrent.Stage;
-import org.apache.cassandra.concurrent.StageManager;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.*;
 import org.apache.cassandra.db.context.CounterContext;
@@ -53,6 +48,7 @@ import org.apache.cassandra.io.util.DataOutputPlus;
 import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.MBeanWrapper;
 import org.apache.cassandra.utils.Pair;
 
 public class CacheService implements CacheServiceMBean
@@ -88,16 +84,7 @@ public class CacheService implements CacheServiceMBean
 
     private CacheService()
     {
-        MBeanServer mbs = ManagementFactory.getPlatformMBeanServer();
-
-        try
-        {
-            mbs.registerMBean(this, new ObjectName(MBEAN_NAME));
-        }
-        catch (Exception e)
-        {
-            throw new RuntimeException(e);
-        }
+        MBeanWrapper.instance.registerMBean(this, MBEAN_NAME);
 
         keyCache = initKeyCache();
         rowCache = initRowCache();
@@ -372,7 +359,7 @@ public class CacheService implements CacheServiceMBean
             if (!cfs.metadata().isCounter() || !cfs.isCounterCacheEnabled())
                 return null;
 
-            return StageManager.getStage(Stage.READ).submit(new Callable<Pair<CounterCacheKey, ClockAndCount>>()
+            return Stage.READ.submit(new Callable<Pair<CounterCacheKey, ClockAndCount>>()
             {
                 public Pair<CounterCacheKey, ClockAndCount> call() throws Exception
                 {
@@ -406,7 +393,7 @@ public class CacheService implements CacheServiceMBean
             final int rowsToCache = cfs.metadata().params.caching.rowsPerPartitionToCache();
             assert(!cfs.isIndex());//Shouldn't have row cache entries for indexes
 
-            return StageManager.getStage(Stage.READ).submit(new Callable<Pair<RowCacheKey, IRowCacheEntry>>()
+            return Stage.READ.submit(new Callable<Pair<RowCacheKey, IRowCacheEntry>>()
             {
                 public Pair<RowCacheKey, IRowCacheEntry> call() throws Exception
                 {

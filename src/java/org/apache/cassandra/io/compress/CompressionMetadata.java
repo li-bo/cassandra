@@ -49,12 +49,13 @@ import org.apache.cassandra.io.IVersionedSerializer;
 import org.apache.cassandra.io.sstable.Component;
 import org.apache.cassandra.io.sstable.CorruptSSTableException;
 import org.apache.cassandra.io.sstable.Descriptor;
+import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.io.util.DataInputPlus;
 import org.apache.cassandra.io.util.DataOutputPlus;
 import org.apache.cassandra.io.util.Memory;
 import org.apache.cassandra.io.util.SafeMemory;
 import org.apache.cassandra.schema.CompressionParams;
-import org.apache.cassandra.utils.Pair;
+import org.apache.cassandra.utils.SyncUtil;
 import org.apache.cassandra.utils.concurrent.Transactional;
 import org.apache.cassandra.utils.concurrent.Ref;
 
@@ -244,10 +245,14 @@ public class CompressionMetadata
     public Chunk chunkFor(long position)
     {
         // position of the chunk
-        int idx = 8 * (int) (position / parameters.chunkLength());
+        long idx = 8 * (position / parameters.chunkLength());
 
         if (idx >= chunkOffsetsSize)
             throw new CorruptSSTableException(new EOFException(), indexFilePath);
+
+        if (idx < 0)
+            throw new CorruptSSTableException(new IllegalArgumentException(String.format("Invalid negative chunk index %d with position %d", idx, position)),
+                                              indexFilePath);
 
         long chunkOffset = chunkOffsets.getLong(idx);
         long nextChunkOffset = (idx + 8 == chunkOffsetsSize)
@@ -261,15 +266,18 @@ public class CompressionMetadata
      * @param sections Collection of sections in uncompressed file. Should not contain sections that overlap each other.
      * @return Total chunk size in bytes for given sections including checksum.
      */
-    public long getTotalSizeForSections(Collection<Pair<Long, Long>> sections)
+    public long getTotalSizeForSections(Collection<SSTableReader.PartitionPositionBounds> sections)
     {
         long size = 0;
         long lastOffset = -1;
-        for (Pair<Long, Long> section : sections)
+        for (SSTableReader.PartitionPositionBounds section : sections)
         {
-            int startIndex = (int) (section.left / parameters.chunkLength());
-            int endIndex = (int) (section.right / parameters.chunkLength());
-            endIndex = section.right % parameters.chunkLength() == 0 ? endIndex - 1 : endIndex;
+            int startIndex = (int) (section.lowerPosition / parameters.chunkLength());
+
+            int endIndex = (int) (section.upperPosition / parameters.chunkLength());
+            if (section.upperPosition % parameters.chunkLength() == 0)
+                endIndex--;
+
             for (int i = startIndex; i <= endIndex; i++)
             {
                 long offset = i * 8L;
@@ -291,21 +299,19 @@ public class CompressionMetadata
      * @param sections Collection of sections in uncompressed file
      * @return Array of chunks which corresponds to given sections of uncompressed file, sorted by chunk offset
      */
-    public Chunk[] getChunksForSections(Collection<Pair<Long, Long>> sections)
+    public Chunk[] getChunksForSections(Collection<SSTableReader.PartitionPositionBounds> sections)
     {
         // use SortedSet to eliminate duplicates and sort by chunk offset
-        SortedSet<Chunk> offsets = new TreeSet<Chunk>(new Comparator<Chunk>()
+        SortedSet<Chunk> offsets = new TreeSet<>((o1, o2) -> Longs.compare(o1.offset, o2.offset));
+
+        for (SSTableReader.PartitionPositionBounds section : sections)
         {
-            public int compare(Chunk o1, Chunk o2)
-            {
-                return Longs.compare(o1.offset, o2.offset);
-            }
-        });
-        for (Pair<Long, Long> section : sections)
-        {
-            int startIndex = (int) (section.left / parameters.chunkLength());
-            int endIndex = (int) (section.right / parameters.chunkLength());
-            endIndex = section.right % parameters.chunkLength() == 0 ? endIndex - 1 : endIndex;
+            int startIndex = (int) (section.lowerPosition / parameters.chunkLength());
+
+            int endIndex = (int) (section.upperPosition / parameters.chunkLength());
+            if (section.upperPosition % parameters.chunkLength() == 0)
+                endIndex--;
+
             for (int i = startIndex; i <= endIndex; i++)
             {
                 long offset = i * 8L;
@@ -316,6 +322,7 @@ public class CompressionMetadata
                 offsets.add(new Chunk(chunkOffset, (int) (nextChunkOffset - chunkOffset - 4))); // "4" bytes reserved for checksum
             }
         }
+
         return offsets.toArray(new Chunk[offsets.size()]);
     }
 
@@ -413,7 +420,7 @@ public class CompressionMetadata
                     out.writeLong(offsets.getLong(i * 8L));
 
                 out.flush();
-                fos.getFD().sync();
+                SyncUtil.sync(fos);
             }
             catch (IOException e)
             {
@@ -424,19 +431,19 @@ public class CompressionMetadata
         @SuppressWarnings("resource")
         public CompressionMetadata open(long dataLength, long compressedLength)
         {
-            SafeMemory offsets = this.offsets.sharedCopy();
+            SafeMemory tOffsets = this.offsets.sharedCopy();
 
             // calculate how many entries we need, if our dataLength is truncated
-            int count = (int) (dataLength / parameters.chunkLength());
+            int tCount = (int) (dataLength / parameters.chunkLength());
             if (dataLength % parameters.chunkLength() != 0)
-                count++;
+                tCount++;
 
-            assert count > 0;
+            assert tCount > 0;
             // grab our actual compressed length from the next offset from our the position we're opened to
-            if (count < this.count)
-                compressedLength = offsets.getLong(count * 8L);
+            if (tCount < this.count)
+                compressedLength = tOffsets.getLong(tCount * 8L);
 
-            return new CompressionMetadata(filePath, parameters, offsets, count * 8L, dataLength, compressedLength);
+            return new CompressionMetadata(filePath, parameters, tOffsets, tCount * 8L, dataLength, compressedLength);
         }
 
         /**

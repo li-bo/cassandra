@@ -25,7 +25,7 @@ import org.slf4j.LoggerFactory;
 
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.Mutation;
-import org.apache.cassandra.db.rows.SerializationHelper;
+import org.apache.cassandra.db.rows.DeserializationHelper;
 import org.apache.cassandra.io.util.DataInputBuffer;
 import org.apache.cassandra.io.util.RebufferingInputStream;
 
@@ -39,7 +39,7 @@ public class CDCTestReplayer extends CommitLogReplayer
     public CDCTestReplayer() throws IOException
     {
         super(CommitLog.instance, CommitLogPosition.NONE, null, ReplayFilter.create());
-        CommitLog.instance.sync();
+        CommitLog.instance.sync(true);
         commitLogReader = new CommitLogTestReader();
     }
 
@@ -62,7 +62,7 @@ public class CDCTestReplayer extends CommitLogReplayer
             Mutation mutation;
             try
             {
-                mutation = Mutation.serializer.deserialize(bufIn, desc.getMessagingVersion(), SerializationHelper.Flag.LOCAL);
+                mutation = Mutation.serializer.deserialize(bufIn, desc.getMessagingVersion(), DeserializationHelper.Flag.LOCAL);
                 if (mutation.trackedByCDC())
                     sawCDCMutation = true;
             }

@@ -38,26 +38,25 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import ch.qos.logback.classic.LoggerContext;
+import ch.qos.logback.classic.joran.ReconfigureOnChangeTask;
 import ch.qos.logback.classic.spi.TurboFilterList;
 import ch.qos.logback.classic.turbo.ReconfigureOnChangeFilter;
 import ch.qos.logback.classic.turbo.TurboFilter;
-import org.apache.cassandra.schema.Schema;
 import org.apache.cassandra.schema.SchemaConstants;
 import org.apache.cassandra.cql3.CQLTester;
 import org.apache.cassandra.cql3.QueryProcessor;
 import org.apache.cassandra.cql3.UntypedResultSet;
 import org.apache.cassandra.cql3.UntypedResultSet.Row;
-import org.apache.cassandra.cql3.functions.UDAggregate;
 import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.db.marshal.TypeParser;
 import org.apache.cassandra.exceptions.FunctionExecutionException;
 import org.apache.cassandra.exceptions.InvalidRequestException;
-import org.apache.cassandra.schema.KeyspaceMetadata;
 import org.apache.cassandra.service.ClientState;
 import org.apache.cassandra.transport.Event;
 import org.apache.cassandra.transport.ProtocolVersion;
 import org.apache.cassandra.transport.messages.ResultMessage;
 
+import static ch.qos.logback.core.CoreConstants.RECONFIGURE_ON_CHANGE_TASK;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
@@ -68,10 +67,21 @@ public class AggregationTest extends CQLTester
     @Test
     public void testNonExistingOnes() throws Throwable
     {
-        assertInvalidThrowMessage("Cannot drop non existing aggregate", InvalidRequestException.class, "DROP AGGREGATE " + KEYSPACE + ".aggr_does_not_exist");
-        assertInvalidThrowMessage("Cannot drop non existing aggregate", InvalidRequestException.class, "DROP AGGREGATE " + KEYSPACE + ".aggr_does_not_exist(int,text)");
-        assertInvalidThrowMessage("Cannot drop non existing aggregate", InvalidRequestException.class, "DROP AGGREGATE keyspace_does_not_exist.aggr_does_not_exist");
-        assertInvalidThrowMessage("Cannot drop non existing aggregate", InvalidRequestException.class, "DROP AGGREGATE keyspace_does_not_exist.aggr_does_not_exist(int,text)");
+        assertInvalidThrowMessage(String.format("Aggregate '%s.aggr_does_not_exist' doesn't exist", KEYSPACE),
+                                  InvalidRequestException.class,
+                                  "DROP AGGREGATE " + KEYSPACE + ".aggr_does_not_exist");
+
+        assertInvalidThrowMessage(String.format("Aggregate '%s.aggr_does_not_exist(int, text)' doesn't exist", KEYSPACE),
+                                  InvalidRequestException.class,
+                                  "DROP AGGREGATE " + KEYSPACE + ".aggr_does_not_exist(int,text)");
+
+        assertInvalidThrowMessage("Aggregate 'keyspace_does_not_exist.aggr_does_not_exist' doesn't exist",
+                                  InvalidRequestException.class,
+                                  "DROP AGGREGATE keyspace_does_not_exist.aggr_does_not_exist");
+
+        assertInvalidThrowMessage("Aggregate 'keyspace_does_not_exist.aggr_does_not_exist(int, text)' doesn't exist",
+                                  InvalidRequestException.class,
+                                  "DROP AGGREGATE keyspace_does_not_exist.aggr_does_not_exist(int,text)");
 
         execute("DROP AGGREGATE IF EXISTS " + KEYSPACE + ".aggr_does_not_exist");
         execute("DROP AGGREGATE IF EXISTS " + KEYSPACE + ".aggr_does_not_exist(int,text)");
@@ -321,26 +331,6 @@ public class AggregationTest extends CQLTester
     }
 
     @Test
-    public void testFunctionsWithCompactStorage() throws Throwable
-    {
-        createTable("CREATE TABLE %s (a int , b int, c double, primary key(a, b) ) WITH COMPACT STORAGE");
-
-        execute("INSERT INTO %s (a, b, c) VALUES (1, 1, 11.5)");
-        execute("INSERT INTO %s (a, b, c) VALUES (1, 2, 9.5)");
-        execute("INSERT INTO %s (a, b, c) VALUES (1, 3, 9.0)");
-
-        assertRows(execute("SELECT max(b), min(b), sum(b), avg(b) , max(c), sum(c), avg(c) FROM %s"),
-                   row(3, 1, 6, 2, 11.5, 30.0, 10.0));
-
-        assertRows(execute("SELECT COUNT(*) FROM %s"), row(3L));
-        assertRows(execute("SELECT COUNT(1) FROM %s"), row(3L));
-        assertRows(execute("SELECT COUNT(*) FROM %s WHERE a = 1 AND b > 1"), row(2L));
-        assertRows(execute("SELECT COUNT(1) FROM %s WHERE a = 1 AND b > 1"), row(2L));
-        assertRows(execute("SELECT max(b), min(b), sum(b), avg(b) , max(c), sum(c), avg(c) FROM %s WHERE a = 1 AND b > 1"),
-                   row(3, 2, 5, 2, 9.5, 18.5, 9.25));
-    }
-
-    @Test
     public void testInvalidCalls() throws Throwable
     {
         createTable("CREATE TABLE %s (a int, b int, c int, primary key (a, b))");
@@ -437,7 +427,7 @@ public class AggregationTest extends CQLTester
         schemaChange("CREATE OR REPLACE AGGREGATE " + a + "(double) " +
                      "SFUNC " + shortFunctionName(f) + " " +
                      "STYPE double " +
-                     "INITCOND 0");
+                     "INITCOND 1");
 
         assertLastSchemaChange(Event.SchemaChange.Change.UPDATED, Event.SchemaChange.Target.AGGREGATE,
                                KEYSPACE, parseFunctionName(a).name,
@@ -482,7 +472,7 @@ public class AggregationTest extends CQLTester
 
         // DROP AGGREGATE must not succeed against a scalar
         assertInvalidMessage("matches multiple function definitions", "DROP AGGREGATE " + f);
-        assertInvalidMessage("non existing", "DROP AGGREGATE " + f + "(double, double)");
+        assertInvalidMessage("doesn't exist", "DROP AGGREGATE " + f + "(double, double)");
 
         String a = createAggregate(KEYSPACE,
                                    "double",
@@ -499,7 +489,7 @@ public class AggregationTest extends CQLTester
 
         // DROP FUNCTION must not succeed against an aggregate
         assertInvalidMessage("matches multiple function definitions", "DROP FUNCTION " + a);
-        assertInvalidMessage("non existing function", "DROP FUNCTION " + a + "(double)");
+        assertInvalidMessage("doesn't exist", "DROP FUNCTION " + a + "(double)");
 
         // ambigious
         assertInvalidMessage("matches multiple function definitions", "DROP AGGREGATE " + a);
@@ -678,37 +668,37 @@ public class AggregationTest extends CQLTester
                                         "LANGUAGE java " +
                                         "AS 'return a.toString();'");
 
-        assertInvalidMessage("does not exist or is not a scalar function",
+        assertInvalidMessage("doesn't exist",
                              "CREATE AGGREGATE " + KEYSPACE + ".aggrInvalid(double)" +
                              "SFUNC " + shortFunctionName(fState) + " " +
                              "STYPE double " +
                              "FINALFUNC " + shortFunctionName(fFinal));
-        assertInvalidMessage("does not exist or is not a scalar function",
+        assertInvalidMessage("doesn't exist",
                              "CREATE AGGREGATE " + KEYSPACE + ".aggrInvalid(int)" +
                              "SFUNC " + shortFunctionName(fState) + " " +
                              "STYPE double " +
                              "FINALFUNC " + shortFunctionName(fFinal));
-        assertInvalidMessage("does not exist or is not a scalar function",
+        assertInvalidMessage("doesn't exist",
                              "CREATE AGGREGATE " + KEYSPACE + ".aggrInvalid(double)" +
                              "SFUNC " + shortFunctionName(fState) + " " +
                              "STYPE int " +
                              "FINALFUNC " + shortFunctionName(fFinal));
-        assertInvalidMessage("does not exist or is not a scalar function",
+        assertInvalidMessage("doesn't exist",
                              "CREATE AGGREGATE " + KEYSPACE + ".aggrInvalid(double)" +
                              "SFUNC " + shortFunctionName(fState) + " " +
                              "STYPE int");
-        assertInvalidMessage("does not exist or is not a scalar function",
+        assertInvalidMessage("doesn't exist",
                              "CREATE AGGREGATE " + KEYSPACE + ".aggrInvalid(int)" +
                              "SFUNC " + shortFunctionName(fState) + " " +
                              "STYPE double");
 
-        assertInvalidMessage("does not exist or is not a scalar function",
+        assertInvalidMessage("doesn't exist",
                              "CREATE AGGREGATE " + KEYSPACE + ".aggrInvalid(double)" +
                              "SFUNC " + shortFunctionName(fState2) + " " +
                              "STYPE double " +
                              "FINALFUNC " + shortFunctionName(fFinal));
 
-        assertInvalidMessage("does not exist or is not a scalar function",
+        assertInvalidMessage("doesn't exist",
                              "CREATE AGGREGATE " + KEYSPACE + ".aggrInvalid(double)" +
                              "SFUNC " + shortFunctionName(fState) + " " +
                              "STYPE double " +
@@ -734,13 +724,13 @@ public class AggregationTest extends CQLTester
                                        "LANGUAGE java " +
                                        "AS 'return a.toString();'");
 
-        assertInvalidMessage("does not exist or is not a scalar function",
+        assertInvalidMessage("doesn't exist",
                              "CREATE AGGREGATE " + KEYSPACE + ".aggrInvalid(int)" +
                              "SFUNC " + shortFunctionName(fState) + "_not_there " +
                              "STYPE int " +
                              "FINALFUNC " + shortFunctionName(fFinal));
 
-        assertInvalidMessage("does not exist or is not a scalar function",
+        assertInvalidMessage("doesn't exist",
                              "CREATE AGGREGATE " + KEYSPACE + ".aggrInvalid(int)" +
                              "SFUNC " + shortFunctionName(fState) + " " +
                              "STYPE int " +
@@ -823,7 +813,7 @@ public class AggregationTest extends CQLTester
     @Test
     public void testJavaAggregateWithoutStateOrFinal() throws Throwable
     {
-        assertInvalidMessage("does not exist or is not a scalar function",
+        assertInvalidMessage("doesn't exist",
                              "CREATE AGGREGATE " + KEYSPACE + ".jSumFooNE1(int) " +
                              "SFUNC jSumFooNEstate " +
                              "STYPE int");
@@ -836,7 +826,7 @@ public class AggregationTest extends CQLTester
                                   "LANGUAGE java " +
                                   "AS 'return Integer.valueOf(a + b);'");
 
-        assertInvalidMessage("does not exist or is not a scalar function",
+        assertInvalidMessage("doesn't exist",
                              "CREATE AGGREGATE " + KEYSPACE + ".jSumFooNE2(int) " +
                              "SFUNC " + shortFunctionName(f) + " " +
                              "STYPE int " +
@@ -1162,12 +1152,12 @@ public class AggregationTest extends CQLTester
                                    "SFUNC " + shortFunctionName(fState) + " " +
                                    "STYPE int ");
 
-        assertInvalidMessage("does not exist or is not a scalar function",
+        assertInvalidMessage("doesn't exist",
                              "CREATE AGGREGATE " + KEYSPACE + ".aggInv(int) " +
                              "SFUNC " + shortFunctionName(a) + " " +
                              "STYPE int ");
 
-        assertInvalidMessage("does not exist or is not a scalar function",
+        assertInvalidMessage("isn't a scalar function",
                              "CREATE AGGREGATE " + KEYSPACE + ".aggInv(int) " +
                              "SFUNC " + shortFunctionName(fState) + " " +
                              "STYPE int " +
@@ -1309,41 +1299,6 @@ public class AggregationTest extends CQLTester
     }
 
     @Test
-    public void testBrokenAggregate() throws Throwable
-    {
-        createTable("CREATE TABLE %s (key int primary key, val int)");
-        execute("INSERT INTO %s (key, val) VALUES (?, ?)", 1, 1);
-
-        String fState = createFunction(KEYSPACE,
-                                       "int, int",
-                                       "CREATE FUNCTION %s(a int, b int) " +
-                                       "CALLED ON NULL INPUT " +
-                                       "RETURNS int " +
-                                       "LANGUAGE javascript " +
-                                       "AS 'a + b;'");
-
-        String a = createAggregate(KEYSPACE,
-                                   "int",
-                                   "CREATE AGGREGATE %s(int) " +
-                                   "SFUNC " + shortFunctionName(fState) + " " +
-                                   "STYPE int ");
-
-        KeyspaceMetadata ksm = Schema.instance.getKeyspaceMetadata(keyspace());
-        UDAggregate f = (UDAggregate) ksm.functions.get(parseFunctionName(a)).iterator().next();
-
-        UDAggregate broken = UDAggregate.createBroken(f.name(),
-                                                      f.argTypes(),
-                                                      f.returnType(),
-                                                      null,
-                                                      new InvalidRequestException("foo bar is broken"));
-
-        Schema.instance.load(ksm.withSwapped(ksm.functions.without(f.name(), f.argTypes()).with(broken)));
-
-        assertInvalidThrowMessage("foo bar is broken", InvalidRequestException.class,
-                                  "SELECT " + a + "(val) FROM %s");
-    }
-
-    @Test
     public void testWrongStateType() throws Throwable
     {
         createTable("CREATE TABLE %s (key int primary key, val int)");
@@ -1468,7 +1423,7 @@ public class AggregationTest extends CQLTester
                                        "LANGUAGE java " +
                                        "AS 'return state;'");
 
-        assertInvalidMessage("The function state type should not be frozen",
+        assertInvalidMessage("cannot be frozen",
                              "CREATE AGGREGATE %s(set<int>) " +
                              "SFUNC " + parseFunctionName(fState).name + ' ' +
                              "STYPE frozen<set<int>> " +
@@ -1489,7 +1444,7 @@ public class AggregationTest extends CQLTester
         assertRows(execute("SELECT " + aggregation + "(b) FROM %s"),
                    row(set(7, 8, 9)));
 
-        assertInvalidMessage("The function arguments should not be frozen",
+        assertInvalidMessage("Argument 'frozen<set<int>>' cannot be frozen; remove frozen<> modifier from 'frozen<set<int>>'",
                              "DROP AGGREGATE %s (frozen<set<int>>);");
     }
 
@@ -1520,7 +1475,7 @@ public class AggregationTest extends CQLTester
                                        "LANGUAGE java " +
                                        "AS 'return state;'");
 
-        assertInvalidMessage("The function state type should not be frozen",
+        assertInvalidMessage("cannot be frozen",
                              "CREATE AGGREGATE %s(list<int>) " +
                              "SFUNC " + parseFunctionName(fState).name + ' ' +
                              "STYPE frozen<list<int>> " +
@@ -1538,7 +1493,7 @@ public class AggregationTest extends CQLTester
         assertRows(execute("SELECT " + aggregation + "(b) FROM %s"),
                    row(list(7, 8, 9)));
 
-        assertInvalidMessage("The function arguments should not be frozen",
+        assertInvalidMessage("Argument 'frozen<list<int>>' cannot be frozen; remove frozen<> modifier from 'frozen<list<int>>'",
                              "DROP AGGREGATE %s (frozen<list<int>>);");
     }
 
@@ -1569,7 +1524,7 @@ public class AggregationTest extends CQLTester
                                        "LANGUAGE java " +
                                        "AS 'return state;'");
 
-        assertInvalidMessage("The function state type should not be frozen",
+        assertInvalidMessage("cannot be frozen",
                              "CREATE AGGREGATE %s(map<int, int>) " +
                              "SFUNC " + parseFunctionName(fState).name + ' ' +
                              "STYPE frozen<map<int, int>> " +
@@ -1587,7 +1542,7 @@ public class AggregationTest extends CQLTester
         assertRows(execute("SELECT " + aggregation + "(b) FROM %s"),
                    row(map(7, 8, 9, 10)));
 
-        assertInvalidMessage("The function arguments should not be frozen",
+        assertInvalidMessage("Argument 'frozen<map<int, int>>' cannot be frozen; remove frozen<> modifier from 'frozen<map<int, int>>'",
                              "DROP AGGREGATE %s (frozen<map<int, int>>);");
     }
 
@@ -1618,7 +1573,7 @@ public class AggregationTest extends CQLTester
                                        "LANGUAGE java " +
                                        "AS 'return state;'");
 
-        assertInvalidMessage("The function state type should not be frozen",
+        assertInvalidMessage("cannot be frozen",
                              "CREATE AGGREGATE %s(tuple<int, int>) " +
                              "SFUNC " + parseFunctionName(fState).name + ' ' +
                              "STYPE frozen<tuple<int, int>> " +
@@ -1636,7 +1591,7 @@ public class AggregationTest extends CQLTester
         assertRows(execute("SELECT " + aggregation + "(b) FROM %s"),
                    row(tuple(7, 8)));
 
-        assertInvalidMessage("The function arguments should not be frozen",
+        assertInvalidMessage("Argument 'tuple<int, int>' cannot be frozen; remove frozen<> modifier from 'tuple<int, int>'",
                              "DROP AGGREGATE %s (frozen<tuple<int, int>>);");
     }
 
@@ -1668,7 +1623,7 @@ public class AggregationTest extends CQLTester
                                        "LANGUAGE java " +
                                        "AS 'return state;'");
 
-        assertInvalidMessage("The function state type should not be frozen",
+        assertInvalidMessage("cannot be frozen",
                              "CREATE AGGREGATE %s(" + myType + ") " +
                              "SFUNC " + parseFunctionName(fState).name + ' ' +
                              "STYPE frozen<" + myType + "> " +
@@ -1686,7 +1641,7 @@ public class AggregationTest extends CQLTester
         assertRows(execute("SELECT " + aggregation + "(b).f FROM %s"),
                    row(7));
 
-        assertInvalidMessage("The function arguments should not be frozen",
+        assertInvalidMessage(String.format("Argument 'frozen<%s>' cannot be frozen; remove frozen<> modifier from 'frozen<%s>'", myType, myType),
                              "DROP AGGREGATE %s (frozen<" + myType + ">);");
     }
 
@@ -1869,6 +1824,16 @@ public class AggregationTest extends CQLTester
                 break;
             }
         }
+
+        ReconfigureOnChangeTask roct = (ReconfigureOnChangeTask) ctx.getObject(RECONFIGURE_ON_CHANGE_TASK);
+        if (roct != null)
+        {
+            // New functionality in logback - they replaced ReconfigureOnChangeFilter (which runs in the logging code)
+            // with an async ReconfigureOnChangeTask - i.e. in a thread that does not become sandboxed.
+            // Let the test run anyway, just we cannot reconfigure it (and it is pointless to reconfigure).
+            return;
+        }
+
         assertTrue("ReconfigureOnChangeFilter not in logback's turbo-filter list - do that by adding scan=\"true\" to logback-test.xml's configuration element", done);
     }
 

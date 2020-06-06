@@ -20,7 +20,6 @@ package org.apache.cassandra.locator;
 
 
 import java.io.IOException;
-import java.net.InetAddress;
 import java.util.EnumMap;
 import java.util.Map;
 
@@ -31,6 +30,7 @@ import org.junit.Test;
 import org.apache.cassandra.SchemaLoader;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.Keyspace;
+import org.apache.cassandra.db.commitlog.CommitLog;
 import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.gms.ApplicationState;
 import org.apache.cassandra.gms.Gossiper;
@@ -46,7 +46,9 @@ public class GoogleCloudSnitchTest
     @BeforeClass
     public static void setup() throws Exception
     {
+        System.setProperty(Gossiper.Props.DISABLE_THREAD_VALIDATION, "true");
         DatabaseDescriptor.daemonInitialization();
+        CommitLog.instance.start();
         SchemaLoader.mkdirs();
         SchemaLoader.cleanup();
         Keyspace.setInitialized();
@@ -72,8 +74,8 @@ public class GoogleCloudSnitchTest
     {
         az = "us-central1-a";
         GoogleCloudSnitch snitch = new TestGoogleCloudSnitch();
-        InetAddress local = InetAddress.getByName("127.0.0.1");
-        InetAddress nonlocal = InetAddress.getByName("127.0.0.7");
+        InetAddressAndPort local = InetAddressAndPort.getByName("127.0.0.1");
+        InetAddressAndPort nonlocal = InetAddressAndPort.getByName("127.0.0.7");
 
         Gossiper.instance.addSavedEndpoint(nonlocal);
         Map<ApplicationState, VersionedValue> stateMap = new EnumMap<>(ApplicationState.class);
@@ -93,7 +95,7 @@ public class GoogleCloudSnitchTest
     {
         az = "asia-east1-a";
         GoogleCloudSnitch snitch = new TestGoogleCloudSnitch();
-        InetAddress local = InetAddress.getByName("127.0.0.1");
+        InetAddressAndPort local = InetAddressAndPort.getByName("127.0.0.1");
         assertEquals("asia-east1", snitch.getDatacenter(local));
         assertEquals("a", snitch.getRack(local));
     }

@@ -16,6 +16,8 @@
 
 .. highlight:: none
 
+.. _monitoring-metrics:
+
 Monitoring
 ----------
 
@@ -54,6 +56,8 @@ All metrics reported by cassandra fit into one of the following types.
 ``Meter``
     A meter metric which measures mean throughput and one-, five-, and fifteen-minute exponentially-weighted moving
     average throughputs.
+
+.. _table-metrics:
 
 Table Metrics
 ^^^^^^^^^^^^^
@@ -95,6 +99,7 @@ ReadLatency                             Latency        Local read latency for th
 RangeLatency                            Latency        Local range scan latency for this table.
 WriteLatency                            Latency        Local write latency for this table.
 CoordinatorReadLatency                  Timer          Coordinator read latency for this table.
+CoordinatorWriteLatency                 Timer          Coordinator write latency for this table.
 CoordinatorScanLatency                  Timer          Coordinator range scan latency for this table.
 PendingFlushes                          Counter        Estimated number of flush tasks pending for this table.
 BytesFlushed                            Counter        Total number of bytes flushed since server [re]start.
@@ -185,7 +190,7 @@ Reported name format:
     ``org.apache.cassandra.metrics.ThreadPools.<MetricName>.<Path>.<ThreadPoolName>``
 
 **JMX MBean**
-    ``org.apache.cassandra.metrics:type=ThreadPools scope=<ThreadPoolName> type=<Type> name=<MetricName>``
+    ``org.apache.cassandra.metrics:type=ThreadPools path=<Path> scope=<ThreadPoolName> name=<MetricName>``
 
 ===================== ============== ===========
 Name                  Type           Description
@@ -227,6 +232,7 @@ PerDiskMemtableFlushWriter_0 internal       Responsible for writing a spec (ther
 Sampler                      internal       Responsible for re-sampling the index summaries of SStables
 SecondaryIndexManagement     internal       Performs updates to secondary indexes
 ValidationExecutor           internal       Performs validation compaction or scrubbing
+ViewBuildExecutor            internal       Performs materialized views initial build
 ============================ ============== ===========
 
 .. |nbsp| unicode:: 0xA0 .. nonbreaking space
@@ -395,6 +401,7 @@ RegularStatementsExecuted  Counter        Number of **non** prepared statements 
 PreparedStatementsRatio    Gauge<Double>  Percentage of statements that are prepared vs unprepared.
 ========================== ============== ===========
 
+.. _dropped-metrics:
 
 DroppedMessage Metrics
 ^^^^^^^^^^^^^^^^^^^^^^
@@ -405,10 +412,10 @@ Dropped writes are stored and retried by ``Hinted Handoff``
 Reported name format:
 
 **Metric Name**
-    ``org.apache.cassandra.metrics.DroppedMessages.<MetricName>.<Type>``
+    ``org.apache.cassandra.metrics.DroppedMessage.<MetricName>.<Type>``
 
 **JMX MBean**
-    ``org.apache.cassandra.metrics:type=DroppedMetrics scope=<Type> name=<MetricName>``
+    ``org.apache.cassandra.metrics:type=DroppedMessage scope=<Type> name=<MetricName>``
 
 ========================== ============== ===========
 Name                       Type           Description
@@ -527,6 +534,8 @@ TotalHints                 Counter        Number of hint messages written to thi
 TotalHintsInProgress       Counter        Number of hints attemping to be sent currently.
 ========================== ============== ===========
 
+.. _handoff-metrics:
+
 HintedHandoff Metrics
 ^^^^^^^^^^^^^^^^^^^^^
 
@@ -549,6 +558,8 @@ Hints_created-<PeerIP>       Counter        Number of hints on disk for this pee
 Hints_not_stored-<PeerIP>    Counter        Number of hints not stored for this peer, due to being down past the configured hint window.
 =========================== ============== ===========
 
+.. _hintsservice-metrics:
+
 HintsService Metrics
 ^^^^^^^^^^^^^^^^^^^^^
 
@@ -570,8 +581,8 @@ Name                        Type           Description
 HintsSucceeded               Meter          A meter of the hints successfully delivered
 HintsFailed                  Meter          A meter of the hints that failed deliver
 HintsTimedOut                Meter          A meter of the hints that timed out
-Hints_delays                 Histogram      Histogram of hint delivery delays (in milliseconds)
-Hints_delays-<PeerIP>        Histogram      Histogram of hint delivery delays (in milliseconds) per peer
+Hint_delays                 Histogram      Histogram of hint delivery delays (in milliseconds)
+Hint_delays-<PeerIP>        Histogram      Histogram of hint delivery delays (in milliseconds) per peer
 =========================== ============== ===========
 
 SSTable Index Metrics
@@ -630,11 +641,13 @@ Reported name format:
 **JMX MBean**
     ``org.apache.cassandra.metrics:type=Client name=<MetricName>``
 
-=========================== ============== ===========
-Name                        Type           Description
-=========================== ============== ===========
-connectedNativeClients      Counter        Number of clients connected to this nodes native protocol server
-=========================== ============== ===========
+============================== =============================== ===========
+Name                           Type                            Description
+============================== =============================== ===========
+connectedNativeClients         Gauge<Integer>                  Number of clients connected to this nodes native protocol server
+connections                    Gauge<List<Map<String, String>> List of all connections and their state information
+connectedNativeClientsByUser   Gauge<Map<String, Int>          Number of connnective native clients by username
+============================== =============================== ===========
 
 
 Batch Metrics

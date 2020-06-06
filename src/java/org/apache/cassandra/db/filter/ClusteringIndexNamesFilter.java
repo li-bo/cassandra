@@ -191,7 +191,7 @@ public class ClusteringIndexNamesFilter extends AbstractClusteringIndexFilter
 
     public String toCQLString(TableMetadata metadata)
     {
-        if (metadata.clusteringColumns().isEmpty() || clusterings.size() <= 1)
+        if (metadata.clusteringColumns().isEmpty() || clusterings.isEmpty())
             return "";
 
         StringBuilder sb = new StringBuilder();
@@ -199,11 +199,25 @@ public class ClusteringIndexNamesFilter extends AbstractClusteringIndexFilter
         sb.append(clusterings.size() == 1 ? " = " : " IN (");
         int i = 0;
         for (Clustering clustering : clusterings)
-            sb.append(i++ == 0 ? "" : ", ").append("(").append(clustering.toCQLString(metadata)).append(")");
+            sb.append(i++ == 0 ? "" : ", ").append('(').append(clustering.toCQLString(metadata)).append(')');
         sb.append(clusterings.size() == 1 ? "" : ")");
 
         appendOrderByToCQLString(metadata, sb);
         return sb.toString();
+    }
+
+    public boolean equals(Object o)
+    {
+        if (this == o) return true;
+        if (o == null || getClass() != o.getClass()) return false;
+        ClusteringIndexNamesFilter that = (ClusteringIndexNamesFilter) o;
+        return Objects.equals(clusterings, that.clusterings) &&
+               Objects.equals(reversed, that.reversed);
+    }
+
+    public int hashCode()
+    {
+        return Objects.hash(clusterings, reversed);
     }
 
     public Kind kind()

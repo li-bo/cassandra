@@ -33,7 +33,8 @@ import org.junit.Test;
 
 import org.apache.cassandra.Util;
 import org.apache.cassandra.cache.IMeasurableMemory;
-import org.apache.cassandra.cql3.statements.CreateTableStatement;
+import org.apache.cassandra.cql3.statements.schema.CreateTableStatement;
+import org.apache.cassandra.db.rows.SerializationHelper;
 import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.cql3.CQLTester;
@@ -165,12 +166,12 @@ public class RowIndexEntryTest extends CQLTester
         DoubleSerializer() throws IOException
         {
             SequentialWriterOption option = SequentialWriterOption.newBuilder().bufferSize(1024).build();
-            File f = File.createTempFile("RowIndexEntryTest-", "db");
+            File f = FileUtils.createTempFile("RowIndexEntryTest-", "db");
             dataWriterNew = new SequentialWriter(f, option);
             columnIndex = new org.apache.cassandra.db.ColumnIndex(header, dataWriterNew, version, Collections.emptyList(),
                                                                   rieSerializer.indexInfoSerializer());
 
-            f = File.createTempFile("RowIndexEntryTest-", "db");
+            f = FileUtils.createTempFile("RowIndexEntryTest-", "db");
             dataWriterOld = new SequentialWriter(f, option);
         }
 
@@ -279,6 +280,7 @@ public class RowIndexEntryTest extends CQLTester
         {
             private final UnfilteredRowIterator iterator;
             private final SequentialWriter writer;
+            private final SerializationHelper helper;
             private final SerializationHeader header;
             private final int version;
 
@@ -306,6 +308,7 @@ public class RowIndexEntryTest extends CQLTester
             {
                 this.iterator = iterator;
                 this.writer = writer;
+                this.helper = new SerializationHelper(header);
                 this.header = header;
                 this.version = version;
                 this.observers = observers == null ? Collections.emptyList() : observers;
@@ -317,7 +320,7 @@ public class RowIndexEntryTest extends CQLTester
                 ByteBufferUtil.writeWithShortLength(iterator.partitionKey().getKey(), writer);
                 DeletionTime.serializer.serialize(iterator.partitionLevelDeletion(), writer);
                 if (header.hasStatic())
-                    UnfilteredSerializer.serializer.serializeStaticRow(iterator.staticRow(), header, writer, version);
+                    UnfilteredSerializer.serializer.serializeStaticRow(iterator.staticRow(), helper, writer, version);
             }
 
             public ColumnIndex build() throws IOException
@@ -358,7 +361,7 @@ public class RowIndexEntryTest extends CQLTester
                     startPosition = pos;
                 }
 
-                UnfilteredSerializer.serializer.serialize(unfiltered, header, writer, pos - previousRowStart, version);
+                UnfilteredSerializer.serializer.serialize(unfiltered, helper, writer, pos - previousRowStart, version);
 
                 // notify observers about each new row
                 if (!observers.isEmpty())
@@ -421,7 +424,7 @@ public class RowIndexEntryTest extends CQLTester
 
         ImmutableBTreePartition partition = Util.getOnlyPartitionUnfiltered(Util.cmd(cfs).build());
 
-        File tempFile = File.createTempFile("row_index_entry_test", null);
+        File tempFile = FileUtils.createTempFile("row_index_entry_test", null);
         tempFile.deleteOnExit();
         SequentialWriter writer = new SequentialWriter(tempFile);
         ColumnIndex columnIndex = RowIndexEntryTest.ColumnIndex.writeAndBuildIndex(partition.unfilteredIterator(), writer, header, Collections.emptySet(), BigFormat.latestVersion);

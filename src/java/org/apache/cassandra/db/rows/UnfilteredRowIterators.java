@@ -18,7 +18,6 @@
 package org.apache.cassandra.db.rows;
 
 import java.util.*;
-import java.security.MessageDigest;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -71,12 +70,17 @@ public abstract class UnfilteredRowIterators
          * particular, this may be called in cases where there is no row in the merged output (if a source has a row
          * that is shadowed by another source range tombstone or partition level deletion).
          *
-         * @param merged the result of the merge. This cannot be {@code null} but can be empty, in which case this is a
-         * placeholder for when at least one source has a row, but that row is shadowed in the merged output.
+         * @param merged the result of the merge. This cannot be {@code null} (so that listener can always access the
+         * clustering from this safely)but can be empty, in which case this is a placeholder for when at least one
+         * source has a row, but that row is shadowed in the merged output.
          * @param versions for each source, the row in that source corresponding to {@code merged}. This can be
          * {@code null} for some sources if the source has not such row.
+         * @return the row to use as result of the merge (can be {@code null}). Most implementations should simply
+         * return {@code merged}, but this allows some implementations to impact the merge result if necessary. If this
+         * returns either {@code null} or an empty row, then the row is skipped from the merge result. If this returns a
+         * non {@code null} result, then the returned row <b>must</b> have the same clustering than {@code merged}.
          */
-        public void onMergedRows(Row merged, Row[] versions);
+        public Row onMergedRows(Row merged, Row[] versions);
 
         /**
          * Called once for every range tombstone marker participating in the merge.
@@ -94,6 +98,17 @@ public abstract class UnfilteredRowIterators
         public void onMergedRangeTombstoneMarkers(RangeTombstoneMarker merged, RangeTombstoneMarker[] versions);
 
         public void close();
+
+        public static MergeListener NOOP = new MergeListener()
+        {
+            public void onMergedPartitionLevelDeletion(DeletionTime mergedDeletion, DeletionTime[] versions) {}
+
+            public Row onMergedRows(Row merged, Row[] versions) {return merged;}
+
+            public void onMergedRangeTombstoneMarkers(RangeTombstoneMarker merged, RangeTombstoneMarker[] versions) {}
+
+            public void close() {}
+        };
     }
 
     /**
@@ -111,13 +126,13 @@ public abstract class UnfilteredRowIterators
     /**
      * Returns an iterator that is the result of merging other iterators.
      */
-    public static UnfilteredRowIterator merge(List<UnfilteredRowIterator> iterators, int nowInSec)
+    public static UnfilteredRowIterator merge(List<UnfilteredRowIterator> iterators)
     {
         assert !iterators.isEmpty();
         if (iterators.size() == 1)
             return iterators.get(0);
 
-        return UnfilteredRowMergeIterator.create(iterators, nowInSec, null);
+        return UnfilteredRowMergeIterator.create(iterators, null);
     }
 
     /**
@@ -126,9 +141,9 @@ public abstract class UnfilteredRowIterators
      *
      * Note that this method assumes that there is at least 2 iterators to merge.
      */
-    public static UnfilteredRowIterator merge(List<UnfilteredRowIterator> iterators, int nowInSec, MergeListener mergeListener)
+    public static UnfilteredRowIterator merge(List<UnfilteredRowIterator> iterators, MergeListener mergeListener)
     {
-        return UnfilteredRowMergeIterator.create(iterators, nowInSec, mergeListener);
+        return UnfilteredRowMergeIterator.create(iterators, mergeListener);
     }
 
     /**
@@ -139,16 +154,42 @@ public abstract class UnfilteredRowIterators
         return EmptyIterators.unfilteredRow(metadata, partitionKey, isReverseOrder, staticRow, partitionDeletion);
     }
 
+    public static UnfilteredRowIterator singleton(Unfiltered unfiltered,
+                                                  TableMetadata metadata,
+                                                  DecoratedKey partitionKey,
+                                                  DeletionTime partitionLevelDeletion,
+                                                  RegularAndStaticColumns columns,
+                                                  Row staticRow,
+                                                  boolean isReverseOrder,
+                                                  EncodingStats encodingStats)
+    {
+        return new AbstractUnfilteredRowIterator(metadata, partitionKey, partitionLevelDeletion, columns, staticRow, isReverseOrder, encodingStats)
+        {
+            boolean isDone = false;
+
+            protected Unfiltered computeNext()
+            {
+                if (!isDone)
+                {
+                    isDone = true;
+                    return unfiltered;
+                }
+
+                return endOfData();
+            }
+        };
+    }
+
     /**
      * Digests the partition represented by the provided iterator.
      *
      * @param iterator the iterator to digest.
-     * @param digest the {@code MessageDigest} to use for the digest.
+     * @param digest the {@link Digest} to use.
      * @param version the messaging protocol to use when producing the digest.
      */
-    public static void digest(UnfilteredRowIterator iterator, MessageDigest digest, int version)
+    public static void digest(UnfilteredRowIterator iterator, Digest digest, int version)
     {
-        digest.update(iterator.partitionKey().getKey().duplicate());
+        digest.update(iterator.partitionKey().getKey());
         iterator.partitionLevelDeletion().digest(digest);
         iterator.columns().regulars.digest(digest);
         // When serializing an iterator, we skip the static columns if the iterator has not static row, even if the
@@ -163,7 +204,7 @@ public abstract class UnfilteredRowIterators
         // upgrade) so we can only do on the next protocol version bump.
         if (iterator.staticRow() != Rows.EMPTY_STATIC_ROW)
             iterator.columns().statics.digest(digest);
-        FBUtilities.updateWithBoolean(digest, iterator.isReverseOrder());
+        digest.updateWithBoolean(iterator.isReverseOrder());
         iterator.staticRow().digest(digest);
 
         while (iterator.hasNext())
@@ -356,7 +397,6 @@ public abstract class UnfilteredRowIterators
                                            List<UnfilteredRowIterator> iterators,
                                            RegularAndStaticColumns columns,
                                            DeletionTime partitionDeletion,
-                                           int nowInSec,
                                            boolean reversed,
                                            MergeListener listener)
         {
@@ -364,17 +404,17 @@ public abstract class UnfilteredRowIterators
                   iterators.get(0).partitionKey(),
                   partitionDeletion,
                   columns,
-                  mergeStaticRows(iterators, columns.statics, nowInSec, listener, partitionDeletion),
+                  mergeStaticRows(iterators, columns.statics, listener, partitionDeletion),
                   reversed,
-                  mergeStats(iterators));
+                  EncodingStats.merge(iterators, UnfilteredRowIterator::stats));
 
             this.mergeIterator = MergeIterator.get(iterators,
                                                    reversed ? metadata.comparator.reversed() : metadata.comparator,
-                                                   new MergeReducer(iterators.size(), reversed, nowInSec, listener));
+                                                   new MergeReducer(iterators.size(), reversed, listener));
             this.listener = listener;
         }
 
-        private static UnfilteredRowMergeIterator create(List<UnfilteredRowIterator> iterators, int nowInSec, MergeListener listener)
+        private static UnfilteredRowMergeIterator create(List<UnfilteredRowIterator> iterators, MergeListener listener)
         {
             try
             {
@@ -383,7 +423,6 @@ public abstract class UnfilteredRowIterators
                                                       iterators,
                                                       collectColumns(iterators),
                                                       collectPartitionLevelDeletion(iterators, listener),
-                                                      nowInSec,
                                                       iterators.get(0).isReverseOrder(),
                                                       listener);
             }
@@ -439,7 +478,6 @@ public abstract class UnfilteredRowIterators
 
         private static Row mergeStaticRows(List<UnfilteredRowIterator> iterators,
                                            Columns columns,
-                                           int nowInSec,
                                            MergeListener listener,
                                            DeletionTime partitionDeletion)
         {
@@ -449,16 +487,19 @@ public abstract class UnfilteredRowIterators
             if (iterators.stream().allMatch(iter -> iter.staticRow().isEmpty()))
                 return Rows.EMPTY_STATIC_ROW;
 
-            Row.Merger merger = new Row.Merger(iterators.size(), nowInSec, columns.hasComplex());
+            Row.Merger merger = new Row.Merger(iterators.size(), columns.hasComplex());
             for (int i = 0; i < iterators.size(); i++)
                 merger.add(i, iterators.get(i).staticRow());
 
             Row merged = merger.merge(partitionDeletion);
             if (merged == null)
                 merged = Rows.EMPTY_STATIC_ROW;
-            if (listener != null)
-                listener.onMergedRows(merged, merger.mergedRows());
-            return merged;
+            if (listener == null)
+                return merged;
+
+            merged = listener.onMergedRows(merged, merger.mergedRows());
+            // Note that onMergedRows can have returned null even though his input wasn't null
+            return merged == null ? Rows.EMPTY_STATIC_ROW : merged;
         }
 
         private static RegularAndStaticColumns collectColumns(List<UnfilteredRowIterator> iterators)
@@ -475,14 +516,6 @@ public abstract class UnfilteredRowIterators
             return statics == first.statics && regulars == first.regulars
                  ? first
                  : new RegularAndStaticColumns(statics, regulars);
-        }
-
-        private static EncodingStats mergeStats(List<UnfilteredRowIterator> iterators)
-        {
-            EncodingStats stats = EncodingStats.NO_STATS;
-            for (UnfilteredRowIterator iter : iterators)
-                stats = stats.mergeWith(iter.stats());
-            return stats;
         }
 
         protected Unfiltered computeNext()
@@ -514,9 +547,9 @@ public abstract class UnfilteredRowIterators
             private final Row.Merger rowMerger;
             private final RangeTombstoneMarker.Merger markerMerger;
 
-            private MergeReducer(int size, boolean reversed, int nowInSec, MergeListener listener)
+            private MergeReducer(int size, boolean reversed, MergeListener listener)
             {
-                this.rowMerger = new Row.Merger(size, nowInSec, columns().regulars.hasComplex());
+                this.rowMerger = new Row.Merger(size, columns().regulars.hasComplex());
                 this.markerMerger = new RangeTombstoneMarker.Merger(size, partitionLevelDeletion(), reversed);
                 this.listener = listener;
             }
@@ -542,9 +575,15 @@ public abstract class UnfilteredRowIterators
                 if (nextKind == Unfiltered.Kind.ROW)
                 {
                     Row merged = rowMerger.merge(markerMerger.activeDeletion());
-                    if (listener != null)
-                        listener.onMergedRows(merged == null ? BTreeRow.emptyRow(rowMerger.mergedClustering()) : merged, rowMerger.mergedRows());
-                    return merged;
+                    if (listener == null)
+                        return merged;
+
+                    merged = listener.onMergedRows(merged == null
+                                                   ? BTreeRow.emptyRow(rowMerger.mergedClustering())
+                                                   : merged,
+                                                   rowMerger.mergedRows());
+
+                    return merged == null || merged.isEmpty() ? null : merged;
                 }
                 else
                 {
@@ -564,4 +603,5 @@ public abstract class UnfilteredRowIterators
             }
         }
     }
+
 }

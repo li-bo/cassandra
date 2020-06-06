@@ -20,7 +20,6 @@
 package org.apache.cassandra.service;
 
 import java.io.IOException;
-import java.net.InetAddress;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
@@ -33,6 +32,7 @@ import org.junit.*;
 import org.apache.cassandra.Util;
 import org.apache.cassandra.concurrent.NamedThreadFactory;
 import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.db.commitlog.CommitLog;
 import org.apache.cassandra.dht.IPartitioner;
 import org.apache.cassandra.dht.RandomPartitioner;
 import org.apache.cassandra.dht.Token;
@@ -40,11 +40,14 @@ import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.gms.ApplicationState;
 import org.apache.cassandra.gms.Gossiper;
 import org.apache.cassandra.gms.VersionedValue.VersionedValueFactory;
+import org.apache.cassandra.locator.InetAddressAndPort;
 import org.apache.cassandra.locator.TokenMetadata;
-import org.apache.cassandra.net.MessageOut;
+import org.apache.cassandra.net.Message;
 import org.apache.cassandra.net.MessagingService;
 import org.apache.cassandra.utils.FBUtilities;
 
+import static org.apache.cassandra.net.NoPayload.noPayload;
+import static org.apache.cassandra.net.Verb.REPLICATION_DONE_REQ;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
 
@@ -53,6 +56,7 @@ public class RemoveTest
     static
     {
         DatabaseDescriptor.daemonInitialization();
+        CommitLog.instance.start();
     }
 
     static final IPartitioner partitioner = RandomPartitioner.instance;
@@ -61,9 +65,9 @@ public class RemoveTest
     static IPartitioner oldPartitioner;
     ArrayList<Token> endpointTokens = new ArrayList<Token>();
     ArrayList<Token> keyTokens = new ArrayList<Token>();
-    List<InetAddress> hosts = new ArrayList<InetAddress>();
+    List<InetAddressAndPort> hosts = new ArrayList<>();
     List<UUID> hostIds = new ArrayList<UUID>();
-    InetAddress removalhost;
+    InetAddressAndPort removalhost;
     UUID removalId;
 
     @BeforeClass
@@ -96,8 +100,9 @@ public class RemoveTest
     @After
     public void tearDown()
     {
-        MessagingService.instance().clearMessageSinks();
-        MessagingService.instance().clearCallbacksUnsafe();
+        MessagingService.instance().inboundSink.clear();
+        MessagingService.instance().outboundSink.clear();
+        MessagingService.instance().callbacks.unsafeClear();
     }
 
     @Test(expected = UnsupportedOperationException.class)
@@ -120,7 +125,7 @@ public class RemoveTest
         VersionedValueFactory valueFactory = new VersionedValueFactory(DatabaseDescriptor.getPartitioner());
         Collection<Token> tokens = Collections.singleton(DatabaseDescriptor.getPartitioner().getRandomToken());
 
-        InetAddress joininghost = hosts.get(4);
+        InetAddressAndPort joininghost = hosts.get(4);
         UUID joiningId = hostIds.get(4);
 
         hosts.remove(joininghost);
@@ -159,10 +164,12 @@ public class RemoveTest
         assertTrue(tmd.isLeaving(removalhost));
         assertEquals(1, tmd.getSizeOfLeavingEndpoints());
 
-        for (InetAddress host : hosts)
+        for (InetAddressAndPort host : hosts)
         {
-            MessageOut msg = new MessageOut(host, MessagingService.Verb.REPLICATION_FINISHED, null, null, Collections.<String, byte[]>emptyMap());
-            MessagingService.instance().sendRR(msg, FBUtilities.getBroadcastAddress());
+            Message msg = Message.builder(REPLICATION_DONE_REQ, noPayload)
+                                 .from(host)
+                                 .build();
+            MessagingService.instance().send(msg, FBUtilities.getBroadcastAddressAndPort());
         }
 
         remover.join();

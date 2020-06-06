@@ -21,6 +21,7 @@ import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.*;
 
+import com.google.common.base.Preconditions;
 import com.google.common.collect.Iterators;
 
 import org.apache.cassandra.schema.ColumnMetadata;
@@ -61,7 +62,7 @@ public abstract class Slices implements Iterable<Slice>
         if (slice.start() == ClusteringBound.BOTTOM && slice.end() == ClusteringBound.TOP)
             return Slices.ALL;
 
-        assert comparator.compare(slice.start(), slice.end()) <= 0;
+        Preconditions.checkArgument(!slice.isEmpty(comparator));
         return new ArrayBackedSlices(comparator, new Slice[]{ slice });
     }
 
@@ -192,7 +193,7 @@ public abstract class Slices implements Iterable<Slice>
 
         public Builder add(Slice slice)
         {
-            assert comparator.compare(slice.start(), slice.end()) <= 0;
+            Preconditions.checkArgument(!slice.isEmpty(comparator));
             if (slices.size() > 0 && comparator.compare(slices.get(slices.size()-1).end(), slice.start()) > 0)
                 needsNormalizing = true;
             slices.add(slice);
@@ -613,6 +614,8 @@ public abstract class Slices implements Iterable<Slice>
                 }
                 else
                 {
+                    boolean isReversed = column.isReversedType();
+
                     // As said above, we assume (without checking) that this means all ComponentOfSlice for this column
                     // are the same, so we only bother about the first.
                     if (first.startValue != null)
@@ -620,14 +623,24 @@ public abstract class Slices implements Iterable<Slice>
                         if (needAnd)
                             sb.append(" AND ");
                         needAnd = true;
-                        sb.append(column.name).append(first.startInclusive ? " >= " : " > ").append(column.type.getString(first.startValue));
+                        sb.append(column.name);
+                        if (isReversed)
+                            sb.append(first.startInclusive ? " <= " : " < ");
+                        else
+                            sb.append(first.startInclusive ? " >= " : " > ");
+                        sb.append(column.type.getString(first.startValue));
                     }
                     if (first.endValue != null)
                     {
                         if (needAnd)
                             sb.append(" AND ");
                         needAnd = true;
-                        sb.append(column.name).append(first.endInclusive ? " <= " : " < ").append(column.type.getString(first.endValue));
+                        sb.append(column.name);
+                        if (isReversed)
+                            sb.append(first.endInclusive ? " >= " : " > ");
+                        else
+                            sb.append(first.endInclusive ? " <= " : " < ");
+                        sb.append(column.type.getString(first.endValue));
                     }
                 }
             }

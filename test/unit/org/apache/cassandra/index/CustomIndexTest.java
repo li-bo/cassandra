@@ -37,7 +37,7 @@ import org.apache.cassandra.cql3.CQLTester;
 import org.apache.cassandra.cql3.ColumnIdentifier;
 import org.apache.cassandra.cql3.restrictions.IndexRestrictions;
 import org.apache.cassandra.cql3.restrictions.StatementRestrictions;
-import org.apache.cassandra.cql3.statements.IndexTarget;
+import org.apache.cassandra.cql3.statements.schema.IndexTarget;
 import org.apache.cassandra.cql3.statements.ModificationStatement;
 import org.apache.cassandra.db.*;
 import org.apache.cassandra.db.marshal.AbstractType;
@@ -54,7 +54,7 @@ import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.concurrent.OpOrder;
 
-import static org.apache.cassandra.cql3.statements.IndexTarget.CUSTOM_INDEX_OPTION_NAME;
+import static org.apache.cassandra.cql3.statements.schema.IndexTarget.CUSTOM_INDEX_OPTION_NAME;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
@@ -163,11 +163,11 @@ public class CustomIndexTest extends CQLTester
     {
         createTable("CREATE TABLE %s(k int, c int, v1 int, v2 int, PRIMARY KEY (k,c))");
 
-        assertInvalidMessage("Duplicate column v1 in index target list",
+        assertInvalidMessage("Duplicate column 'v1' in index target list",
                              String.format("CREATE CUSTOM INDEX ON %%s(v1, v1) USING '%s'",
                                            StubIndex.class.getName()));
 
-        assertInvalidMessage("Duplicate column v1 in index target list",
+        assertInvalidMessage("Duplicate column 'v1' in index target list",
                              String.format("CREATE CUSTOM INDEX ON %%s(v1, v1, c, c) USING '%s'",
                                            StubIndex.class.getName()));
     }
@@ -684,7 +684,11 @@ public class CustomIndexTest extends CQLTester
         assertTrue(index.writeGroups.size() > 1);
         assertFalse(index.readOrderingAtFinish.isBlocking());
         index.writeGroups.forEach(group -> assertFalse(group.isBlocking()));
-        index.barriers.forEach(OpOrder.Barrier::allPriorOpsAreFinished);
+        index.readBarriers.forEach(b -> assertTrue(b.getSyncPoint().isFinished()));
+        index.writeBarriers.forEach(b -> {
+            b.await(); // Keyspace.writeOrder is global, so this might be temporally blocked by other tests
+            assertTrue(b.getSyncPoint().isFinished());
+        });
     }
 
     @Test
@@ -792,6 +796,37 @@ public class CustomIndexTest extends CQLTester
         assertEquals(1, index.beginCalls);
         assertEquals(1, index.finishCalls);
     }
+
+    @Test
+    public void rangeTombstoneTest() throws Throwable
+    {
+        createTable("CREATE TABLE %s(k int, c int, v int, v2 int, PRIMARY KEY(k,c))");
+        ColumnFamilyStore cfs = getCurrentColumnFamilyStore();
+        SecondaryIndexManager indexManager = cfs.indexManager;
+
+        // Insert a single range tombstone
+        execute("DELETE FROM %s WHERE k=1 and c > 2");
+        cfs.forceBlockingFlush();
+
+        // Create the index, which won't automatically start building
+        String indexName = "range_tombstone_idx";
+        createIndex(String.format("CREATE CUSTOM INDEX %s ON %%s(v) USING '%s'",
+                                  indexName, StubIndex.class.getName()));
+        String indexName2 = "range_tombstone_idx2";
+        createIndex(String.format("CREATE CUSTOM INDEX %s ON %%s(v2) USING '%s'",
+                                  indexName2, StubIndex.class.getName()));
+
+        StubIndex index = (StubIndex) indexManager.getIndexByName(indexName);
+        StubIndex index2 = (StubIndex) indexManager.getIndexByName(indexName2);
+
+        // Index the partition
+        DecoratedKey targetKey = getCurrentColumnFamilyStore().decorateKey(ByteBufferUtil.bytes(1));
+        indexManager.indexPartition(targetKey, Sets.newHashSet(index, index2), 1);
+
+        // and both indexes should have the same range tombstone
+        assertEquals(index.rangeTombstones, index2.rangeTombstones);
+    }
+
 
     // Used for index creation above
     public static class BrokenCustom2I extends StubIndex
@@ -1021,7 +1056,8 @@ public class CustomIndexTest extends CQLTester
         OpOrder.Group readOrderingAtStart = null;
         OpOrder.Group readOrderingAtFinish = null;
         Set<OpOrder.Group> writeGroups = new HashSet<>();
-        List<OpOrder.Barrier> barriers = new ArrayList<>();
+        List<OpOrder.Barrier> readBarriers = new ArrayList<>();
+        List<OpOrder.Barrier> writeBarriers = new ArrayList<>();
 
         static final int ROWS_IN_PARTITION = 1000;
 
@@ -1048,13 +1084,14 @@ public class CustomIndexTest extends CQLTester
         public Indexer indexerFor(final DecoratedKey key,
                                   RegularAndStaticColumns columns,
                                   int nowInSec,
-                                  OpOrder.Group opGroup,
+                                  WriteContext ctx,
                                   IndexTransaction.Type transactionType)
         {
+            CassandraWriteContext cassandraWriteContext = (CassandraWriteContext) ctx;
             if (readOrderingAtStart == null)
                 readOrderingAtStart = baseCfs.readOrdering.getCurrent();
 
-            writeGroups.add(opGroup);
+            writeGroups.add(cassandraWriteContext.getGroup());
 
             return new Indexer()
             {
@@ -1066,10 +1103,10 @@ public class CustomIndexTest extends CQLTester
                     // indexing of a partition
                     OpOrder.Barrier readBarrier = baseCfs.readOrdering.newBarrier();
                     readBarrier.issue();
-                    barriers.add(readBarrier);
+                    readBarriers.add(readBarrier);
                     OpOrder.Barrier writeBarrier = Keyspace.writeOrder.newBarrier();
                     writeBarrier.issue();
-                    barriers.add(writeBarrier);
+                    writeBarriers.add(writeBarrier);
                 }
 
                 public void insertRow(Row row)

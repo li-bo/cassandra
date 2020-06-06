@@ -19,6 +19,7 @@ package org.apache.cassandra.db.view;
 
 import java.nio.ByteBuffer;
 import java.util.*;
+import java.util.stream.Collectors;
 
 import com.google.common.collect.Iterators;
 import com.google.common.collect.PeekingIterator;
@@ -53,7 +54,7 @@ public class ViewUpdateGenerator
     private final TableMetadata viewMetadata;
     private final boolean baseEnforceStrictLiveness;
 
-    private final Map<DecoratedKey, PartitionUpdate> updates = new HashMap<>();
+    private final Map<DecoratedKey, PartitionUpdate.Builder> updates = new HashMap<>();
 
     // Reused internally to build a new entry
     private final ByteBuffer[] currentViewEntryPartitionKey;
@@ -143,7 +144,7 @@ public class ViewUpdateGenerator
      */
     public Collection<PartitionUpdate> generateViewUpdates()
     {
-        return updates.values();
+        return updates.values().stream().map(PartitionUpdate.Builder::build).collect(Collectors.toList());
     }
 
     /**
@@ -404,11 +405,13 @@ public class ViewUpdateGenerator
         if (timestamp > rowDeletion)
         {
             /**
-              * TODO: This is a hack and overload of LivenessInfo and we should probably modify
-              * the storage engine to properly support this, but on the meantime this
-              * should be fine because it only happens in some specific scenarios explained above.
+              * We use an expired liveness instead of a row tombstone to allow a shadowed MV
+              * entry to co-exist with a row tombstone, see ViewComplexTest#testCommutativeRowDeletion.
+              *
+              * TODO This is a dirty overload of LivenessInfo and we should modify
+              * the storage engine to properly support this on CASSANDRA-13826.
               */
-            LivenessInfo info = LivenessInfo.withExpirationTime(timestamp, Integer.MAX_VALUE, nowInSec);
+            LivenessInfo info = LivenessInfo.withExpirationTime(timestamp, LivenessInfo.EXPIRED_LIVENESS_TTL, nowInSec);
             currentViewEntryBuilder.addPrimaryKeyLivenessInfo(info);
         }
         currentViewEntryBuilder.addRowDeletion(mergedBaseRow.deletion());
@@ -564,14 +567,13 @@ public class ViewUpdateGenerator
             return;
 
         DecoratedKey partitionKey = makeCurrentPartitionKey();
-        PartitionUpdate update = updates.get(partitionKey);
-        if (update == null)
-        {
-            // We can't really know which columns of the view will be updated nor how many row will be updated for this key
-            // so we rely on hopefully sane defaults.
-            update = new PartitionUpdate(viewMetadata, partitionKey, viewMetadata.regularAndStaticColumns(), 4);
-            updates.put(partitionKey, update);
-        }
+        // We can't really know which columns of the view will be updated nor how many row will be updated for this key
+        // so we rely on hopefully sane defaults.
+        PartitionUpdate.Builder update = updates.computeIfAbsent(partitionKey,
+                                                                 k -> new PartitionUpdate.Builder(viewMetadata,
+                                                                                                  partitionKey,
+                                                                                                  viewMetadata.regularAndStaticColumns(),
+                                                                                                  4));
         update.add(row);
     }
 

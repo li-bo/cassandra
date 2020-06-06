@@ -21,28 +21,34 @@ import java.io.File;
 import java.io.IOException;
 import java.util.*;
 
-import org.apache.cassandra.cql3.statements.CreateTableStatement;
-import org.apache.cassandra.dht.Murmur3Partitioner;
-import org.apache.cassandra.index.sasi.SASIIndex;
-import org.apache.cassandra.index.sasi.disk.OnDiskIndexBuilder;
-import org.junit.After;
-import org.junit.BeforeClass;
-
+import org.apache.cassandra.auth.AuthKeyspace;
+import org.apache.cassandra.auth.AuthSchemaChangeListener;
+import org.apache.cassandra.auth.IAuthenticator;
+import org.apache.cassandra.auth.IAuthorizer;
+import org.apache.cassandra.auth.INetworkAuthorizer;
+import org.apache.cassandra.auth.IRoleManager;
 import org.apache.cassandra.config.*;
 import org.apache.cassandra.cql3.CQLTester;
 import org.apache.cassandra.cql3.ColumnIdentifier;
-import org.apache.cassandra.cql3.statements.IndexTarget;
+import org.apache.cassandra.cql3.statements.schema.CreateTableStatement;
+import org.apache.cassandra.cql3.statements.schema.IndexTarget;
 import org.apache.cassandra.db.RowUpdateBuilder;
 import org.apache.cassandra.db.commitlog.CommitLog;
 import org.apache.cassandra.db.marshal.*;
+import org.apache.cassandra.dht.Murmur3Partitioner;
 import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.gms.Gossiper;
 import org.apache.cassandra.index.StubIndex;
+import org.apache.cassandra.index.sasi.SASIIndex;
+import org.apache.cassandra.index.sasi.disk.OnDiskIndexBuilder;
 import org.apache.cassandra.io.util.FileUtils;
 import org.apache.cassandra.schema.*;
 import org.apache.cassandra.schema.MigrationManager;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.FBUtilities;
+
+import org.junit.After;
+import org.junit.BeforeClass;
 
 public class SchemaLoader
 {
@@ -96,6 +102,8 @@ public class SchemaLoader
         String ks_nocommit = testName + "NoCommitlogSpace";
         String ks_prsi = testName + "PerRowSecondaryIndex";
         String ks_cql = testName + "cql_keyspace";
+        String ks_cql_replicated = testName + "cql_keyspace_replicated";
+        String ks_with_transient = testName + "ks_with_transient";
 
         AbstractType bytes = BytesType.instance;
 
@@ -120,7 +128,7 @@ public class SchemaLoader
                 KeyspaceParams.simple(1),
                 Tables.of(
                 // Column Families
-                standardCFMD(ks1, "Standard1").compaction(CompactionParams.scts(compactionOptions)).build(),
+                standardCFMD(ks1, "Standard1").compaction(CompactionParams.stcs(compactionOptions)).build(),
                 standardCFMD(ks1, "Standard2").build(),
                 standardCFMD(ks1, "Standard3").build(),
                 standardCFMD(ks1, "Standard4").build(),
@@ -212,42 +220,30 @@ public class SchemaLoader
         schema.add(KeyspaceMetadata.create(ks_nocommit, KeyspaceParams.simpleTransient(1), Tables.of(
                 standardCFMD(ks_nocommit, "Standard1").build())));
 
+        String simpleTable = "CREATE TABLE table1 ("
+                             + "k int PRIMARY KEY,"
+                             + "v1 text,"
+                             + "v2 int"
+                             + ")";
         // CQLKeyspace
         schema.add(KeyspaceMetadata.create(ks_cql, KeyspaceParams.simple(1), Tables.of(
 
         // Column Families
-        CreateTableStatement.parse("CREATE TABLE table1 ("
-                                   + "k int PRIMARY KEY,"
-                                   + "v1 text,"
-                                   + "v2 int"
-                                   + ")", ks_cql)
-                            .build(),
+        CreateTableStatement.parse(simpleTable, ks_cql).build(),
 
         CreateTableStatement.parse("CREATE TABLE table2 ("
                                    + "k text,"
                                    + "c text,"
                                    + "v text,"
                                    + "PRIMARY KEY (k, c))", ks_cql)
-                            .build(),
-
-        CreateTableStatement.parse("CREATE TABLE foo ("
-                                   + "bar text, "
-                                   + "baz text, "
-                                   + "qux text, "
-                                   + "PRIMARY KEY(bar, baz) ) "
-                                   + "WITH COMPACT STORAGE", ks_cql)
-                            .build(),
-
-        CreateTableStatement.parse("CREATE TABLE foofoo ("
-                                   + "bar text, "
-                                   + "baz text, "
-                                   + "qux text, "
-                                   + "quz text, "
-                                   + "foo text, "
-                                   + "PRIMARY KEY((bar, baz), qux, quz) ) "
-                                   + "WITH COMPACT STORAGE", ks_cql)
                             .build()
         )));
+
+        schema.add(KeyspaceMetadata.create(ks_cql_replicated, KeyspaceParams.simple(3),
+                                           Tables.of(CreateTableStatement.parse(simpleTable, ks_cql_replicated).build())));
+
+        schema.add(KeyspaceMetadata.create(ks_with_transient, KeyspaceParams.simple("3/1"),
+                                           Tables.of(CreateTableStatement.parse(simpleTable, ks_with_transient).build())));
 
         if (DatabaseDescriptor.getPartitioner() instanceof Murmur3Partitioner)
         {
@@ -288,6 +284,20 @@ public class SchemaLoader
     public static void createKeyspace(String name, KeyspaceParams params, Tables tables, Types types)
     {
         MigrationManager.announceNewKeyspace(KeyspaceMetadata.create(name, params, tables, Views.none(), types, Functions.none()), true);
+    }
+
+    public static void setupAuth(IRoleManager roleManager, IAuthenticator authenticator, IAuthorizer authorizer, INetworkAuthorizer networkAuthorizer)
+    {
+        DatabaseDescriptor.setRoleManager(roleManager);
+        DatabaseDescriptor.setAuthenticator(authenticator);
+        DatabaseDescriptor.setAuthorizer(authorizer);
+        DatabaseDescriptor.setNetworkAuthorizer(networkAuthorizer);
+        MigrationManager.announceNewKeyspace(AuthKeyspace.metadata(), true);
+        DatabaseDescriptor.getRoleManager().setup();
+        DatabaseDescriptor.getAuthenticator().setup();
+        DatabaseDescriptor.getAuthorizer().setup();
+        DatabaseDescriptor.getNetworkAuthorizer().setup();
+        Schema.instance.registerListener(new AuthSchemaChangeListener());
     }
 
     public static ColumnMetadata integerColumn(String ksName, String cfName)
@@ -380,6 +390,15 @@ public class SchemaLoader
         return builder;
     }
 
+    public static TableMetadata.Builder staticCFMD(String ksName, String cfName)
+    {
+        return TableMetadata.builder(ksName, cfName)
+                                 .addPartitionKeyColumn("key", AsciiType.instance)
+                                 .addClusteringColumn("cols", AsciiType.instance)
+                                 .addStaticColumn("val", AsciiType.instance)
+                                 .addRegularColumn("val2", AsciiType.instance);
+    }
+
 
     public static TableMetadata.Builder denseCFMD(String ksName, String cfName)
     {
@@ -459,6 +478,35 @@ public class SchemaLoader
                                                        IndexMetadata.Kind.COMPOSITES,
                                                        Collections.EMPTY_MAP));
         }
+
+        return builder.indexes(indexes.build());
+    }
+
+    public static TableMetadata.Builder compositeMultipleIndexCFMD(String ksName, String cfName) throws ConfigurationException
+    {
+        TableMetadata.Builder builder = TableMetadata.builder(ksName, cfName)
+                                                     .addPartitionKeyColumn("key", AsciiType.instance)
+                                                     .addClusteringColumn("c1", AsciiType.instance)
+                                                     .addRegularColumn("birthdate", LongType.instance)
+                                                     .addRegularColumn("notbirthdate", LongType.instance)
+                                                     .compression(getCompressionParameters());
+
+
+        Indexes.Builder indexes = Indexes.builder();
+
+        indexes.add(IndexMetadata.fromIndexTargets(Collections.singletonList(
+                                                   new IndexTarget(new ColumnIdentifier("birthdate", true),
+                                                                   IndexTarget.Type.VALUES)),
+                                                   "birthdate_key_index",
+                                                   IndexMetadata.Kind.COMPOSITES,
+                                                   Collections.EMPTY_MAP));
+        indexes.add(IndexMetadata.fromIndexTargets(Collections.singletonList(
+                                                   new IndexTarget(new ColumnIdentifier("notbirthdate", true),
+                                                                   IndexTarget.Type.VALUES)),
+                                                   "notbirthdate_key_index",
+                                                   IndexMetadata.Kind.COMPOSITES,
+                                                   Collections.EMPTY_MAP));
+
 
         return builder.indexes(indexes.build());
     }

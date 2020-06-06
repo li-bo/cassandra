@@ -21,6 +21,8 @@ import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
 
+import org.apache.cassandra.audit.AuditLogContext;
+import org.apache.cassandra.audit.AuditLogEntryType;
 import org.apache.cassandra.cql3.*;
 import org.apache.cassandra.cql3.conditions.ColumnCondition;
 import org.apache.cassandra.cql3.conditions.Conditions;
@@ -33,6 +35,8 @@ import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.Pair;
+import org.apache.commons.lang3.builder.ToStringBuilder;
+import org.apache.commons.lang3.builder.ToStringStyle;
 
 import static org.apache.cassandra.cql3.statements.RequestValidations.checkContainsNoDuplicates;
 import static org.apache.cassandra.cql3.statements.RequestValidations.checkFalse;
@@ -47,23 +51,18 @@ public class UpdateStatement extends ModificationStatement
     private static final Constants.Value EMPTY = new Constants.Value(ByteBufferUtil.EMPTY_BYTE_BUFFER);
 
     private UpdateStatement(StatementType type,
-                            int boundTerms,
+                            VariableSpecifications bindVariables,
                             TableMetadata metadata,
                             Operations operations,
                             StatementRestrictions restrictions,
                             Conditions conditions,
                             Attributes attrs)
     {
-        super(type, boundTerms, metadata, operations, restrictions, conditions, attrs);
-    }
-
-    public boolean requireFullClusteringKey()
-    {
-        return true;
+        super(type, bindVariables, metadata, operations, restrictions, conditions, attrs);
     }
 
     @Override
-    public void addUpdateForKey(PartitionUpdate update, Clustering clustering, UpdateParameters params)
+    public void addUpdateForKey(PartitionUpdate.Builder updateBuilder, Clustering clustering, UpdateParameters params)
     {
         if (updatesRegularRows())
         {
@@ -90,22 +89,22 @@ public class UpdateStatement extends ModificationStatement
             }
 
             for (Operation op : updates)
-                op.execute(update.partitionKey(), params);
+                op.execute(updateBuilder.partitionKey(), params);
 
-            update.add(params.buildRow());
+            updateBuilder.add(params.buildRow());
         }
 
         if (updatesStaticRow())
         {
             params.newRow(Clustering.STATIC_CLUSTERING);
             for (Operation op : getStaticOperations())
-                op.execute(update.partitionKey(), params);
-            update.add(params.buildRow());
+                op.execute(updateBuilder.partitionKey(), params);
+            updateBuilder.add(params.buildRow());
         }
     }
 
     @Override
-    public void addUpdateForKey(PartitionUpdate update, Slice slice, UpdateParameters params)
+    public void addUpdateForKey(PartitionUpdate.Builder update, Slice slice, UpdateParameters params)
     {
         throw new UnsupportedOperationException();
     }
@@ -124,7 +123,7 @@ public class UpdateStatement extends ModificationStatement
          * @param columnValues list of column values (corresponds to names)
          * @param ifNotExists true if an IF NOT EXISTS condition was specified, false otherwise
          */
-        public ParsedInsert(CFName name,
+        public ParsedInsert(QualifiedName name,
                             Attributes.Raw attrs,
                             List<ColumnMetadata.Raw> columnNames,
                             List<Term.Raw> columnValues,
@@ -137,7 +136,7 @@ public class UpdateStatement extends ModificationStatement
 
         @Override
         protected ModificationStatement prepareInternal(TableMetadata metadata,
-                                                        VariableSpecifications boundNames,
+                                                        VariableSpecifications bindVariables,
                                                         Conditions conditions,
                                                         Attributes attrs)
         {
@@ -170,7 +169,7 @@ public class UpdateStatement extends ModificationStatement
                 else
                 {
                     Operation operation = new Operation.SetValue(value).prepare(metadata, def);
-                    operation.collectMarkerSpecification(boundNames);
+                    operation.collectMarkerSpecification(bindVariables);
                     operations.add(operation);
                 }
             }
@@ -180,13 +179,13 @@ public class UpdateStatement extends ModificationStatement
             StatementRestrictions restrictions = new StatementRestrictions(type,
                                                                            metadata,
                                                                            whereClause.build(),
-                                                                           boundNames,
+                                                                           bindVariables,
                                                                            applyOnlyToStaticColumns,
                                                                            false,
                                                                            false);
 
             return new UpdateStatement(type,
-                                       boundNames.size(),
+                                       bindVariables,
                                        metadata,
                                        operations,
                                        restrictions,
@@ -203,7 +202,7 @@ public class UpdateStatement extends ModificationStatement
         private final Json.Raw jsonValue;
         private final boolean defaultUnset;
 
-        public ParsedInsertJson(CFName name, Attributes.Raw attrs, Json.Raw jsonValue, boolean defaultUnset, boolean ifNotExists)
+        public ParsedInsertJson(QualifiedName name, Attributes.Raw attrs, Json.Raw jsonValue, boolean defaultUnset, boolean ifNotExists)
         {
             super(name, StatementType.INSERT, attrs, null, ifNotExists, false);
             this.jsonValue = jsonValue;
@@ -212,14 +211,14 @@ public class UpdateStatement extends ModificationStatement
 
         @Override
         protected ModificationStatement prepareInternal(TableMetadata metadata,
-                                                        VariableSpecifications boundNames,
+                                                        VariableSpecifications bindVariables,
                                                         Conditions conditions,
                                                         Attributes attrs)
         {
             checkFalse(metadata.isCounter(), "INSERT statements are not allowed on counter tables, use UPDATE instead");
 
             Collection<ColumnMetadata> defs = metadata.columns();
-            Json.Prepared prepared = jsonValue.prepareAndCollectMarkers(metadata, defs, boundNames);
+            Json.Prepared prepared = jsonValue.prepareAndCollectMarkers(metadata, defs, bindVariables);
 
             WhereClause.Builder whereClause = new WhereClause.Builder();
             Operations operations = new Operations(type);
@@ -238,7 +237,7 @@ public class UpdateStatement extends ModificationStatement
                 else
                 {
                     Operation operation = new Operation.SetValue(raw).prepare(metadata, def);
-                    operation.collectMarkerSpecification(boundNames);
+                    operation.collectMarkerSpecification(bindVariables);
                     operations.add(operation);
                 }
             }
@@ -248,13 +247,13 @@ public class UpdateStatement extends ModificationStatement
             StatementRestrictions restrictions = new StatementRestrictions(type,
                                                                            metadata,
                                                                            whereClause.build(),
-                                                                           boundNames,
+                                                                           bindVariables,
                                                                            applyOnlyToStaticColumns,
                                                                            false,
                                                                            false);
 
             return new UpdateStatement(type,
-                                       boundNames.size(),
+                                       bindVariables,
                                        metadata,
                                        operations,
                                        restrictions,
@@ -279,7 +278,7 @@ public class UpdateStatement extends ModificationStatement
          * @param whereClause the where clause
          * @param ifExists flag to check if row exists
          * */
-        public ParsedUpdate(CFName name,
+        public ParsedUpdate(QualifiedName name,
                             Attributes.Raw attrs,
                             List<Pair<ColumnMetadata.Raw, Operation.RawUpdate>> updates,
                             WhereClause whereClause,
@@ -293,7 +292,7 @@ public class UpdateStatement extends ModificationStatement
 
         @Override
         protected ModificationStatement prepareInternal(TableMetadata metadata,
-                                                        VariableSpecifications boundNames,
+                                                        VariableSpecifications bindVariables,
                                                         Conditions conditions,
                                                         Attributes attrs)
         {
@@ -306,23 +305,35 @@ public class UpdateStatement extends ModificationStatement
                 checkFalse(def.isPrimaryKeyColumn(), "PRIMARY KEY part %s found in SET part", def.name);
 
                 Operation operation = entry.right.prepare(metadata, def);
-                operation.collectMarkerSpecification(boundNames);
+                operation.collectMarkerSpecification(bindVariables);
                 operations.add(operation);
             }
 
             StatementRestrictions restrictions = newRestrictions(metadata,
-                                                                 boundNames,
+                                                                 bindVariables,
                                                                  operations,
                                                                  whereClause,
                                                                  conditions);
 
             return new UpdateStatement(type,
-                                       boundNames.size(),
+                                       bindVariables,
                                        metadata,
                                        operations,
                                        restrictions,
                                        conditions,
                                        attrs);
         }
+    }
+    
+    @Override
+    public String toString()
+    {
+        return ToStringBuilder.reflectionToString(this, ToStringStyle.SHORT_PREFIX_STYLE);
+    }
+
+    @Override
+    public AuditLogContext getAuditLogContext()
+    {
+        return new AuditLogContext(AuditLogEntryType.UPDATE, keyspace(), columnFamily());
     }
 }

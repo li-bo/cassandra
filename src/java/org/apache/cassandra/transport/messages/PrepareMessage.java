@@ -17,17 +17,20 @@
  */
 package org.apache.cassandra.transport.messages;
 
-import java.util.UUID;
+import java.util.function.Supplier;
 
 import com.google.common.collect.ImmutableMap;
-import io.netty.buffer.ByteBuf;
 
+import io.netty.buffer.ByteBuf;
+import org.apache.cassandra.cql3.QueryEvents;
+import org.apache.cassandra.cql3.QueryHandler;
 import org.apache.cassandra.service.ClientState;
 import org.apache.cassandra.service.QueryState;
 import org.apache.cassandra.tracing.Tracing;
-import org.apache.cassandra.transport.*;
+import org.apache.cassandra.transport.CBUtil;
+import org.apache.cassandra.transport.Message;
+import org.apache.cassandra.transport.ProtocolVersion;
 import org.apache.cassandra.utils.JVMStabilityInspector;
-import org.apache.cassandra.utils.UUIDGen;
 
 public class PrepareMessage extends Message.Request
 {
@@ -59,7 +62,7 @@ public class PrepareMessage extends Message.Request
                     dest.writeInt(0x0);
                 else {
                     dest.writeInt(0x1);
-                    CBUtil.writeString(msg.keyspace, dest);
+                    CBUtil.writeAsciiString(msg.keyspace, dest);
                 }
             }
         }
@@ -75,7 +78,7 @@ public class PrepareMessage extends Message.Request
                 // If we have a keyspace, we'd write it out. Otherwise, we'd write nothing.
                 size += msg.keyspace == null
                     ? 0
-                    : CBUtil.sizeOfString(msg.keyspace);
+                    : CBUtil.sizeOfAsciiString(msg.keyspace);
             }
             return size;
         }
@@ -91,40 +94,32 @@ public class PrepareMessage extends Message.Request
         this.keyspace = keyspace;
     }
 
-    public Message.Response execute(QueryState state, long queryStartNanoTime)
+    @Override
+    protected boolean isTraceable()
+    {
+        return true;
+    }
+
+    @Override
+    protected Message.Response execute(QueryState state, long queryStartNanoTime, boolean traceRequest)
     {
         try
         {
-            UUID tracingId = null;
-            if (isTracingRequested())
-            {
-                tracingId = UUIDGen.getTimeUUID();
-                state.prepareTracingSession(tracingId);
-            }
-
-            if (state.traceNextQuery())
-            {
-                state.createTracingSession(getCustomPayload());
+            if (traceRequest)
                 Tracing.instance.begin("Preparing CQL3 query", state.getClientAddress(), ImmutableMap.of("query", query));
-            }
 
-            Message.Response response = ClientState.getCQLQueryHandler().prepare(query,
-                                                                                 state.getClientState().cloneWithKeyspaceIfSet(keyspace),
-                                                                                 getCustomPayload());
-
-            if (tracingId != null)
-                response.setTracingId(tracingId);
-
+            ClientState clientState = state.getClientState().cloneWithKeyspaceIfSet(keyspace);
+            QueryHandler queryHandler = ClientState.getCQLQueryHandler();
+            long queryTime = System.currentTimeMillis();
+            ResultMessage.Prepared response = queryHandler.prepare(query, clientState, getCustomPayload());
+            QueryEvents.instance.notifyPrepareSuccess(() -> queryHandler.getPrepared(response.statementId), query, state, queryTime, response);
             return response;
         }
         catch (Exception e)
         {
+            QueryEvents.instance.notifyPrepareFailure(null, query, state, e);
             JVMStabilityInspector.inspectThrowable(e);
             return ErrorMessage.fromException(e);
-        }
-        finally
-        {
-            Tracing.instance.stopSession();
         }
     }
 

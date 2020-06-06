@@ -17,15 +17,17 @@
  */
 package org.apache.cassandra.repair;
 
-import java.net.InetAddress;
-
 import com.google.common.util.concurrent.AbstractFuture;
 
 import org.apache.cassandra.exceptions.RepairException;
+import org.apache.cassandra.locator.InetAddressAndPort;
+import org.apache.cassandra.net.Message;
 import org.apache.cassandra.net.MessagingService;
 import org.apache.cassandra.repair.messages.ValidationRequest;
 import org.apache.cassandra.streaming.PreviewKind;
 import org.apache.cassandra.utils.MerkleTrees;
+
+import static org.apache.cassandra.net.Verb.VALIDATION_REQ;
 
 /**
  * ValidationTask sends {@link ValidationRequest} to a replica.
@@ -34,11 +36,11 @@ import org.apache.cassandra.utils.MerkleTrees;
 public class ValidationTask extends AbstractFuture<TreeResponse> implements Runnable
 {
     private final RepairJobDesc desc;
-    private final InetAddress endpoint;
+    private final InetAddressAndPort endpoint;
     private final int nowInSec;
     private final PreviewKind previewKind;
 
-    public ValidationTask(RepairJobDesc desc, InetAddress endpoint, int nowInSec, PreviewKind previewKind)
+    public ValidationTask(RepairJobDesc desc, InetAddressAndPort endpoint, int nowInSec, PreviewKind previewKind)
     {
         this.desc = desc;
         this.endpoint = endpoint;
@@ -52,7 +54,7 @@ public class ValidationTask extends AbstractFuture<TreeResponse> implements Runn
     public void run()
     {
         ValidationRequest request = new ValidationRequest(desc, nowInSec);
-        MessagingService.instance().sendOneWay(request.createMessage(), endpoint);
+        MessagingService.instance().send(Message.out(VALIDATION_REQ, request), endpoint);
     }
 
     /**

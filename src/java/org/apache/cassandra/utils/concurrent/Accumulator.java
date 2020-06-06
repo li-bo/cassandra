@@ -18,6 +18,9 @@
 */
 package org.apache.cassandra.utils.concurrent;
 
+import java.util.AbstractCollection;
+import java.util.Collection;
+import java.util.Arrays;
 import java.util.Iterator;
 import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
 
@@ -27,7 +30,7 @@ import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
  *
  * @param <E>
  */
-public class Accumulator<E> implements Iterable<E>
+public class Accumulator<E>
 {
     private volatile int nextIndex;
     private volatile int presentCount;
@@ -105,7 +108,7 @@ public class Accumulator<E> implements Iterable<E>
         return values.length;
     }
 
-    public Iterator<E> iterator()
+    private Iterator<E> iterator(int count)
     {
         return new Iterator<E>()
         {
@@ -113,7 +116,7 @@ public class Accumulator<E> implements Iterable<E>
 
             public boolean hasNext()
             {
-                return p < presentCount;
+                return p < count;
             }
 
             public E next()
@@ -134,5 +137,36 @@ public class Accumulator<E> implements Iterable<E>
         if (i >= presentCount)
             throw new IndexOutOfBoundsException();
         return (E) values[i];
+    }
+
+    public Collection<E> snapshot()
+    {
+        int count = presentCount;
+        return new AbstractCollection<E>()
+        {
+            @Override
+            public Iterator<E> iterator()
+            {
+                return Accumulator.this.iterator(count);
+            }
+
+            @Override
+            public int size()
+            {
+                return count;
+            }
+        };
+    }
+
+    /**
+     * Removes all of the elements from this accumulator.
+     *
+     * This method is not thread-safe when used concurrently with {@link #add(Object)}.
+     */
+    public void clearUnsafe()
+    {
+        nextIndexUpdater.set(this, 0);
+        presentCountUpdater.set(this, 0);
+        Arrays.fill(values, null);
     }
 }

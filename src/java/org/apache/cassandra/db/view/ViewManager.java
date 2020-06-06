@@ -22,6 +22,7 @@ import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.locks.Lock;
 
+import com.google.common.collect.Maps;
 import com.google.common.util.concurrent.Striped;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -32,6 +33,7 @@ import org.apache.cassandra.schema.ViewMetadata;
 import org.apache.cassandra.db.*;
 import org.apache.cassandra.db.partitions.*;
 import org.apache.cassandra.repair.SystemDistributedKeyspace;
+import org.apache.cassandra.schema.Views;
 import org.apache.cassandra.service.StorageService;
 
 /**
@@ -77,7 +79,7 @@ public class ViewManager
             {
                 assert keyspace.getName().equals(update.metadata().keyspace);
 
-                if (coordinatorBatchlog && keyspace.getReplicationStrategy().getReplicationFactor() == 1)
+                if (coordinatorBatchlog && keyspace.getReplicationStrategy().getReplicationFactor().allReplicas == 1)
                     continue;
 
                 if (!forTable(update.metadata().id).updatedViews(update).isEmpty())
@@ -93,18 +95,13 @@ public class ViewManager
         return viewsByName.values();
     }
 
-    public void reload()
+    public void reload(boolean buildAllViews)
     {
-        Map<String, ViewMetadata> newViewsByName = new HashMap<>();
-        for (ViewMetadata definition : keyspace.getMetadata().views)
+        Views views = keyspace.getMetadata().views;
+        Map<String, ViewMetadata> newViewsByName = Maps.newHashMapWithExpectedSize(views.size());
+        for (ViewMetadata definition : views)
         {
-            newViewsByName.put(definition.name, definition);
-        }
-
-        for (String viewName : viewsByName.keySet())
-        {
-            if (!newViewsByName.containsKey(viewName))
-                removeView(viewName);
+            newViewsByName.put(definition.name(), definition);
         }
 
         for (Map.Entry<String, ViewMetadata> entry : newViewsByName.entrySet())
@@ -112,6 +109,9 @@ public class ViewManager
             if (!viewsByName.containsKey(entry.getKey()))
                 addView(entry.getValue());
         }
+
+        if (!buildAllViews)
+            return;
 
         // Building views involves updating view build status in the system_distributed
         // keyspace and therefore it requires ring information. This check prevents builds
@@ -141,23 +141,29 @@ public class ViewManager
         if (!keyspace.hasColumnFamilyStore(definition.baseTableId))
         {
             logger.warn("Not adding view {} because the base table {} is unknown",
-                        definition.name,
+                        definition.name(),
                         definition.baseTableId);
             return;
         }
 
         View view = new View(definition, keyspace.getColumnFamilyStore(definition.baseTableId));
         forTable(view.getDefinition().baseTableId).add(view);
-        viewsByName.put(definition.name, view);
+        viewsByName.put(definition.name(), view);
     }
 
-    public void removeView(String name)
+    /**
+     * Stops the building of the specified view, no-op if it isn't building.
+     *
+     * @param name the name of the view
+     */
+    public void dropView(String name)
     {
         View view = viewsByName.remove(name);
 
         if (view == null)
             return;
 
+        view.stopBuild();
         forTable(view.getDefinition().baseTableId).removeByName(name);
         SystemKeyspace.setViewRemoved(keyspace.getName(), view.name);
         SystemDistributedKeyspace.setViewRemoved(keyspace.getName(), view.name);

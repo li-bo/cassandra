@@ -19,26 +19,26 @@
 package org.apache.cassandra.repair.messages;
 
 import java.io.IOException;
-import java.net.InetAddress;
 import java.util.UUID;
 
 import org.apache.cassandra.db.TypeSizes;
+import org.apache.cassandra.io.IVersionedSerializer;
 import org.apache.cassandra.io.util.DataInputPlus;
 import org.apache.cassandra.io.util.DataOutputPlus;
-import org.apache.cassandra.serializers.InetAddressSerializer;
-import org.apache.cassandra.serializers.TypeSerializer;
-import org.apache.cassandra.utils.ByteBufferUtil;
+import org.apache.cassandra.locator.InetAddressAndPort;
 import org.apache.cassandra.utils.UUIDSerializer;
+
+import static org.apache.cassandra.locator.InetAddressAndPort.Serializer.inetAddressAndPortSerializer;
 
 public class FinalizePromise extends RepairMessage
 {
     public final UUID sessionID;
-    public final InetAddress participant;
+    public final InetAddressAndPort participant;
     public final boolean promised;
 
-    public FinalizePromise(UUID sessionID, InetAddress participant, boolean promised)
+    public FinalizePromise(UUID sessionID, InetAddressAndPort participant, boolean promised)
     {
-        super(Type.FINALIZE_PROMISE, null);
+        super(null);
         assert sessionID != null;
         assert participant != null;
         this.sessionID = sessionID;
@@ -66,28 +66,26 @@ public class FinalizePromise extends RepairMessage
         return result;
     }
 
-    public static MessageSerializer serializer = new MessageSerializer<FinalizePromise>()
+    public static final IVersionedSerializer<FinalizePromise> serializer = new IVersionedSerializer<FinalizePromise>()
     {
-        private TypeSerializer<InetAddress> inetSerializer = InetAddressSerializer.instance;
-
         public void serialize(FinalizePromise msg, DataOutputPlus out, int version) throws IOException
         {
             UUIDSerializer.serializer.serialize(msg.sessionID, out, version);
-            ByteBufferUtil.writeWithShortLength(inetSerializer.serialize(msg.participant), out);
+            inetAddressAndPortSerializer.serialize(msg.participant, out, version);
             out.writeBoolean(msg.promised);
         }
 
         public FinalizePromise deserialize(DataInputPlus in, int version) throws IOException
         {
             return new FinalizePromise(UUIDSerializer.serializer.deserialize(in, version),
-                                       inetSerializer.deserialize(ByteBufferUtil.readWithShortLength(in)),
+                                       inetAddressAndPortSerializer.deserialize(in, version),
                                        in.readBoolean());
         }
 
         public long serializedSize(FinalizePromise msg, int version)
         {
             long size = UUIDSerializer.serializer.serializedSize(msg.sessionID, version);
-            size += ByteBufferUtil.serializedSizeWithShortLength(inetSerializer.serialize(msg.participant));
+            size += inetAddressAndPortSerializer.serializedSize(msg.participant, version);
             size += TypeSizes.sizeof(msg.promised);
             return size;
         }

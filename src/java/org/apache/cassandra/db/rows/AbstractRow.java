@@ -17,8 +17,6 @@
 package org.apache.cassandra.db.rows;
 
 import java.nio.ByteBuffer;
-import java.security.MessageDigest;
-import java.util.AbstractCollection;
 import java.util.Objects;
 import java.util.function.Function;
 import java.util.stream.Collectors;
@@ -26,12 +24,12 @@ import java.util.stream.StreamSupport;
 
 import com.google.common.collect.Iterables;
 
-import org.apache.cassandra.schema.TableMetadata;
-import org.apache.cassandra.db.*;
+import org.apache.cassandra.db.Clustering;
+import org.apache.cassandra.db.Digest;
 import org.apache.cassandra.db.marshal.CollectionType;
 import org.apache.cassandra.db.marshal.UserType;
+import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.serializers.MarshalException;
-import org.apache.cassandra.utils.FBUtilities;
 
 /**
  * Base abstract class for {@code Row} implementations.
@@ -39,7 +37,7 @@ import org.apache.cassandra.utils.FBUtilities;
  * Unless you have a very good reason not to, every row implementation
  * should probably extend this class.
  */
-public abstract class AbstractRow extends AbstractCollection<ColumnData> implements Row
+public abstract class AbstractRow implements Row
 {
     public Unfiltered.Kind kind()
     {
@@ -61,16 +59,15 @@ public abstract class AbstractRow extends AbstractCollection<ColumnData> impleme
         return clustering() == Clustering.STATIC_CLUSTERING;
     }
 
-    public void digest(MessageDigest digest)
+    public void digest(Digest digest)
     {
-        FBUtilities.updateWithByte(digest, kind().ordinal());
+        digest.updateWithByte(kind().ordinal());
         clustering().digest(digest);
 
         deletion().digest(digest);
         primaryKeyLivenessInfo().digest(digest);
 
-        for (ColumnData cd : this)
-            cd.digest(digest);
+        apply(ColumnData::digest, digest);
     }
 
     public void validateData(TableMetadata metadata)
@@ -80,15 +77,40 @@ public abstract class AbstractRow extends AbstractCollection<ColumnData> impleme
         {
             ByteBuffer value = clustering.get(i);
             if (value != null)
-                metadata.comparator.subtype(i).validate(value);
+            {
+                try
+                {
+                    metadata.comparator.subtype(i).validate(value);
+                }
+                catch (Exception e)
+                {
+                    throw new MarshalException("comparator #" + i + " '" + metadata.comparator.subtype(i) + "' in '" + metadata + "' didn't validate", e);
+                }
+            }
         }
 
         primaryKeyLivenessInfo().validate();
         if (deletion().time().localDeletionTime() < 0)
-            throw new MarshalException("A local deletion time should not be negative");
+            throw new MarshalException("A local deletion time should not be negative in '" + metadata + "'");
 
+        apply(cd -> cd.validate());
+    }
+
+    public boolean hasInvalidDeletions()
+    {
+        if (primaryKeyLivenessInfo().isExpiring() && (primaryKeyLivenessInfo().ttl() < 0 || primaryKeyLivenessInfo().localExpirationTime() < 0))
+            return true;
+        if (!deletion().time().validate())
+            return true;
         for (ColumnData cd : this)
-            cd.validate();
+            if (cd.hasInvalidDeletions())
+                return true;
+        return false;
+    }
+
+    public String toString()
+    {
+        return columnData().toString();
     }
 
     public String toString(TableMetadata metadata)

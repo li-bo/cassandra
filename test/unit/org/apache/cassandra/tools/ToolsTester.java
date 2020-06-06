@@ -29,6 +29,7 @@ import java.security.Permission;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
+import java.util.Objects;
 import java.util.Set;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
@@ -38,6 +39,7 @@ import org.junit.BeforeClass;
 
 import org.slf4j.LoggerFactory;
 
+import static org.apache.cassandra.utils.FBUtilities.preventIllegalAccessWarnings;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
@@ -48,6 +50,11 @@ import static org.junit.Assert.fail;
  */
 public abstract class ToolsTester
 {
+    static
+    {
+        preventIllegalAccessWarnings();
+    }
+
     private static List<ThreadInfo> initialThreads;
 
     static final String[] EXPECTED_THREADS_WITH_SCHEMA = {
@@ -82,6 +89,7 @@ public abstract class ToolsTester
                               .collect(Collectors.toSet());
 
         Set<String> current = Arrays.stream(threads.getThreadInfo(threads.getAllThreadIds()))
+                                    .filter(Objects::nonNull)
                                     .map(ThreadInfo::getThreadName)
                                     .collect(Collectors.toSet());
 

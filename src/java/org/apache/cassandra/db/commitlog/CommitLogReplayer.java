@@ -26,14 +26,17 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Predicate;
-import com.google.common.collect.*;
+import com.google.common.collect.HashMultimap;
+import com.google.common.collect.Iterables;
+import com.google.common.collect.Multimap;
+import com.google.common.collect.Ordering;
+
 import org.apache.commons.lang3.StringUtils;
 import org.cliffc.high_scale_lib.NonBlockingHashSet;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import org.apache.cassandra.concurrent.Stage;
-import org.apache.cassandra.concurrent.StageManager;
 import org.apache.cassandra.config.Config;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.ColumnFamilyStore;
@@ -152,7 +155,7 @@ public class CommitLogReplayer implements CommitLogReadHandler
             sawCDCMutation = false;
             commitLogReader.readCommitLogSegment(this, file, globalPosition, i == filteredLogs.size());
             if (sawCDCMutation)
-                handleCDCReplayCompletion(clogs[i]);
+                handleCDCReplayCompletion(file);
         }
     }
 
@@ -249,7 +252,7 @@ public class CommitLogReplayer implements CommitLogReadHandler
                     //    b) have already been flushed,
                     // or c) are part of a cf that was dropped.
                     // Keep in mind that the cf.name() is suspect. do every thing based on the cfid instead.
-                    Mutation newMutation = null;
+                    Mutation.PartitionUpdateCollector newPUCollector = null;
                     for (PartitionUpdate update : commitLogReplayer.replayFilter.filter(mutation))
                     {
                         if (Schema.instance.getTableMetadata(update.metadata().id) == null)
@@ -259,22 +262,22 @@ public class CommitLogReplayer implements CommitLogReadHandler
                         // if it is the last known segment, if we are after the commit log segment position
                         if (commitLogReplayer.shouldReplay(update.metadata().id, new CommitLogPosition(segmentId, entryLocation)))
                         {
-                            if (newMutation == null)
-                                newMutation = new Mutation(mutation.getKeyspaceName(), mutation.key());
-                            newMutation.add(update);
+                            if (newPUCollector == null)
+                                newPUCollector = new Mutation.PartitionUpdateCollector(mutation.getKeyspaceName(), mutation.key());
+                            newPUCollector.add(update);
                             commitLogReplayer.replayedCount.incrementAndGet();
                         }
                     }
-                    if (newMutation != null)
+                    if (newPUCollector != null)
                     {
-                        assert !newMutation.isEmpty();
+                        assert !newPUCollector.isEmpty();
 
-                        Keyspace.open(newMutation.getKeyspaceName()).apply(newMutation, false, true, false);
+                        Keyspace.open(newPUCollector.getKeyspaceName()).apply(newPUCollector.build(), false, true, false);
                         commitLogReplayer.keyspacesReplayed.add(keyspace);
                     }
                 }
             };
-            return StageManager.getStage(Stage.MUTATION).submit(runnable, serializedSize);
+            return Stage.MUTATION.submit(runnable, serializedSize);
         }
     }
 

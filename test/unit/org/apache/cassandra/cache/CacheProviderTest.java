@@ -19,8 +19,6 @@
 package org.apache.cassandra.cache;
 
 import java.nio.ByteBuffer;
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
@@ -31,6 +29,7 @@ import org.junit.Test;
 import com.github.benmanes.caffeine.cache.Weigher;
 import org.apache.cassandra.SchemaLoader;
 import org.apache.cassandra.concurrent.NamedThreadFactory;
+import org.apache.cassandra.db.Digest;
 import org.apache.cassandra.db.RowUpdateBuilder;
 import org.apache.cassandra.db.marshal.AsciiType;
 import org.apache.cassandra.db.marshal.UTF8Type;
@@ -46,6 +45,7 @@ import org.apache.cassandra.schema.TableId;
 import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.utils.FBUtilities;
 
+import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNotSame;
@@ -104,18 +104,11 @@ public class CacheProviderTest
     private void assertDigests(IRowCacheEntry one, CachedBTreePartition two)
     {
         assertTrue(one instanceof CachedBTreePartition);
-        try
-        {
-            MessageDigest d1 = MessageDigest.getInstance("MD5");
-            MessageDigest d2 = MessageDigest.getInstance("MD5");
-            UnfilteredRowIterators.digest(((CachedBTreePartition) one).unfilteredIterator(), d1, MessagingService.current_version);
-            UnfilteredRowIterators.digest(((CachedBTreePartition) two).unfilteredIterator(), d2, MessagingService.current_version);
-            assertTrue(MessageDigest.isEqual(d1.digest(), d2.digest()));
-        }
-        catch (NoSuchAlgorithmException e)
-        {
-            throw new RuntimeException(e);
-        }
+        Digest d1 = Digest.forReadResponse();
+        Digest d2 = Digest.forReadResponse();
+        UnfilteredRowIterators.digest(((CachedBTreePartition) one).unfilteredIterator(), d1, MessagingService.current_version);
+        UnfilteredRowIterators.digest(((CachedBTreePartition) two).unfilteredIterator(), d2, MessagingService.current_version);
+        assertArrayEquals(d1.digest(), d2.digest());
     }
 
     private void concurrentCase(final CachedBTreePartition partition, final ICache<MeasureableString, IRowCacheEntry> cache) throws InterruptedException
@@ -192,6 +185,7 @@ public class CacheProviderTest
         assertEquals(key1.hashCode(), key2.hashCode());
 
         tm = TableMetadata.builder("ks", "tab.indexFoo", id1)
+                          .kind(TableMetadata.Kind.INDEX)
                           .addPartitionKeyColumn("pk", UTF8Type.instance)
                           .indexes(Indexes.of(IndexMetadata.fromSchemaMetadata("indexFoo", IndexMetadata.Kind.KEYS, Collections.emptyMap())))
                           .build();

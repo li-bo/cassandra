@@ -19,8 +19,8 @@
 package org.apache.cassandra.repair;
 
 import java.io.IOException;
-import java.net.InetAddress;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ExecutionException;
@@ -35,7 +35,7 @@ import org.apache.cassandra.dht.Murmur3Partitioner;
 import org.apache.cassandra.dht.Range;
 import org.apache.cassandra.dht.Token;
 import org.apache.cassandra.gms.Gossiper;
-import org.apache.cassandra.service.ActiveRepairService;
+import org.apache.cassandra.locator.InetAddressAndPort;
 import org.apache.cassandra.streaming.PreviewKind;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.UUIDGen;
@@ -54,7 +54,7 @@ public class RepairSessionTest
     @Test
     public void testConviction() throws Exception
     {
-        InetAddress remote = InetAddress.getByName("127.0.0.2");
+        InetAddressAndPort remote = InetAddressAndPort.getByName("127.0.0.2");
         Gossiper.instance.initializeNodeUnsafe(remote, UUID.randomUUID(), 1);
 
         // Set up RepairSession
@@ -62,11 +62,12 @@ public class RepairSessionTest
         UUID sessionId = UUID.randomUUID();
         IPartitioner p = Murmur3Partitioner.instance;
         Range<Token> repairRange = new Range<>(p.getToken(ByteBufferUtil.bytes(0)), p.getToken(ByteBufferUtil.bytes(100)));
-        Set<InetAddress> endpoints = Sets.newHashSet(remote);
-        RepairSession session = new RepairSession(parentSessionId, sessionId, Arrays.asList(repairRange),
+        Set<InetAddressAndPort> endpoints = Sets.newHashSet(remote);
+        RepairSession session = new RepairSession(parentSessionId, sessionId,
+                                                  new CommonRange(endpoints, Collections.emptySet(), Arrays.asList(repairRange)),
                                                   "Keyspace1", RepairParallelism.SEQUENTIAL,
-                                                  endpoints, false, false, false,
-                                                  PreviewKind.NONE, "Standard1");
+                                                  false, false, false,
+                                                  PreviewKind.NONE, false, "Standard1");
 
         // perform convict
         session.convict(remote, Double.MAX_VALUE);

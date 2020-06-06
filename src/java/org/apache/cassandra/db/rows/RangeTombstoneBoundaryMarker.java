@@ -18,7 +18,6 @@
 package org.apache.cassandra.db.rows;
 
 import java.nio.ByteBuffer;
-import java.security.MessageDigest;
 import java.util.Objects;
 
 import org.apache.cassandra.schema.TableMetadata;
@@ -115,6 +114,11 @@ public class RangeTombstoneBoundaryMarker extends AbstractRangeTombstoneMarker<C
         return true;
     }
 
+    public boolean hasInvalidDeletions()
+    {
+        return !startDeletion.validate() || !endDeletion.validate();
+    }
+
     public RangeTombstoneBoundaryMarker copy(AbstractAllocator allocator)
     {
         return new RangeTombstoneBoundaryMarker(clustering().copy(allocator), endDeletion, startDeletion);
@@ -136,15 +140,15 @@ public class RangeTombstoneBoundaryMarker extends AbstractRangeTombstoneMarker<C
 
     public RangeTombstoneBoundMarker createCorrespondingCloseMarker(boolean reversed)
     {
-        return new RangeTombstoneBoundMarker(closeBound(reversed), endDeletion);
+        return new RangeTombstoneBoundMarker(closeBound(reversed), closeDeletionTime(reversed));
     }
 
     public RangeTombstoneBoundMarker createCorrespondingOpenMarker(boolean reversed)
     {
-        return new RangeTombstoneBoundMarker(openBound(reversed), startDeletion);
+        return new RangeTombstoneBoundMarker(openBound(reversed), openDeletionTime(reversed));
     }
 
-    public void digest(MessageDigest digest)
+    public void digest(Digest digest)
     {
         bound.digest(digest);
         endDeletion.digest(digest);
@@ -153,7 +157,10 @@ public class RangeTombstoneBoundaryMarker extends AbstractRangeTombstoneMarker<C
 
     public String toString(TableMetadata metadata)
     {
-        return String.format("Marker %s@%d-%d", bound.toString(metadata), endDeletion.markedForDeleteAt(), startDeletion.markedForDeleteAt());
+        return String.format("Marker %s@%d/%d-%d/%d",
+                             bound.toString(metadata),
+                             endDeletion.markedForDeleteAt(), endDeletion.localDeletionTime(),
+                             startDeletion.markedForDeleteAt(), startDeletion.localDeletionTime());
     }
 
     @Override

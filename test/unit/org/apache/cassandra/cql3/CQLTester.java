@@ -23,6 +23,7 @@ import java.math.BigDecimal;
 import java.math.BigInteger;
 import java.net.InetAddress;
 import java.net.ServerSocket;
+import java.net.UnknownHostException;
 import java.nio.ByteBuffer;
 import java.util.*;
 import java.util.concurrent.CountDownLatch;
@@ -45,12 +46,19 @@ import com.datastax.driver.core.DataType;
 import com.datastax.driver.core.ResultSet;
 
 import org.apache.cassandra.SchemaLoader;
+import org.apache.cassandra.audit.AuditLogManager;
 import org.apache.cassandra.concurrent.ScheduledExecutors;
+import org.apache.cassandra.db.virtual.VirtualKeyspaceRegistry;
+import org.apache.cassandra.db.virtual.VirtualSchemaKeyspace;
+import org.apache.cassandra.index.SecondaryIndexManager;
+import org.apache.cassandra.config.EncryptionOptions;
+import org.apache.cassandra.locator.InetAddressAndPort;
+import org.apache.cassandra.locator.Replica;
+import org.apache.cassandra.locator.TokenMetadata;
+import org.apache.cassandra.metrics.ClientMetrics;
 import org.apache.cassandra.schema.*;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.cql3.functions.FunctionName;
-import org.apache.cassandra.cql3.functions.ThreadAwareSecurityManager;
-import org.apache.cassandra.cql3.statements.ParsedStatement;
 import org.apache.cassandra.db.*;
 import org.apache.cassandra.db.commitlog.CommitLog;
 import org.apache.cassandra.db.marshal.*;
@@ -60,6 +68,8 @@ import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.exceptions.SyntaxException;
 import org.apache.cassandra.io.util.FileUtils;
 import org.apache.cassandra.locator.AbstractEndpointSnitch;
+import org.apache.cassandra.schema.IndexMetadata;
+import org.apache.cassandra.schema.KeyspaceMetadata;
 import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.serializers.TypeSerializer;
 import org.apache.cassandra.service.ClientState;
@@ -70,6 +80,7 @@ import org.apache.cassandra.transport.ProtocolVersion;
 import org.apache.cassandra.transport.messages.ResultMessage;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.security.ThreadAwareSecurityManager;
 
 import static junit.framework.Assert.assertNotNull;
 
@@ -88,13 +99,15 @@ public abstract class CQLTester
     private static final AtomicInteger seqNumber = new AtomicInteger();
     protected static final ByteBuffer TOO_BIG = ByteBuffer.allocate(FBUtilities.MAX_UNSIGNED_SHORT + 1024);
     public static final String DATA_CENTER = "datacenter1";
+    public static final String DATA_CENTER_REMOTE = "datacenter2";
     public static final String RACK1 = "rack1";
 
     private static org.apache.cassandra.transport.Server server;
     protected static final int nativePort;
     protected static final InetAddress nativeAddr;
+    protected static final Set<InetAddressAndPort> remoteAddrs = new HashSet<>();
     private static final Map<ProtocolVersion, Cluster> clusters = new HashMap<>();
-    private static final Map<ProtocolVersion, Session> sessions = new HashMap<>();
+    protected static final Map<ProtocolVersion, Session> sessions = new HashMap<>();
 
     private static boolean isServerPrepared = false;
 
@@ -142,9 +155,13 @@ public abstract class CQLTester
         // Register an EndpointSnitch which returns fixed values for test.
         DatabaseDescriptor.setEndpointSnitch(new AbstractEndpointSnitch()
         {
-            @Override public String getRack(InetAddress endpoint) { return RACK1; }
-            @Override public String getDatacenter(InetAddress endpoint) { return DATA_CENTER; }
-            @Override public int compareEndpoints(InetAddress target, InetAddress a1, InetAddress a2) { return 0; }
+            @Override public String getRack(InetAddressAndPort endpoint) { return RACK1; }
+            @Override public String getDatacenter(InetAddressAndPort endpoint) {
+                if (remoteAddrs.contains(endpoint))
+                    return DATA_CENTER_REMOTE;
+                return DATA_CENTER;
+            }
+            @Override public int compareEndpoints(InetAddressAndPort target, Replica a1, Replica a2) { return 0; }
         });
 
         try
@@ -185,6 +202,8 @@ public abstract class CQLTester
             return;
 
         DatabaseDescriptor.daemonInitialization();
+        DatabaseDescriptor.setTransientReplicationEnabledUnsafe(true);
+        CommitLog.instance.start();
 
         // Cleanup first
         try
@@ -194,6 +213,15 @@ public abstract class CQLTester
         catch (IOException e)
         {
             logger.error("Failed to cleanup and recreate directories.");
+            throw new RuntimeException(e);
+        }
+
+        try {
+            remoteAddrs.add(InetAddressAndPort.getByName("127.0.0.4"));
+        }
+        catch (UnknownHostException e)
+        {
+            logger.error("Failed to lookup host");
             throw new RuntimeException(e);
         }
 
@@ -209,12 +237,14 @@ public abstract class CQLTester
 
         Keyspace.setInitialized();
         SystemKeyspace.persistLocalMetadata();
+        AuditLogManager.instance.initialize();
         isServerPrepared = true;
     }
 
     public static void cleanupAndLeaveDirs() throws IOException
     {
         // We need to stop and unmap all CLS instances prior to cleanup() or we'll get failures on Windows.
+        CommitLog.instance.start();
         CommitLog.instance.stopUnsafe(true);
         mkdirs();
         cleanup();
@@ -270,7 +300,6 @@ public abstract class CQLTester
     {
         if (ROW_CACHE_SIZE_IN_MB > 0)
             DatabaseDescriptor.setRowCacheSizeInMB(ROW_CACHE_SIZE_IN_MB);
-
         StorageService.instance.setPartitionerUnsafe(Murmur3Partitioner.instance);
 
         // Once per-JVM is enough
@@ -292,6 +321,9 @@ public abstract class CQLTester
         // statements are not cached but re-prepared every time). So we clear the cache between test files to avoid accumulating too much.
         if (reusePrepared)
             QueryProcessor.clearInternalStatementsCache();
+
+        TokenMetadata metadata = StorageService.instance.getTokenMetadata();
+        metadata.clearUnsafe();
     }
 
     @Before
@@ -375,10 +407,13 @@ public abstract class CQLTester
             return;
 
         SystemKeyspace.finishStartup();
+        VirtualKeyspaceRegistry.instance.register(VirtualSchemaKeyspace.instance);
+
         StorageService.instance.initServer();
         SchemaLoader.startGossiper();
 
         server = new Server.Builder().withHost(nativeAddr).withPort(nativePort).build();
+        ClientMetrics.instance.init(Collections.singleton(server));
         server.start();
 
         for (ProtocolVersion version : PROTOCOL_VERSIONS)
@@ -386,12 +421,18 @@ public abstract class CQLTester
             if (clusters.containsKey(version))
                 continue;
 
-            Cluster cluster = Cluster.builder()
-                                     .addContactPoints(nativeAddr)
-                                     .withClusterName("Test Cluster")
-                                     .withPort(nativePort)
-                                     .withProtocolVersion(com.datastax.driver.core.ProtocolVersion.fromInt(version.asInt()))
-                                     .build();
+            Cluster.Builder builder = Cluster.builder()
+                                             .withoutJMXReporting()
+                                             .addContactPoints(nativeAddr)
+                                             .withClusterName("Test Cluster")
+                                             .withPort(nativePort);
+
+            if (version.isBeta())
+                builder = builder.allowBetaProtocolVersion();
+            else
+                builder = builder.withProtocolVersion(com.datastax.driver.core.ProtocolVersion.fromInt(version.asInt()));
+
+            Cluster cluster = builder.build();
             clusters.put(version, cluster);
             sessions.put(version, cluster.connect());
 
@@ -534,6 +575,13 @@ public abstract class CQLTester
         return tables.get(tables.size() - 1);
     }
 
+    protected String currentKeyspace()
+    {
+        if (keyspaces.isEmpty())
+            return null;
+        return keyspaces.get(keyspaces.size() - 1);
+    }
+
     protected ByteBuffer unset()
     {
         return ByteBufferUtil.UNSET_BYTE_BUFFER;
@@ -603,6 +651,20 @@ public abstract class CQLTester
         return currentKeyspace;
     }
 
+    protected void alterKeyspace(String query)
+    {
+        String fullQuery = String.format(query, currentKeyspace());
+        logger.info(fullQuery);
+        schemaChange(fullQuery);
+    }
+ 
+    protected void alterKeyspaceMayThrow(String query) throws Throwable
+    {
+        String fullQuery = String.format(query, currentKeyspace());
+        logger.info(fullQuery);
+        QueryProcessor.executeOnceInternal(fullQuery);
+    }
+    
     protected String createKeyspaceName()
     {
         String currentKeyspace = "keyspace_" + seqNumber.getAndIncrement();
@@ -697,7 +759,13 @@ public abstract class CQLTester
             throw new IllegalArgumentException("Table name should be specified: " + formattedQuery);
 
         String column = matcher.group(9);
-        return Indexes.getAvailableIndexName(keyspace, table, Strings.isNullOrEmpty(column) ? null : column);
+
+        String baseName = Strings.isNullOrEmpty(column)
+                        ? IndexMetadata.generateDefaultIndexName(table)
+                        : IndexMetadata.generateDefaultIndexName(table, new ColumnIdentifier(column, true));
+
+        KeyspaceMetadata ks = Schema.instance.getKeyspaceMetadata(keyspace);
+        return ks.findAvailableIndexName(baseName);
     }
 
     /**
@@ -728,6 +796,38 @@ public abstract class CQLTester
         }
 
         return indexCreated;
+    }
+
+    /**
+     * Index creation is asynchronous, this method waits until the specified index hasn't any building task running.
+     * <p>
+     * This method differs from {@link #waitForIndex(String, String, String)} in that it doesn't require the index to be
+     * fully nor successfully built, so it can be used to wait for failing index builds.
+     *
+     * @param keyspace the index keyspace name
+     * @param indexName the index name
+     * @return {@code true} if the index build tasks have finished in 5 seconds, {@code false} otherwise
+     */
+    protected boolean waitForIndexBuilds(String keyspace, String indexName) throws InterruptedException
+    {
+        long start = System.currentTimeMillis();
+        SecondaryIndexManager indexManager = getCurrentColumnFamilyStore(keyspace).indexManager;
+
+        while (true)
+        {
+            if (!indexManager.isIndexBuilding(indexName))
+            {
+                return true;
+            }
+            else if (System.currentTimeMillis() - start > 5000)
+            {
+                return false;
+            }
+            else
+            {
+                Thread.sleep(10);
+            }
+        }
     }
 
     protected void createIndexMayThrow(String query) throws Throwable
@@ -761,16 +861,15 @@ public abstract class CQLTester
     {
         try
         {
-            ClientState state = ClientState.forInternalCalls();
-            state.setKeyspace(SchemaConstants.SYSTEM_KEYSPACE_NAME);
+            ClientState state = ClientState.forInternalCalls(SchemaConstants.SYSTEM_KEYSPACE_NAME);
             QueryState queryState = new QueryState(state);
 
-            ParsedStatement.Prepared prepared = QueryProcessor.parseStatement(query, queryState.getClientState());
-            prepared.statement.validate(state);
+            CQLStatement statement = QueryProcessor.parseStatement(query, queryState.getClientState());
+            statement.validate(state);
 
             QueryOptions options = QueryOptions.forInternalCalls(Collections.<ByteBuffer>emptyList());
 
-            lastSchemaChangeResult = prepared.statement.executeInternal(queryState, options);
+            lastSchemaChangeResult = statement.executeLocally(queryState, options);
         }
         catch (Exception e)
         {
@@ -789,6 +888,16 @@ public abstract class CQLTester
         return sessionNet(protocolVersion).execute(formatQuery(query), values);
     }
 
+    protected com.datastax.driver.core.ResultSet executeNet(String query, Object... values) throws Throwable
+    {
+        return sessionNet().execute(formatQuery(query), values);
+    }
+
+    protected com.datastax.driver.core.ResultSet executeNetWithPaging(ProtocolVersion version, String query, int pageSize) throws Throwable
+    {
+        return sessionNet(version).execute(new SimpleStatement(formatQuery(query)).setFetchSize(pageSize));
+    }
+
     protected com.datastax.driver.core.ResultSet executeNetWithPaging(String query, int pageSize) throws Throwable
     {
         return sessionNet().execute(new SimpleStatement(formatQuery(query)).setFetchSize(pageSize));
@@ -804,6 +913,16 @@ public abstract class CQLTester
         requireNetwork();
 
         return sessions.get(protocolVersion);
+    }
+
+    protected SimpleClient newSimpleClient(ProtocolVersion version, boolean compression, boolean checksums, boolean isOverloadedException) throws IOException
+    {
+        return new SimpleClient(nativeAddr.getHostAddress(), nativePort, version, version.isBeta(), new EncryptionOptions()).connect(compression, checksums, isOverloadedException);
+    }
+
+    protected SimpleClient newSimpleClient(ProtocolVersion version, boolean compression, boolean checksums) throws IOException
+    {
+        return newSimpleClient(version, compression, checksums, false);
     }
 
     protected String formatQuery(String query)
@@ -1594,7 +1713,7 @@ public abstract class CQLTester
         return m;
     }
 
-    protected com.datastax.driver.core.TupleType tupleTypeOf(ProtocolVersion protocolVersion, DataType...types)
+    protected com.datastax.driver.core.TupleType tupleTypeOf(ProtocolVersion protocolVersion, com.datastax.driver.core.DataType...types)
     {
         requireNetwork();
         return clusters.get(protocolVersion).getMetadata().newTupleType(types);

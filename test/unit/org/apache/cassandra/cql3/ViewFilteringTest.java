@@ -28,11 +28,10 @@ import org.junit.Ignore;
 import org.junit.Test;
 
 import com.datastax.driver.core.exceptions.InvalidQueryException;
-import junit.framework.Assert;
+import org.junit.Assert;
 
 import org.apache.cassandra.concurrent.SEPExecutor;
 import org.apache.cassandra.concurrent.Stage;
-import org.apache.cassandra.concurrent.StageManager;
 import org.apache.cassandra.db.Keyspace;
 import org.apache.cassandra.db.SystemKeyspace;
 import org.apache.cassandra.transport.ProtocolVersion;
@@ -80,8 +79,8 @@ public class ViewFilteringTest extends CQLTester
     private void updateView(String query, Object... params) throws Throwable
     {
         executeNet(protocolVersion, query, params);
-        while (!(((SEPExecutor) StageManager.getStage(Stage.VIEW_MUTATION)).getPendingTasks() == 0
-                 && ((SEPExecutor) StageManager.getStage(Stage.VIEW_MUTATION)).getActiveCount() == 0))
+        while (!(((SEPExecutor) Stage.VIEW_MUTATION.executor()).getPendingTaskCount() == 0
+                 && ((SEPExecutor) Stage.VIEW_MUTATION.executor()).getActiveTaskCount() == 0))
         {
             Thread.sleep(1);
         }
@@ -1848,7 +1847,7 @@ public class ViewFilteringTest extends CQLTester
         executeNet(protocolVersion, "USE " + keyspace());
 
         try {
-            createView("mv_test", "CREATE MATERIALIZED VIEW %s AS SELECT * FROM %%s WHERE b IS NOT NULL AND c IS NOT NULL AND d = 1 PRIMARY KEY (a, b, c)");
+            createView("mv_test", "CREATE MATERIALIZED VIEW %s AS SELECT * FROM %%s WHERE a IS NOT NULL AND b IS NOT NULL AND c IS NOT NULL AND d = 1 PRIMARY KEY (a, b, c)");
             dropView("mv_test");
         } catch(Exception e) {
             throw new RuntimeException("MV creation with non primary column restrictions failed.", e);

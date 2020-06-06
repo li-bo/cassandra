@@ -22,9 +22,14 @@ import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
 import java.util.List;
 import java.util.Random;
+import java.util.UUID;
 
+import com.google.common.collect.Lists;
+import com.google.common.collect.Iterables;
 import org.junit.After;
 import org.junit.Assert;
 import org.junit.BeforeClass;
@@ -36,10 +41,25 @@ import org.slf4j.LoggerFactory;
 
 import org.apache.cassandra.SchemaLoader;
 import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.cql3.QueryOptions;
 import org.apache.cassandra.cql3.QueryProcessor;
 import org.apache.cassandra.cql3.UntypedResultSet;
+import org.apache.cassandra.cql3.statements.SelectStatement;
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.Keyspace;
+import org.apache.cassandra.db.compaction.AbstractCompactionTask;
+import org.apache.cassandra.db.compaction.CompactionManager;
+import org.apache.cassandra.db.compaction.Verifier;
+import org.apache.cassandra.db.repair.PendingAntiCompaction;
+import org.apache.cassandra.db.streaming.CassandraOutgoingFile;
+import org.apache.cassandra.db.ReadExecutionController;
+import org.apache.cassandra.db.SinglePartitionReadCommand;
+import org.apache.cassandra.db.SinglePartitionSliceCommandTest;
+import org.apache.cassandra.db.compaction.Verifier;
+import org.apache.cassandra.db.partitions.UnfilteredPartitionIterator;
+import org.apache.cassandra.db.rows.RangeTombstoneMarker;
+import org.apache.cassandra.db.rows.Unfiltered;
+import org.apache.cassandra.db.rows.UnfilteredRowIterator;
 import org.apache.cassandra.dht.IPartitioner;
 import org.apache.cassandra.dht.Range;
 import org.apache.cassandra.dht.Token;
@@ -48,13 +68,23 @@ import org.apache.cassandra.io.sstable.format.SSTableFormat;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.io.sstable.format.Version;
 import org.apache.cassandra.io.sstable.format.big.BigFormat;
+import org.apache.cassandra.service.ActiveRepairService;
 import org.apache.cassandra.service.CacheService;
+import org.apache.cassandra.service.ClientState;
 import org.apache.cassandra.service.StorageService;
+import org.apache.cassandra.streaming.OutgoingStream;
 import org.apache.cassandra.streaming.StreamPlan;
 import org.apache.cassandra.streaming.StreamSession;
 import org.apache.cassandra.streaming.StreamOperation;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.UUIDGen;
+
+import static org.apache.cassandra.service.ActiveRepairService.NO_PENDING_REPAIR;
+import static org.apache.cassandra.service.ActiveRepairService.UNREPAIRED_SSTABLE;
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.fail;
 
 /**
  * Tests backwards compatibility for SSTables
@@ -92,8 +122,8 @@ public class LegacySSTableTest
     public static void defineSchema() throws ConfigurationException
     {
         String scp = System.getProperty(LEGACY_SSTABLE_PROP);
-        Assert.assertNotNull("System property " + LEGACY_SSTABLE_ROOT + " not set", scp);
-        
+        Assert.assertNotNull("System property " + LEGACY_SSTABLE_PROP + " not set", scp);
+
         LEGACY_SSTABLE_ROOT = new File(scp).getAbsoluteFile();
         Assert.assertTrue("System property " + LEGACY_SSTABLE_ROOT + " does not specify a directory", LEGACY_SSTABLE_ROOT.isDirectory());
 
@@ -146,6 +176,118 @@ public class LegacySSTableTest
         doTestLegacyCqlTables();
     }
 
+    @Test
+    public void testMutateMetadata() throws Exception
+    {
+        // we need to make sure we write old version metadata in the format for that version
+        for (String legacyVersion : legacyVersions)
+        {
+            logger.info("Loading legacy version: {}", legacyVersion);
+            truncateLegacyTables(legacyVersion);
+            loadLegacyTables(legacyVersion);
+            CacheService.instance.invalidateKeyCache();
+
+            for (ColumnFamilyStore cfs : Keyspace.open("legacy_tables").getColumnFamilyStores())
+            {
+                for (SSTableReader sstable : cfs.getLiveSSTables())
+                {
+                    sstable.descriptor.getMetadataSerializer().mutateRepairMetadata(sstable.descriptor, 1234, NO_PENDING_REPAIR, false);
+                    sstable.reloadSSTableMetadata();
+                    assertEquals(1234, sstable.getRepairedAt());
+                    if (sstable.descriptor.version.hasPendingRepair())
+                        assertEquals(NO_PENDING_REPAIR, sstable.getPendingRepair());
+                }
+
+                boolean isTransient = false;
+                for (SSTableReader sstable : cfs.getLiveSSTables())
+                {
+                    UUID random = UUID.randomUUID();
+                    sstable.descriptor.getMetadataSerializer().mutateRepairMetadata(sstable.descriptor, UNREPAIRED_SSTABLE, random, isTransient);
+                    sstable.reloadSSTableMetadata();
+                    assertEquals(UNREPAIRED_SSTABLE, sstable.getRepairedAt());
+                    if (sstable.descriptor.version.hasPendingRepair())
+                        assertEquals(random, sstable.getPendingRepair());
+                    if (sstable.descriptor.version.hasIsTransient())
+                        assertEquals(isTransient, sstable.isTransient());
+
+                    isTransient = !isTransient;
+                }
+            }
+        }
+    }
+
+    @Test
+    public void testMutateMetadataCSM() throws Exception
+    {
+        // we need to make sure we write old version metadata in the format for that version
+        for (String legacyVersion : legacyVersions)
+        {
+            // Skip 2.0.1 sstables as it doesn't have repaired information
+            if (legacyVersion.equals("jb"))
+                continue;
+            truncateTables(legacyVersion);
+            loadLegacyTables(legacyVersion);
+
+            for (ColumnFamilyStore cfs : Keyspace.open("legacy_tables").getColumnFamilyStores())
+            {
+                // set pending
+                for (SSTableReader sstable : cfs.getLiveSSTables())
+                {
+                    UUID random = UUID.randomUUID();
+                    try
+                    {
+                        cfs.getCompactionStrategyManager().mutateRepaired(Collections.singleton(sstable), UNREPAIRED_SSTABLE, random, false);
+                        if (!sstable.descriptor.version.hasPendingRepair())
+                            fail("We should fail setting pending repair on unsupported sstables "+sstable);
+                    }
+                    catch (IllegalStateException e)
+                    {
+                        if (sstable.descriptor.version.hasPendingRepair())
+                            fail("We should succeed setting pending repair on "+legacyVersion + " sstables, failed on "+sstable);
+                    }
+                }
+                // set transient
+                for (SSTableReader sstable : cfs.getLiveSSTables())
+                {
+                    try
+                    {
+                        cfs.getCompactionStrategyManager().mutateRepaired(Collections.singleton(sstable), UNREPAIRED_SSTABLE, UUID.randomUUID(), true);
+                        if (!sstable.descriptor.version.hasIsTransient())
+                            fail("We should fail setting pending repair on unsupported sstables "+sstable);
+                    }
+                    catch (IllegalStateException e)
+                    {
+                        if (sstable.descriptor.version.hasIsTransient())
+                            fail("We should succeed setting pending repair on "+legacyVersion + " sstables, failed on "+sstable);
+                    }
+                }
+            }
+        }
+    }
+
+    @Test
+    public void testMutateLevel() throws Exception
+    {
+        // we need to make sure we write old version metadata in the format for that version
+        for (String legacyVersion : legacyVersions)
+        {
+            logger.info("Loading legacy version: {}", legacyVersion);
+            truncateLegacyTables(legacyVersion);
+            loadLegacyTables(legacyVersion);
+            CacheService.instance.invalidateKeyCache();
+
+            for (ColumnFamilyStore cfs : Keyspace.open("legacy_tables").getColumnFamilyStores())
+            {
+                for (SSTableReader sstable : cfs.getLiveSSTables())
+                {
+                    sstable.descriptor.getMetadataSerializer().mutateLevel(sstable.descriptor, 1234);
+                    sstable.reloadSSTableMetadata();
+                    assertEquals(1234, sstable.getSSTableLevel());
+                }
+            }
+        }
+    }
+
     private void doTestLegacyCqlTables() throws Exception
     {
         for (String legacyVersion : legacyVersions)
@@ -171,68 +313,163 @@ public class LegacySSTableTest
         }
     }
 
-    private void streamLegacyTables(String legacyVersion) throws Exception
+    @Test
+    public void testInaccurateSSTableMinMax() throws Exception
     {
-        for (int compact = 0; compact <= 1; compact++)
+        QueryProcessor.executeInternal("CREATE TABLE legacy_tables.legacy_mc_inaccurate_min_max (k int, c1 int, c2 int, c3 int, v int, primary key (k, c1, c2, c3))");
+        loadLegacyTable("legacy_%s_inaccurate_min_max", "mc");
+
+        /*
+         sstable has the following mutations:
+            INSERT INTO legacy_tables.legacy_mc_inaccurate_min_max (k, c1, c2, c3, v) VALUES (100, 4, 4, 4, 4)
+            DELETE FROM legacy_tables.legacy_mc_inaccurate_min_max WHERE k=100 AND c1<3
+         */
+
+        String query = "SELECT * FROM legacy_tables.legacy_mc_inaccurate_min_max WHERE k=100 AND c1=1 AND c2=1";
+        List<Unfiltered> unfiltereds = SinglePartitionSliceCommandTest.getUnfilteredsFromSinglePartition(query);
+        Assert.assertEquals(2, unfiltereds.size());
+        Assert.assertTrue(unfiltereds.get(0).isRangeTombstoneMarker());
+        Assert.assertTrue(((RangeTombstoneMarker) unfiltereds.get(0)).isOpen(false));
+        Assert.assertTrue(unfiltereds.get(1).isRangeTombstoneMarker());
+        Assert.assertTrue(((RangeTombstoneMarker) unfiltereds.get(1)).isClose(false));
+    }
+
+    @Test
+    public void testVerifyOldSSTables() throws IOException
+    {
+        for (String legacyVersion : legacyVersions)
         {
-            logger.info("Streaming legacy version {}{}", legacyVersion, getCompactNameSuffix(compact));
-            streamLegacyTable("legacy_%s_simple%s", legacyVersion, getCompactNameSuffix(compact));
-            streamLegacyTable("legacy_%s_simple_counter%s", legacyVersion, getCompactNameSuffix(compact));
-            streamLegacyTable("legacy_%s_clust%s", legacyVersion, getCompactNameSuffix(compact));
-            streamLegacyTable("legacy_%s_clust_counter%s", legacyVersion, getCompactNameSuffix(compact));
+            ColumnFamilyStore cfs = Keyspace.open("legacy_tables").getColumnFamilyStore(String.format("legacy_%s_simple", legacyVersion));
+            loadLegacyTable("legacy_%s_simple", legacyVersion);
+
+            for (SSTableReader sstable : cfs.getLiveSSTables())
+            {
+                try (Verifier verifier = new Verifier(cfs, sstable, false, Verifier.options().checkVersion(true).build()))
+                {
+                    verifier.verify();
+                    if (!sstable.descriptor.version.isLatestVersion())
+                        fail("Verify should throw RuntimeException for old sstables "+sstable);
+                }
+                catch (RuntimeException e)
+                {}
+            }
+            // make sure we don't throw any exception if not checking version:
+            for (SSTableReader sstable : cfs.getLiveSSTables())
+            {
+                try (Verifier verifier = new Verifier(cfs, sstable, false, Verifier.options().checkVersion(false).build()))
+                {
+                    verifier.verify();
+                }
+                catch (Throwable e)
+                {
+                    fail("Verify should throw RuntimeException for old sstables "+sstable);
+                }
+            }
         }
     }
 
-    private void streamLegacyTable(String tablePattern, String legacyVersion, String compactNameSuffix) throws Exception
+    @Test
+    public void testPendingAntiCompactionOldSSTables() throws Exception
     {
-        String table = String.format(tablePattern, legacyVersion, compactNameSuffix);
+        for (String legacyVersion : legacyVersions)
+        {
+            ColumnFamilyStore cfs = Keyspace.open("legacy_tables").getColumnFamilyStore(String.format("legacy_%s_simple", legacyVersion));
+            loadLegacyTable("legacy_%s_simple", legacyVersion);
+
+            boolean shouldFail = !cfs.getLiveSSTables().stream().allMatch(sstable -> sstable.descriptor.version.hasPendingRepair());
+            IPartitioner p = Iterables.getFirst(cfs.getLiveSSTables(), null).getPartitioner();
+            Range<Token> r = new Range<>(p.getMinimumToken(), p.getMinimumToken());
+            PendingAntiCompaction.AcquisitionCallable acquisitionCallable = new PendingAntiCompaction.AcquisitionCallable(cfs, Collections.singleton(r), UUIDGen.getTimeUUID(), 0, 0);
+            PendingAntiCompaction.AcquireResult res = acquisitionCallable.call();
+            assertEquals(shouldFail, res == null);
+            if (res != null)
+                res.abort();
+        }
+    }
+
+    @Test
+    public void testAutomaticUpgrade() throws Exception
+    {
+        for (String legacyVersion : legacyVersions)
+        {
+            logger.info("Loading legacy version: {}", legacyVersion);
+            truncateLegacyTables(legacyVersion);
+            loadLegacyTables(legacyVersion);
+            ColumnFamilyStore cfs = Keyspace.open("legacy_tables").getColumnFamilyStore(String.format("legacy_%s_simple", legacyVersion));
+            AbstractCompactionTask act = cfs.getCompactionStrategyManager().getNextBackgroundTask(0);
+            // there should be no compactions to run with auto upgrades disabled:
+            assertEquals(null, act);
+        }
+
+        DatabaseDescriptor.setAutomaticSSTableUpgradeEnabled(true);
+        for (String legacyVersion : legacyVersions)
+        {
+            logger.info("Loading legacy version: {}", legacyVersion);
+            truncateLegacyTables(legacyVersion);
+            loadLegacyTables(legacyVersion);
+            ColumnFamilyStore cfs = Keyspace.open("legacy_tables").getColumnFamilyStore(String.format("legacy_%s_simple", legacyVersion));
+            if (cfs.getLiveSSTables().stream().anyMatch(s -> !s.descriptor.version.isLatestVersion()))
+                assertTrue(cfs.metric.oldVersionSSTableCount.getValue() > 0);
+            while (cfs.getLiveSSTables().stream().anyMatch(s -> !s.descriptor.version.isLatestVersion()))
+            {
+                CompactionManager.instance.submitBackground(cfs);
+                Thread.sleep(100);
+            }
+            assertTrue(cfs.metric.oldVersionSSTableCount.getValue() == 0);
+        }
+        DatabaseDescriptor.setAutomaticSSTableUpgradeEnabled(false);
+    }
+
+    private void streamLegacyTables(String legacyVersion) throws Exception
+    {
+            logger.info("Streaming legacy version {}", legacyVersion);
+            streamLegacyTable("legacy_%s_simple", legacyVersion);
+            streamLegacyTable("legacy_%s_simple_counter", legacyVersion);
+            streamLegacyTable("legacy_%s_clust", legacyVersion);
+            streamLegacyTable("legacy_%s_clust_counter", legacyVersion);
+    }
+
+    private void streamLegacyTable(String tablePattern, String legacyVersion) throws Exception
+    {
+        String table = String.format(tablePattern, legacyVersion);
         SSTableReader sstable = SSTableReader.open(getDescriptor(legacyVersion, table));
         IPartitioner p = sstable.getPartitioner();
         List<Range<Token>> ranges = new ArrayList<>();
         ranges.add(new Range<>(p.getMinimumToken(), p.getToken(ByteBufferUtil.bytes("100"))));
         ranges.add(new Range<>(p.getToken(ByteBufferUtil.bytes("100")), p.getMinimumToken()));
-        ArrayList<StreamSession.SSTableStreamingSections> details = new ArrayList<>();
-        details.add(new StreamSession.SSTableStreamingSections(sstable.ref(),
-                                                               sstable.getPositionsForRanges(ranges),
-                                                               sstable.estimatedKeysForRanges(ranges)));
-        new StreamPlan(StreamOperation.OTHER).transferFiles(FBUtilities.getBroadcastAddress(), details)
-                                  .execute().get();
+        List<OutgoingStream> streams = Lists.newArrayList(new CassandraOutgoingFile(StreamOperation.OTHER,
+                                                                                    sstable.ref(),
+                                                                                    sstable.getPositionsForRanges(ranges),
+                                                                                    ranges,
+                                                                                    sstable.estimatedKeysForRanges(ranges)));
+        new StreamPlan(StreamOperation.OTHER).transferStreams(FBUtilities.getBroadcastAddressAndPort(), streams).execute().get();
     }
 
     private static void truncateLegacyTables(String legacyVersion) throws Exception
     {
-        for (int compact = 0; compact <= 1; compact++)
-        {
-            logger.info("Truncating legacy version {}{}", legacyVersion, getCompactNameSuffix(compact));
-            Keyspace.open("legacy_tables").getColumnFamilyStore(String.format("legacy_%s_simple%s", legacyVersion, getCompactNameSuffix(compact))).truncateBlocking();
-            Keyspace.open("legacy_tables").getColumnFamilyStore(String.format("legacy_%s_simple_counter%s", legacyVersion, getCompactNameSuffix(compact))).truncateBlocking();
-            Keyspace.open("legacy_tables").getColumnFamilyStore(String.format("legacy_%s_clust%s", legacyVersion, getCompactNameSuffix(compact))).truncateBlocking();
-            Keyspace.open("legacy_tables").getColumnFamilyStore(String.format("legacy_%s_clust_counter%s", legacyVersion, getCompactNameSuffix(compact))).truncateBlocking();
-        }
+        logger.info("Truncating legacy version {}", legacyVersion);
+        Keyspace.open("legacy_tables").getColumnFamilyStore(String.format("legacy_%s_simple", legacyVersion)).truncateBlocking();
+        Keyspace.open("legacy_tables").getColumnFamilyStore(String.format("legacy_%s_simple_counter", legacyVersion)).truncateBlocking();
+        Keyspace.open("legacy_tables").getColumnFamilyStore(String.format("legacy_%s_clust", legacyVersion)).truncateBlocking();
+        Keyspace.open("legacy_tables").getColumnFamilyStore(String.format("legacy_%s_clust_counter", legacyVersion)).truncateBlocking();
     }
 
     private static void compactLegacyTables(String legacyVersion) throws Exception
     {
-        for (int compact = 0; compact <= 1; compact++)
-        {
-            logger.info("Compacting legacy version {}{}", legacyVersion, getCompactNameSuffix(compact));
-            Keyspace.open("legacy_tables").getColumnFamilyStore(String.format("legacy_%s_simple%s", legacyVersion, getCompactNameSuffix(compact))).forceMajorCompaction();
-            Keyspace.open("legacy_tables").getColumnFamilyStore(String.format("legacy_%s_simple_counter%s", legacyVersion, getCompactNameSuffix(compact))).forceMajorCompaction();
-            Keyspace.open("legacy_tables").getColumnFamilyStore(String.format("legacy_%s_clust%s", legacyVersion, getCompactNameSuffix(compact))).forceMajorCompaction();
-            Keyspace.open("legacy_tables").getColumnFamilyStore(String.format("legacy_%s_clust_counter%s", legacyVersion, getCompactNameSuffix(compact))).forceMajorCompaction();
-        }
+        logger.info("Compacting legacy version {}", legacyVersion);
+        Keyspace.open("legacy_tables").getColumnFamilyStore(String.format("legacy_%s_simple", legacyVersion)).forceMajorCompaction();
+        Keyspace.open("legacy_tables").getColumnFamilyStore(String.format("legacy_%s_simple_counter", legacyVersion)).forceMajorCompaction();
+        Keyspace.open("legacy_tables").getColumnFamilyStore(String.format("legacy_%s_clust", legacyVersion)).forceMajorCompaction();
+        Keyspace.open("legacy_tables").getColumnFamilyStore(String.format("legacy_%s_clust_counter", legacyVersion)).forceMajorCompaction();
     }
 
     private static void loadLegacyTables(String legacyVersion) throws Exception
     {
-        for (int compact = 0; compact <= 1; compact++)
-        {
-            logger.info("Preparing legacy version {}{}", legacyVersion, getCompactNameSuffix(compact));
-            loadLegacyTable("legacy_%s_simple%s", legacyVersion, getCompactNameSuffix(compact));
-            loadLegacyTable("legacy_%s_simple_counter%s", legacyVersion, getCompactNameSuffix(compact));
-            loadLegacyTable("legacy_%s_clust%s", legacyVersion, getCompactNameSuffix(compact));
-            loadLegacyTable("legacy_%s_clust_counter%s", legacyVersion, getCompactNameSuffix(compact));
-        }
+            logger.info("Preparing legacy version {}", legacyVersion);
+            loadLegacyTable("legacy_%s_simple", legacyVersion);
+            loadLegacyTable("legacy_%s_simple_counter", legacyVersion);
+            loadLegacyTable("legacy_%s_clust", legacyVersion);
+            loadLegacyTable("legacy_%s_clust_counter", legacyVersion);
     }
 
     private static void verifyCache(String legacyVersion, long startCount) throws InterruptedException, java.util.concurrent.ExecutionException
@@ -251,68 +488,64 @@ public class LegacySSTableTest
 
     private static void verifyReads(String legacyVersion)
     {
-        for (int compact = 0; compact <= 1; compact++)
+        for (int ck = 0; ck < 50; ck++)
         {
-            for (int ck = 0; ck < 50; ck++)
+            String ckValue = Integer.toString(ck) + longString;
+            for (int pk = 0; pk < 5; pk++)
             {
-                String ckValue = Integer.toString(ck) + longString;
-                for (int pk = 0; pk < 5; pk++)
+                logger.debug("for pk={} ck={}", pk, ck);
+
+                String pkValue = Integer.toString(pk);
+                if (ck == 0)
                 {
-                    logger.debug("for pk={} ck={}", pk, ck);
-
-                    String pkValue = Integer.toString(pk);
-                    UntypedResultSet rs;
-                    if (ck == 0)
-                    {
-                        readSimpleTable(legacyVersion, getCompactNameSuffix(compact),  pkValue);
-                        readSimpleCounterTable(legacyVersion, getCompactNameSuffix(compact), pkValue);
-                    }
-
-                    readClusteringTable(legacyVersion, getCompactNameSuffix(compact), ck, ckValue, pkValue);
-                    readClusteringCounterTable(legacyVersion, getCompactNameSuffix(compact), ckValue, pkValue);
+                    readSimpleTable(legacyVersion, pkValue);
+                    readSimpleCounterTable(legacyVersion, pkValue);
                 }
+
+                readClusteringTable(legacyVersion, ck, ckValue, pkValue);
+                readClusteringCounterTable(legacyVersion, ckValue, pkValue);
             }
         }
     }
 
-    private static void readClusteringCounterTable(String legacyVersion, String compactSuffix, String ckValue, String pkValue)
+    private static void readClusteringCounterTable(String legacyVersion, String ckValue, String pkValue)
     {
-        logger.debug("Read legacy_{}_clust_counter{}", legacyVersion, compactSuffix);
+        logger.debug("Read legacy_{}_clust_counter", legacyVersion);
         UntypedResultSet rs;
-        rs = QueryProcessor.executeInternal(String.format("SELECT val FROM legacy_tables.legacy_%s_clust_counter%s WHERE pk=? AND ck=?", legacyVersion, compactSuffix), pkValue, ckValue);
+        rs = QueryProcessor.executeInternal(String.format("SELECT val FROM legacy_tables.legacy_%s_clust_counter WHERE pk=? AND ck=?", legacyVersion), pkValue, ckValue);
         Assert.assertNotNull(rs);
         Assert.assertEquals(1, rs.size());
         Assert.assertEquals(1L, rs.one().getLong("val"));
     }
 
-    private static void readClusteringTable(String legacyVersion, String compactSuffix, int ck, String ckValue, String pkValue)
+    private static void readClusteringTable(String legacyVersion, int ck, String ckValue, String pkValue)
     {
-        logger.debug("Read legacy_{}_clust{}", legacyVersion, compactSuffix);
+        logger.debug("Read legacy_{}_clust", legacyVersion);
         UntypedResultSet rs;
-        rs = QueryProcessor.executeInternal(String.format("SELECT val FROM legacy_tables.legacy_%s_clust%s WHERE pk=? AND ck=?", legacyVersion, compactSuffix), pkValue, ckValue);
+        rs = QueryProcessor.executeInternal(String.format("SELECT val FROM legacy_tables.legacy_%s_clust WHERE pk=? AND ck=?", legacyVersion), pkValue, ckValue);
         assertLegacyClustRows(1, rs);
 
         String ckValue2 = Integer.toString(ck < 10 ? 40 : ck - 1) + longString;
         String ckValue3 = Integer.toString(ck > 39 ? 10 : ck + 1) + longString;
-        rs = QueryProcessor.executeInternal(String.format("SELECT val FROM legacy_tables.legacy_%s_clust%s WHERE pk=? AND ck IN (?, ?, ?)", legacyVersion, compactSuffix), pkValue, ckValue, ckValue2, ckValue3);
+        rs = QueryProcessor.executeInternal(String.format("SELECT val FROM legacy_tables.legacy_%s_clust WHERE pk=? AND ck IN (?, ?, ?)", legacyVersion), pkValue, ckValue, ckValue2, ckValue3);
         assertLegacyClustRows(3, rs);
     }
 
-    private static void readSimpleCounterTable(String legacyVersion, String compactSuffix, String pkValue)
+    private static void readSimpleCounterTable(String legacyVersion, String pkValue)
     {
-        logger.debug("Read legacy_{}_simple_counter{}", legacyVersion, compactSuffix);
+        logger.debug("Read legacy_{}_simple_counter", legacyVersion);
         UntypedResultSet rs;
-        rs = QueryProcessor.executeInternal(String.format("SELECT val FROM legacy_tables.legacy_%s_simple_counter%s WHERE pk=?", legacyVersion, compactSuffix), pkValue);
+        rs = QueryProcessor.executeInternal(String.format("SELECT val FROM legacy_tables.legacy_%s_simple_counter WHERE pk=?", legacyVersion), pkValue);
         Assert.assertNotNull(rs);
         Assert.assertEquals(1, rs.size());
         Assert.assertEquals(1L, rs.one().getLong("val"));
     }
 
-    private static void readSimpleTable(String legacyVersion, String compactSuffix, String pkValue)
+    private static void readSimpleTable(String legacyVersion, String pkValue)
     {
-        logger.debug("Read simple: legacy_{}_simple{}", legacyVersion, compactSuffix);
+        logger.debug("Read simple: legacy_{}_simple", legacyVersion);
         UntypedResultSet rs;
-        rs = QueryProcessor.executeInternal(String.format("SELECT val FROM legacy_tables.legacy_%s_simple%s WHERE pk=?", legacyVersion, compactSuffix), pkValue);
+        rs = QueryProcessor.executeInternal(String.format("SELECT val FROM legacy_tables.legacy_%s_simple WHERE pk=?", legacyVersion), pkValue);
         Assert.assertNotNull(rs);
         Assert.assertEquals(1, rs.size());
         Assert.assertEquals("foo bar baz", rs.one().getString("val"));
@@ -325,31 +558,18 @@ public class LegacySSTableTest
 
     private static void createTables(String legacyVersion)
     {
-        for (int i=0; i<=1; i++)
-        {
-            String compactSuffix = getCompactNameSuffix(i);
-            String tableSuffix = i == 0? "" : " WITH COMPACT STORAGE";
-            QueryProcessor.executeInternal(String.format("CREATE TABLE legacy_tables.legacy_%s_simple%s (pk text PRIMARY KEY, val text)%s", legacyVersion, compactSuffix, tableSuffix));
-            QueryProcessor.executeInternal(String.format("CREATE TABLE legacy_tables.legacy_%s_simple_counter%s (pk text PRIMARY KEY, val counter)%s", legacyVersion, compactSuffix, tableSuffix));
-            QueryProcessor.executeInternal(String.format("CREATE TABLE legacy_tables.legacy_%s_clust%s (pk text, ck text, val text, PRIMARY KEY (pk, ck))%s", legacyVersion, compactSuffix, tableSuffix));
-            QueryProcessor.executeInternal(String.format("CREATE TABLE legacy_tables.legacy_%s_clust_counter%s (pk text, ck text, val counter, PRIMARY KEY (pk, ck))%s", legacyVersion, compactSuffix, tableSuffix));
-        }
-    }
-
-    private static String getCompactNameSuffix(int i)
-    {
-        return i == 0? "" : "_compact";
+        QueryProcessor.executeInternal(String.format("CREATE TABLE legacy_tables.legacy_%s_simple (pk text PRIMARY KEY, val text)", legacyVersion));
+        QueryProcessor.executeInternal(String.format("CREATE TABLE legacy_tables.legacy_%s_simple_counter (pk text PRIMARY KEY, val counter)", legacyVersion));
+        QueryProcessor.executeInternal(String.format("CREATE TABLE legacy_tables.legacy_%s_clust (pk text, ck text, val text, PRIMARY KEY (pk, ck))", legacyVersion));
+        QueryProcessor.executeInternal(String.format("CREATE TABLE legacy_tables.legacy_%s_clust_counter (pk text, ck text, val counter, PRIMARY KEY (pk, ck))", legacyVersion));
     }
 
     private static void truncateTables(String legacyVersion)
     {
-        for (int compact = 0; compact <= 1; compact++)
-        {
-            QueryProcessor.executeInternal(String.format("TRUNCATE legacy_tables.legacy_%s_simple%s", legacyVersion, getCompactNameSuffix(compact)));
-            QueryProcessor.executeInternal(String.format("TRUNCATE legacy_tables.legacy_%s_simple_counter%s", legacyVersion, getCompactNameSuffix(compact)));
-            QueryProcessor.executeInternal(String.format("TRUNCATE legacy_tables.legacy_%s_clust%s", legacyVersion, getCompactNameSuffix(compact)));
-            QueryProcessor.executeInternal(String.format("TRUNCATE legacy_tables.legacy_%s_clust_counter%s", legacyVersion, getCompactNameSuffix(compact)));
-        }
+        QueryProcessor.executeInternal(String.format("TRUNCATE legacy_tables.legacy_%s_simple", legacyVersion));
+        QueryProcessor.executeInternal(String.format("TRUNCATE legacy_tables.legacy_%s_simple_counter", legacyVersion));
+        QueryProcessor.executeInternal(String.format("TRUNCATE legacy_tables.legacy_%s_clust", legacyVersion));
+        QueryProcessor.executeInternal(String.format("TRUNCATE legacy_tables.legacy_%s_clust_counter", legacyVersion));
         CacheService.instance.invalidateCounterCache();
         CacheService.instance.invalidateKeyCache();
     }
@@ -367,9 +587,9 @@ public class LegacySSTableTest
         }
     }
 
-    private static void loadLegacyTable(String tablePattern, String legacyVersion, String compactSuffix) throws IOException
+    private static void loadLegacyTable(String tablePattern, String legacyVersion) throws IOException
     {
-        String table = String.format(tablePattern, legacyVersion, compactSuffix);
+        String table = String.format(tablePattern, legacyVersion);
 
         logger.info("Loading legacy table {}", table);
 
@@ -404,28 +624,24 @@ public class LegacySSTableTest
         }
         String randomString = sb.toString();
 
-        for (int compact = 0; compact <= 1; compact++)
+        for (int pk = 0; pk < 5; pk++)
         {
-            for (int pk = 0; pk < 5; pk++)
+            String valPk = Integer.toString(pk);
+            QueryProcessor.executeInternal(String.format("INSERT INTO legacy_tables.legacy_%s_simple (pk, val) VALUES ('%s', '%s')",
+                                                         BigFormat.latestVersion, valPk, "foo bar baz"));
+
+            QueryProcessor.executeInternal(String.format("UPDATE legacy_tables.legacy_%s_simple_counter SET val = val + 1 WHERE pk = '%s'",
+                                                         BigFormat.latestVersion, valPk));
+
+            for (int ck = 0; ck < 50; ck++)
             {
-                String valPk = Integer.toString(pk);
-                QueryProcessor.executeInternal(String.format("INSERT INTO legacy_tables.legacy_%s_simple%s (pk, val) VALUES ('%s', '%s')",
-                                                             BigFormat.latestVersion, getCompactNameSuffix(compact), valPk, "foo bar baz"));
+                String valCk = Integer.toString(ck);
 
-                QueryProcessor.executeInternal(String.format("UPDATE legacy_tables.legacy_%s_simple_counter%s SET val = val + 1 WHERE pk = '%s'",
-                                                             BigFormat.latestVersion, getCompactNameSuffix(compact), valPk));
+                QueryProcessor.executeInternal(String.format("INSERT INTO legacy_tables.legacy_%s_clust (pk, ck, val) VALUES ('%s', '%s', '%s')",
+                                                             BigFormat.latestVersion, valPk, valCk + longString, randomString));
 
-                for (int ck = 0; ck < 50; ck++)
-                {
-                    String valCk = Integer.toString(ck);
-
-                    QueryProcessor.executeInternal(String.format("INSERT INTO legacy_tables.legacy_%s_clust%s (pk, ck, val) VALUES ('%s', '%s', '%s')",
-                                                                 BigFormat.latestVersion, getCompactNameSuffix(compact), valPk, valCk + longString, randomString));
-
-                    QueryProcessor.executeInternal(String.format("UPDATE legacy_tables.legacy_%s_clust_counter%s SET val = val + 1 WHERE pk = '%s' AND ck='%s'",
-                                                                 BigFormat.latestVersion, getCompactNameSuffix(compact), valPk, valCk + longString));
-
-                }
+                QueryProcessor.executeInternal(String.format("UPDATE legacy_tables.legacy_%s_clust_counter SET val = val + 1 WHERE pk = '%s' AND ck='%s'",
+                                                             BigFormat.latestVersion, valPk, valCk + longString));
             }
         }
 
@@ -433,16 +649,13 @@ public class LegacySSTableTest
 
         File ksDir = new File(LEGACY_SSTABLE_ROOT, String.format("%s/legacy_tables", BigFormat.latestVersion));
         ksDir.mkdirs();
-        for (int compact = 0; compact <= 1; compact++)
-        {
-            copySstablesFromTestData(String.format("legacy_%s_simple%s", BigFormat.latestVersion, getCompactNameSuffix(compact)), ksDir);
-            copySstablesFromTestData(String.format("legacy_%s_simple_counter%s", BigFormat.latestVersion, getCompactNameSuffix(compact)), ksDir);
-            copySstablesFromTestData(String.format("legacy_%s_clust%s", BigFormat.latestVersion, getCompactNameSuffix(compact)), ksDir);
-            copySstablesFromTestData(String.format("legacy_%s_clust_counter%s", BigFormat.latestVersion, getCompactNameSuffix(compact)), ksDir);
-        }
+        copySstablesFromTestData(String.format("legacy_%s_simple", BigFormat.latestVersion), ksDir);
+        copySstablesFromTestData(String.format("legacy_%s_simple_counter", BigFormat.latestVersion), ksDir);
+        copySstablesFromTestData(String.format("legacy_%s_clust", BigFormat.latestVersion), ksDir);
+        copySstablesFromTestData(String.format("legacy_%s_clust_counter", BigFormat.latestVersion), ksDir);
     }
 
-    private void copySstablesFromTestData(String table, File ksDir) throws IOException
+    public static void copySstablesFromTestData(String table, File ksDir) throws IOException
     {
         File cfDir = new File(ksDir, table);
         cfDir.mkdir();

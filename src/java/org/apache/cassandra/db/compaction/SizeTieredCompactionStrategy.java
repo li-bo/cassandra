@@ -66,7 +66,8 @@ public class SizeTieredCompactionStrategy extends AbstractCompactionStrategy
 
     protected SizeTieredCompactionStrategyOptions sizeTieredOptions;
     protected volatile int estimatedRemainingTasks;
-    private final Set<SSTableReader> sstables = new HashSet<>();
+    @VisibleForTesting
+    protected final Set<SSTableReader> sstables = new HashSet<>();
 
     public SizeTieredCompactionStrategy(ColumnFamilyStore cfs, Map<String, String> options)
     {
@@ -177,6 +178,7 @@ public class SizeTieredCompactionStrategy extends AbstractCompactionStrategy
     @SuppressWarnings("resource")
     public AbstractCompactionTask getNextBackgroundTask(int gcBefore)
     {
+        List<SSTableReader> previousCandidate = null;
         while (true)
         {
             List<SSTableReader> hottestBucket = getNextBackgroundSSTables(gcBefore);
@@ -184,14 +186,25 @@ public class SizeTieredCompactionStrategy extends AbstractCompactionStrategy
             if (hottestBucket.isEmpty())
                 return null;
 
+            // Already tried acquiring references without success. It means there is a race with
+            // the tracker but candidate SSTables were not yet replaced in the compaction strategy manager
+            if (hottestBucket.equals(previousCandidate))
+            {
+                logger.warn("Could not acquire references for compacting SSTables {} which is not a problem per se," +
+                            "unless it happens frequently, in which case it must be reported. Will retry later.",
+                            hottestBucket);
+                return null;
+            }
+
             LifecycleTransaction transaction = cfs.getTracker().tryModify(hottestBucket, OperationType.COMPACTION);
             if (transaction != null)
                 return new CompactionTask(cfs, transaction, gcBefore);
+            previousCandidate = hottestBucket;
         }
     }
 
     @SuppressWarnings("resource")
-    public Collection<AbstractCompactionTask> getMaximalTask(final int gcBefore, boolean splitOutput)
+    public synchronized Collection<AbstractCompactionTask> getMaximalTask(final int gcBefore, boolean splitOutput)
     {
         Iterable<SSTableReader> filteredSSTables = filterSuspectSSTables(sstables);
         if (Iterables.isEmpty(filteredSSTables))
@@ -317,13 +330,13 @@ public class SizeTieredCompactionStrategy extends AbstractCompactionStrategy
     }
 
     @Override
-    public void addSSTable(SSTableReader added)
+    public synchronized void addSSTable(SSTableReader added)
     {
         sstables.add(added);
     }
 
     @Override
-    public void removeSSTable(SSTableReader sstable)
+    public synchronized void removeSSTable(SSTableReader sstable)
     {
         sstables.remove(sstable);
     }

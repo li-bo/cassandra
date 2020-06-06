@@ -40,16 +40,19 @@ import java.util.regex.Pattern;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.io.ByteStreams;
 import com.google.common.reflect.TypeToken;
+
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import com.datastax.driver.core.TypeCodec;
 import org.apache.cassandra.concurrent.NamedThreadFactory;
 import org.apache.cassandra.cql3.ColumnIdentifier;
+import org.apache.cassandra.cql3.functions.types.TypeCodec;
 import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.exceptions.InvalidRequestException;
 import org.apache.cassandra.transport.ProtocolVersion;
 import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.security.SecurityThreadGroup;
+import org.apache.cassandra.security.ThreadAwareSecurityManager;
 import org.eclipse.jdt.core.compiler.IProblem;
 import org.eclipse.jdt.internal.compiler.*;
 import org.eclipse.jdt.internal.compiler.Compiler;
@@ -67,7 +70,7 @@ public final class JavaBasedUDFunction extends UDFunction
 
     private static final Pattern JAVA_LANG_PREFIX = Pattern.compile("\\bjava\\.lang\\.");
 
-    static final Logger logger = LoggerFactory.getLogger(JavaBasedUDFunction.class);
+    private static final Logger logger = LoggerFactory.getLogger(JavaBasedUDFunction.class);
 
     private static final AtomicInteger classSequence = new AtomicInteger();
 
@@ -184,6 +187,8 @@ public final class JavaBasedUDFunction extends UDFunction
 
     private final JavaUDF javaUDF;
 
+    private static final Pattern patternJavaDriver = Pattern.compile("com\\.datastax\\.driver\\.core\\.");
+
     JavaBasedUDFunction(FunctionName name, List<ColumnIdentifier> argNames, List<AbstractType<?>> argTypes,
                         AbstractType<?> returnType, boolean calledOnNullInput, String body)
     {
@@ -220,7 +225,7 @@ public final class JavaBasedUDFunction extends UDFunction
                         break;
                     case "body":
                         lineOffset = countNewlines(javaSourceBuilder);
-                        s = body;
+                        s = patternJavaDriver.matcher(body).replaceAll("org.apache.cassandra.cql3.functions.types.");
                         break;
                     case "arguments":
                         s = generateArguments(javaParamTypes, argNames, false);
@@ -254,10 +259,10 @@ public final class JavaBasedUDFunction extends UDFunction
             EcjCompilationUnit compilationUnit = new EcjCompilationUnit(javaSource, targetClassName);
 
             Compiler compiler = new Compiler(compilationUnit,
-                                                                               errorHandlingPolicy,
-                                                                               compilerOptions,
-                                                                               compilationUnit,
-                                                                               problemFactory);
+                                             errorHandlingPolicy,
+                                             compilerOptions,
+                                             compilationUnit,
+                                             problemFactory);
             compiler.compile(new ICompilationUnit[]{ compilationUnit });
 
             if (compilationUnit.problemList != null && !compilationUnit.problemList.isEmpty())
@@ -579,6 +584,7 @@ public final class JavaBasedUDFunction extends UDFunction
             return findType(result.toString());
         }
 
+        @SuppressWarnings("resource")
         private NameEnvironmentAnswer findType(String className)
         {
             if (className.equals(this.className))

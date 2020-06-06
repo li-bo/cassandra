@@ -22,12 +22,12 @@ import java.util.*;
 import java.util.function.Consumer;
 import java.util.function.Predicate;
 import java.nio.ByteBuffer;
-import java.security.MessageDigest;
 
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Iterators;
 
 import net.nicoulaj.compilecommand.annotations.DontInline;
+import org.apache.cassandra.exceptions.UnknownColumnException;
 import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.cql3.ColumnIdentifier;
@@ -52,7 +52,16 @@ public class Columns extends AbstractCollection<ColumnMetadata> implements Colle
 {
     public static final Serializer serializer = new Serializer();
     public static final Columns NONE = new Columns(BTree.empty(), 0);
-    private static final ColumnMetadata FIRST_COMPLEX =
+
+    public static final ColumnMetadata FIRST_COMPLEX_STATIC =
+        new ColumnMetadata("",
+                           "",
+                           ColumnIdentifier.getInterned(ByteBufferUtil.EMPTY_BYTE_BUFFER, UTF8Type.instance),
+                           SetType.getInstance(UTF8Type.instance, true),
+                           ColumnMetadata.NO_POSITION,
+                           ColumnMetadata.Kind.STATIC);
+
+    public static final ColumnMetadata FIRST_COMPLEX_REGULAR =
         new ColumnMetadata("",
                            "",
                            ColumnIdentifier.getInterned(ByteBufferUtil.EMPTY_BYTE_BUFFER, UTF8Type.instance),
@@ -101,11 +110,14 @@ public class Columns extends AbstractCollection<ColumnMetadata> implements Colle
 
     private static int findFirstComplexIdx(Object[] tree)
     {
-        // have fast path for common no-complex case
+        if (BTree.isEmpty(tree))
+            return 0;
+
         int size = BTree.size(tree);
-        if (!BTree.isEmpty(tree) && BTree.<ColumnMetadata>findByIndex(tree, size - 1).isSimple())
-            return size;
-        return BTree.ceilIndex(tree, Comparator.naturalOrder(), FIRST_COMPLEX);
+        ColumnMetadata last = BTree.findByIndex(tree, size - 1);
+        return last.isSimple()
+             ? size
+             : BTree.ceilIndex(tree, Comparator.naturalOrder(), last.isStatic() ? FIRST_COMPLEX_STATIC : FIRST_COMPLEX_REGULAR);
     }
 
     /**
@@ -361,20 +373,19 @@ public class Columns extends AbstractCollection<ColumnMetadata> implements Colle
         return column -> iter.next(column) != null;
     }
 
-    public void digest(MessageDigest digest)
+    public void digest(Digest digest)
     {
         for (ColumnMetadata c : this)
-            digest.update(c.name.bytes.duplicate());
+            digest.update(c.name.bytes);
     }
 
     /**
      * Apply a function to each column definition in forwards or reversed order.
      * @param function
-     * @param reversed
      */
-    public void apply(Consumer<ColumnMetadata> function, boolean reversed)
+    public void apply(Consumer<ColumnMetadata> function)
     {
-        BTree.apply(columns, function, reversed);
+        BTree.apply(columns, function);
     }
 
     @Override
@@ -441,7 +452,7 @@ public class Columns extends AbstractCollection<ColumnMetadata> implements Colle
                     // deserialization. The column will be ignore later on anyway.
                     column = metadata.getDroppedColumn(name);
                     if (column == null)
-                        throw new RuntimeException("Unknown column " + UTF8Type.instance.getString(name) + " during deserialization");
+                        throw new UnknownColumnException("Unknown column " + UTF8Type.instance.getString(name) + " during deserialization");
                 }
                 builder.add(column);
             }
@@ -525,6 +536,8 @@ public class Columns extends AbstractCollection<ColumnMetadata> implements Colle
                     }
                     encoded >>>= 1;
                 }
+                if (encoded != 0)
+                    throw new IOException("Invalid Columns subset bytes; too many bits set:" + Long.toBinaryString(encoded));
                 return new Columns(builder.build(), firstComplexIdx);
             }
         }

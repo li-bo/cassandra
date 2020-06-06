@@ -17,15 +17,13 @@
  */
 package org.apache.cassandra.db.rows;
 
-import java.security.MessageDigest;
-
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import org.apache.cassandra.db.Digest;
 import org.apache.cassandra.db.filter.ColumnFilter;
 import org.apache.cassandra.db.transform.Transformation;
 import org.apache.cassandra.schema.TableMetadata;
-import org.apache.cassandra.utils.FBUtilities;
 
 /**
  * Static methods to work with row iterators.
@@ -36,16 +34,16 @@ public abstract class RowIterators
 
     private RowIterators() {}
 
-    public static void digest(RowIterator iterator, MessageDigest digest)
+    public static void digest(RowIterator iterator, Digest digest)
     {
         // TODO: we're not computing digest the same way that old nodes. This is
         // currently ok as this is only used for schema digest and the is no exchange
         // of schema digest between different versions. If this changes however,
         // we'll need to agree on a version.
-        digest.update(iterator.partitionKey().getKey().duplicate());
+        digest.update(iterator.partitionKey().getKey());
         iterator.columns().regulars.digest(digest);
         iterator.columns().statics.digest(digest);
-        FBUtilities.updateWithBoolean(digest, iterator.isReverseOrder());
+        digest.updateWithBoolean(iterator.isReverseOrder());
         iterator.staticRow().digest(digest);
 
         while (iterator.hasNext())

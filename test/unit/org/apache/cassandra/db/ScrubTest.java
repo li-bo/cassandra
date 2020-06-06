@@ -26,6 +26,7 @@ import java.nio.file.Paths;
 import java.util.*;
 import java.util.concurrent.ExecutionException;
 
+import org.apache.cassandra.db.lifecycle.LifecycleNewTracker;
 import org.apache.commons.lang3.StringUtils;
 import org.junit.BeforeClass;
 import org.junit.Test;
@@ -122,7 +123,7 @@ public class ScrubTest
         fillCF(cfs, 1);
         assertOrderedAll(cfs, 1);
 
-        CompactionManager.instance.performScrub(cfs, false, true, 2);
+        CompactionManager.instance.performScrub(cfs, false, true, false, 2);
 
         // check data is still there
         assertOrderedAll(cfs, 1);
@@ -318,7 +319,7 @@ public class ScrubTest
         DatabaseDescriptor.setPartitionerUnsafe(new ByteOrderedPartitioner());
 
         // Create out-of-order SSTable
-        File tempDir = File.createTempFile("ScrubTest.testScrubOutOfOrder", "").getParentFile();
+        File tempDir = FileUtils.createTempFile("ScrubTest.testScrubOutOfOrder", "").getParentFile();
         // create ks/cf directory
         File tempDataDir = new File(tempDir, String.join(File.separator, KEYSPACE, CF3));
         tempDataDir.mkdirs();
@@ -520,33 +521,6 @@ public class ScrubTest
         CompactionManager.instance.performScrub(cfs2, false, false, 2);
     }
 
-    /**
-     * For CASSANDRA-6892 too, check that for a compact table with one cluster column, we can insert whatever
-     * we want as value for the clustering column, including something that would conflict with a CQL column definition.
-     */
-    @Test
-    public void testValidationCompactStorage() throws Exception
-    {
-        QueryProcessor.process(String.format("CREATE TABLE \"%s\".test_compact_dynamic_columns (a int, b text, c text, PRIMARY KEY (a, b)) WITH COMPACT STORAGE", KEYSPACE), ConsistencyLevel.ONE);
-
-        Keyspace keyspace = Keyspace.open(KEYSPACE);
-        ColumnFamilyStore cfs = keyspace.getColumnFamilyStore("test_compact_dynamic_columns");
-
-        QueryProcessor.executeInternal(String.format("INSERT INTO \"%s\".test_compact_dynamic_columns (a, b, c) VALUES (0, 'a', 'foo')", KEYSPACE));
-        QueryProcessor.executeInternal(String.format("INSERT INTO \"%s\".test_compact_dynamic_columns (a, b, c) VALUES (0, 'b', 'bar')", KEYSPACE));
-        QueryProcessor.executeInternal(String.format("INSERT INTO \"%s\".test_compact_dynamic_columns (a, b, c) VALUES (0, 'c', 'boo')", KEYSPACE));
-        cfs.forceBlockingFlush();
-        CompactionManager.instance.performScrub(cfs, true, true, 2);
-
-        // Scrub is silent, but it will remove broken records. So reading everything back to make sure nothing to "scrubbed away"
-        UntypedResultSet rs = QueryProcessor.executeInternal(String.format("SELECT * FROM \"%s\".test_compact_dynamic_columns", KEYSPACE));
-        assertEquals(3, rs.size());
-
-        Iterator<UntypedResultSet.Row> iter = rs.iterator();
-        assertEquals("foo", iter.next().getString("c"));
-        assertEquals("bar", iter.next().getString("c"));
-        assertEquals("boo", iter.next().getString("c"));
-    }
 
     @Test /* CASSANDRA-5174 */
     public void testScrubKeysIndex_preserveOrder() throws IOException, ExecutionException, InterruptedException
@@ -625,7 +599,7 @@ public class ScrubTest
                 { //make sure the next scrub fails
                     overrideWithGarbage(indexCfs.getLiveSSTables().iterator().next(), ByteBufferUtil.bytes(1L), ByteBufferUtil.bytes(2L));
                 }
-                CompactionManager.AllSSTableOpStatus result = indexCfs.scrub(false, false, true, true, 0);
+                CompactionManager.AllSSTableOpStatus result = indexCfs.scrub(false, false, false, true, false,0);
                 assertEquals(failure ?
                              CompactionManager.AllSSTableOpStatus.ABORTED :
                              CompactionManager.AllSSTableOpStatus.SUCCESSFUL,
@@ -642,14 +616,14 @@ public class ScrubTest
     {
         SerializationHeader header = new SerializationHeader(true, metadata.get(), metadata.get().regularAndStaticColumns(), EncodingStats.NO_STATS);
         MetadataCollector collector = new MetadataCollector(metadata.get().comparator).sstableLevel(0);
-        return new TestMultiWriter(new TestWriter(descriptor, keyCount, 0, null, metadata, collector, header, txn), txn);
+        return new TestMultiWriter(new TestWriter(descriptor, keyCount, 0, null, false, metadata, collector, header, txn), txn);
     }
 
     private static class TestMultiWriter extends SimpleSSTableMultiWriter
     {
-        TestMultiWriter(SSTableWriter writer, LifecycleTransaction txn)
+        TestMultiWriter(SSTableWriter writer, LifecycleNewTracker lifecycleNewTracker)
         {
-            super(writer, txn);
+            super(writer, lifecycleNewTracker);
         }
     }
 
@@ -658,10 +632,10 @@ public class ScrubTest
      */
     private static class TestWriter extends BigTableWriter
     {
-        TestWriter(Descriptor descriptor, long keyCount, long repairedAt, UUID pendingRepair, TableMetadataRef metadata,
+        TestWriter(Descriptor descriptor, long keyCount, long repairedAt, UUID pendingRepair, boolean isTransient, TableMetadataRef metadata,
                    MetadataCollector collector, SerializationHeader header, LifecycleTransaction txn)
         {
-            super(descriptor, keyCount, repairedAt, pendingRepair, metadata, collector, header, Collections.emptySet(), txn);
+            super(descriptor, keyCount, repairedAt, pendingRepair, isTransient, metadata, collector, header, Collections.emptySet(), txn);
         }
 
         @Override
@@ -704,7 +678,7 @@ public class ScrubTest
 
         cfs.loadNewSSTables();
 
-        cfs.scrub(true, true, true, 1);
+        cfs.scrub(true, true, false, false, false, 1);
 
         UntypedResultSet rs = QueryProcessor.executeInternal(String.format("SELECT * FROM \"%s\".cf_with_duplicates_3_0", KEYSPACE));
         assertEquals(1, rs.size());

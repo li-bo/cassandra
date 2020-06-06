@@ -19,8 +19,6 @@
 package org.apache.cassandra.db;
 
 import java.nio.ByteBuffer;
-import java.security.MessageDigest;
-import java.util.Arrays;
 
 import org.junit.AfterClass;
 import org.junit.Assert;
@@ -29,12 +27,15 @@ import org.junit.Test;
 
 import org.apache.cassandra.SchemaLoader;
 import org.apache.cassandra.schema.ColumnMetadata;
+import org.apache.cassandra.db.rows.BTreeRow;
 import org.apache.cassandra.db.rows.BufferCell;
 import org.apache.cassandra.db.rows.Cell;
 import org.apache.cassandra.db.rows.Cells;
 import org.apache.cassandra.db.context.CounterContext;
+import org.apache.cassandra.db.rows.Row;
 import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.schema.KeyspaceParams;
+import org.apache.cassandra.serializers.AsciiSerializer;
 import org.apache.cassandra.utils.*;
 
 import static org.junit.Assert.*;
@@ -134,43 +135,43 @@ public class CounterCellTest
         // both deleted, diff deletion time, same ts
         left = createDeleted(cfs, col, 2, 5);
         right = createDeleted(cfs, col, 2, 10);
-        assert Cells.reconcile(left, right, 10) == right;
+        assert Cells.reconcile(left, right) == right;
 
         // diff ts
         right = createLegacyCounterCell(cfs, col, 1, 10);
-        assert Cells.reconcile(left, right, 10) == left;
+        assert Cells.reconcile(left, right) == left;
 
         // < tombstone
         left = createDeleted(cfs, col, 6, 6);
         right = createLegacyCounterCell(cfs, col, 1, 5);
-        assert Cells.reconcile(left, right, 10) == left;
+        assert Cells.reconcile(left, right) == left;
 
         // > tombstone
         left = createDeleted(cfs, col, 1, 1);
         right = createLegacyCounterCell(cfs, col, 1, 5);
-        assert Cells.reconcile(left, right, 10) == left;
+        assert Cells.reconcile(left, right) == left;
 
         // == tombstone
         left = createDeleted(cfs, col, 8, 8);
         right = createLegacyCounterCell(cfs, col, 1, 8);
-        assert Cells.reconcile(left, right, 10) == left;
+        assert Cells.reconcile(left, right) == left;
 
         // live + live
         left = createLegacyCounterCell(cfs, col, 1, 2);
         right = createLegacyCounterCell(cfs, col, 3, 5);
-        Cell reconciled = Cells.reconcile(left, right, 10);
+        Cell reconciled = Cells.reconcile(left, right);
         assertEquals(CounterContext.instance().total(reconciled.value()), 4);
         assertEquals(reconciled.timestamp(), 5L);
 
         // Add, don't change TS
         Cell addTen = createLegacyCounterCell(cfs, col, 10, 4);
-        reconciled = Cells.reconcile(reconciled, addTen, 10);
+        reconciled = Cells.reconcile(reconciled, addTen);
         assertEquals(CounterContext.instance().total(reconciled.value()), 14);
         assertEquals(reconciled.timestamp(), 5L);
 
         // Add w/new TS
         Cell addThree = createLegacyCounterCell(cfs, col, 3, 7);
-        reconciled = Cells.reconcile(reconciled, addThree, 10);
+        reconciled = Cells.reconcile(reconciled, addThree);
         assertEquals(CounterContext.instance().total(reconciled.value()), 17);
         assertEquals(reconciled.timestamp(), 7L);
 
@@ -178,7 +179,7 @@ public class CounterCellTest
         assert reconciled.localDeletionTime() == Integer.MAX_VALUE;
 
         Cell deleted = createDeleted(cfs, col, 8, 8);
-        reconciled = Cells.reconcile(reconciled, deleted, 10);
+        reconciled = Cells.reconcile(reconciled, deleted);
         assert reconciled.localDeletionTime() == 8;
     }
 
@@ -261,8 +262,8 @@ public class CounterCellTest
         ColumnFamilyStore cfs = Keyspace.open(KEYSPACE1).getColumnFamilyStore(COUNTER1);
         ByteBuffer col = ByteBufferUtil.bytes("val");
 
-        MessageDigest digest1 = MessageDigest.getInstance("md5");
-        MessageDigest digest2 = MessageDigest.getInstance("md5");
+        Digest digest1 = Digest.forReadResponse();
+        Digest digest2 = Digest.forReadResponse();
 
         CounterContext.ContextState state = CounterContext.ContextState.allocate(0, 2, 2);
         state.writeRemote(CounterId.fromInt(1), 4L, 4L);
@@ -278,6 +279,26 @@ public class CounterCellTest
         original.digest(digest1);
         cleared.digest(digest2);
 
-        assert Arrays.equals(digest1.digest(), digest2.digest());
+        assertArrayEquals(digest1.digest(), digest2.digest());
     }
+
+    @Test
+    public void testDigestWithEmptyCells() throws Exception
+    {
+        // For DB-1881
+        ColumnFamilyStore cfs = Keyspace.open(KEYSPACE1).getColumnFamilyStore(COUNTER1);
+
+        ColumnMetadata emptyColDef = cfs.metadata().getColumn(ByteBufferUtil.bytes("val2"));
+        BufferCell emptyCell = BufferCell.live(emptyColDef, 0, ByteBuffer.allocate(0));
+
+        Row.Builder builder = BTreeRow.unsortedBuilder();
+        builder.newRow(Clustering.make(AsciiSerializer.instance.serialize("test")));
+        builder.addCell(emptyCell);
+        Row row = builder.build();
+
+        Digest digest = Digest.forReadResponse();
+        row.digest(digest);
+        assertNotNull(digest.digest());
+    }
+
 }

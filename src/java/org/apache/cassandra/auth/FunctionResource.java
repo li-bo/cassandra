@@ -134,6 +134,11 @@ public class FunctionResource implements IResource
         return new FunctionResource(keyspace, name, argTypes);
     }
 
+    public static FunctionResource function(Function function)
+    {
+        return new FunctionResource(function.name().keyspace, function.name().name, function.argTypes());
+    }
+
     /**
      * Creates a FunctionResource representing a specific, keyspace-scoped function.
      * This variant is used to create an instance during parsing of a CQL statement.
@@ -150,11 +155,16 @@ public class FunctionResource implements IResource
         if (keyspace == null)
             throw new InvalidRequestException("In this context function name must be " +
                                               "explictly qualified by a keyspace");
-        List<AbstractType<?>> abstractTypes = new ArrayList<>();
+        List<AbstractType<?>> abstractTypes = new ArrayList<>(argTypes.size());
         for (CQL3Type.Raw cqlType : argTypes)
             abstractTypes.add(cqlType.prepare(keyspace).getType());
 
         return new FunctionResource(keyspace, name, abstractTypes);
+    }
+
+    public static FunctionResource functionFromCql(FunctionName name, List<CQL3Type.Raw> argTypes)
+    {
+        return functionFromCql(name.keyspace, name.name, argTypes);
     }
 
     /**

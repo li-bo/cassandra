@@ -18,27 +18,23 @@
 package org.apache.cassandra.service;
 
 import java.io.IOException;
-import java.lang.management.ManagementFactory;
-import java.net.InetAddress;
 import java.net.UnknownHostException;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 
-import javax.management.MBeanServer;
-import javax.management.ObjectName;
-
-import com.google.common.base.Predicate;
+import com.google.common.base.Preconditions;
 import com.google.common.cache.Cache;
 import com.google.common.cache.CacheBuilder;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Iterables;
 import com.google.common.collect.Multimap;
-import com.google.common.collect.Sets;
 import com.google.common.util.concurrent.AbstractFuture;
 
 import com.google.common.util.concurrent.ListeningExecutorService;
 import com.google.common.util.concurrent.MoreExecutors;
+import org.apache.cassandra.locator.EndpointsByRange;
+import org.apache.cassandra.locator.EndpointsForRange;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -48,7 +44,7 @@ import org.apache.cassandra.concurrent.ScheduledExecutors;
 import org.apache.cassandra.config.Config;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.ColumnFamilyStore;
-import org.apache.cassandra.dht.Bounds;
+import org.apache.cassandra.db.Keyspace;
 import org.apache.cassandra.dht.Range;
 import org.apache.cassandra.dht.Token;
 import org.apache.cassandra.exceptions.RequestFailureReason;
@@ -60,12 +56,13 @@ import org.apache.cassandra.gms.IFailureDetector;
 import org.apache.cassandra.gms.IEndpointStateChangeSubscriber;
 import org.apache.cassandra.gms.IFailureDetectionEventListener;
 import org.apache.cassandra.gms.VersionedValue;
-import org.apache.cassandra.io.sstable.format.SSTableReader;
+import org.apache.cassandra.locator.InetAddressAndPort;
 import org.apache.cassandra.locator.TokenMetadata;
-import org.apache.cassandra.net.IAsyncCallbackWithFailure;
-import org.apache.cassandra.net.MessageIn;
-import org.apache.cassandra.net.MessageOut;
+import org.apache.cassandra.metrics.RepairMetrics;
+import org.apache.cassandra.net.RequestCallback;
+import org.apache.cassandra.net.Message;
 import org.apache.cassandra.net.MessagingService;
+import org.apache.cassandra.repair.CommonRange;
 import org.apache.cassandra.streaming.PreviewKind;
 import org.apache.cassandra.repair.RepairJobDesc;
 import org.apache.cassandra.repair.RepairParallelism;
@@ -74,13 +71,14 @@ import org.apache.cassandra.repair.consistent.CoordinatorSessions;
 import org.apache.cassandra.repair.consistent.LocalSessions;
 import org.apache.cassandra.repair.messages.*;
 import org.apache.cassandra.schema.TableId;
-import org.apache.cassandra.utils.CassandraVersion;
-import org.apache.cassandra.utils.Clock;
 import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.MBeanWrapper;
 import org.apache.cassandra.utils.Pair;
 import org.apache.cassandra.utils.UUIDGen;
 
-import static org.apache.cassandra.config.Config.RepairCommandPoolFullStrategy.queue;
+import static com.google.common.collect.Iterables.concat;
+import static com.google.common.collect.Iterables.transform;
+import static org.apache.cassandra.net.Verb.PREPARE_MSG;
 
 /**
  * ActiveRepairService is the starting point for manual "active" repairs.
@@ -114,8 +112,6 @@ public class ActiveRepairService implements IEndpointStateChangeSubscriber, IFai
 
     private boolean registeredForEndpointChanges = false;
 
-    public static CassandraVersion SUPPORTS_GLOBAL_PREPARE_FLAG_VERSION = new CassandraVersion("2.2.1");
-
     private static final Logger logger = LoggerFactory.getLogger(ActiveRepairService.class);
     // singleton enforcement
     public static final ActiveRepairService instance = new ActiveRepairService(FailureDetector.instance, Gossiper.instance);
@@ -147,6 +143,7 @@ public class ActiveRepairService implements IEndpointStateChangeSubscriber, IFai
                                                                  new NamedThreadFactory("Repair-Task"),
                                                                  "internal",
                                                                  new ThreadPoolExecutor.AbortPolicy());
+        RepairMetrics.init();
     }
 
     private final IFailureDetector failureDetector;
@@ -167,15 +164,7 @@ public class ActiveRepairService implements IEndpointStateChangeSubscriber, IFai
                                              .maximumSize(Long.getLong("cassandra.parent_repair_status_cache_size", 100_000))
                                              .build();
 
-        MBeanServer mbs = ManagementFactory.getPlatformMBeanServer();
-        try
-        {
-            mbs.registerMBean(this, new ObjectName(MBEAN_NAME));
-        }
-        catch (Exception e)
-        {
-            throw new RuntimeException(e);
-        }
+        MBeanWrapper.instance.registerMBean(this, MBEAN_NAME);
     }
 
     public void start()
@@ -199,34 +188,51 @@ public class ActiveRepairService implements IEndpointStateChangeSubscriber, IFai
         consistent.local.cancelSession(sessionID, force);
     }
 
+    @Override
+    public void setRepairSessionSpaceInMegabytes(int sizeInMegabytes)
+    {
+        DatabaseDescriptor.setRepairSessionSpaceInMegabytes(sizeInMegabytes);
+    }
+
+    @Override
+    public int getRepairSessionSpaceInMegabytes()
+    {
+        return DatabaseDescriptor.getRepairSessionSpaceInMegabytes();
+    }
+
     /**
      * Requests repairs for the given keyspace and column families.
      *
      * @return Future for asynchronous call or null if there is no need to repair
      */
     public RepairSession submitRepairSession(UUID parentRepairSession,
-                                             Collection<Range<Token>> range,
+                                             CommonRange range,
                                              String keyspace,
                                              RepairParallelism parallelismDegree,
-                                             Set<InetAddress> endpoints,
                                              boolean isIncremental,
                                              boolean pullRepair,
                                              boolean force,
                                              PreviewKind previewKind,
+                                             boolean optimiseStreams,
                                              ListeningExecutorService executor,
                                              String... cfnames)
     {
-        if (endpoints.isEmpty())
+        if (range.endpoints.isEmpty())
             return null;
 
         if (cfnames.length == 0)
             return null;
 
-        final RepairSession session = new RepairSession(parentRepairSession, UUIDGen.getTimeUUID(), range, keyspace, parallelismDegree, endpoints, isIncremental, pullRepair, force, previewKind, cfnames);
+        final RepairSession session = new RepairSession(parentRepairSession, UUIDGen.getTimeUUID(), range, keyspace,
+                                                        parallelismDegree, isIncremental, pullRepair, force,
+                                                        previewKind, optimiseStreams, cfnames);
 
         sessions.put(session.getId(), session);
         // register listeners
         registerOnFdAndGossip(session);
+
+        if (session.previewKind == PreviewKind.REPAIRED)
+            LocalSessions.registerListener(session);
 
         // remove session at completion
         session.addListener(new Runnable()
@@ -237,10 +243,21 @@ public class ActiveRepairService implements IEndpointStateChangeSubscriber, IFai
             public void run()
             {
                 sessions.remove(session.getId());
+                LocalSessions.unregisterListener(session);
             }
         }, MoreExecutors.directExecutor());
         session.start(executor);
         return session;
+    }
+
+    public boolean getUseOffheapMerkleTrees()
+    {
+        return DatabaseDescriptor.useOffheapMerkleTrees();
+    }
+
+    public void setUseOffheapMerkleTrees(boolean value)
+    {
+        DatabaseDescriptor.useOffheapMerkleTrees(value);
     }
 
     private <T extends AbstractFuture &
@@ -261,7 +278,7 @@ public class ActiveRepairService implements IEndpointStateChangeSubscriber, IFai
                 failureDetector.unregisterFailureDetectionEventListener(task);
                 gossiper.unregister(task);
             }
-        }, MoreExecutors.sameThreadExecutor());
+        }, MoreExecutors.directExecutor());
     }
 
     public synchronized void terminateSessions()
@@ -295,12 +312,12 @@ public class ActiveRepairService implements IEndpointStateChangeSubscriber, IFai
      *
      * @return neighbors with whom we share the provided range
      */
-    public static Set<InetAddress> getNeighbors(String keyspaceName, Collection<Range<Token>> keyspaceLocalRanges,
-                                                Range<Token> toRepair, Collection<String> dataCenters,
-                                                Collection<String> hosts)
+    public static EndpointsForRange getNeighbors(String keyspaceName, Iterable<Range<Token>> keyspaceLocalRanges,
+                                          Range<Token> toRepair, Collection<String> dataCenters,
+                                          Collection<String> hosts)
     {
         StorageService ss = StorageService.instance;
-        Map<Range<Token>, List<InetAddress>> replicaSets = ss.getRangeToAddressMap(keyspaceName);
+        EndpointsByRange replicaSets = ss.getRangeToAddressMap(keyspaceName);
         Range<Token> rangeSuperSet = null;
         for (Range<Token> range : keyspaceLocalRanges)
         {
@@ -318,33 +335,26 @@ public class ActiveRepairService implements IEndpointStateChangeSubscriber, IFai
             }
         }
         if (rangeSuperSet == null || !replicaSets.containsKey(rangeSuperSet))
-            return Collections.emptySet();
+            return EndpointsForRange.empty(toRepair);
 
-        Set<InetAddress> neighbors = new HashSet<>(replicaSets.get(rangeSuperSet));
-        neighbors.remove(FBUtilities.getBroadcastAddress());
+        EndpointsForRange neighbors = replicaSets.get(rangeSuperSet).withoutSelf();
 
         if (dataCenters != null && !dataCenters.isEmpty())
         {
             TokenMetadata.Topology topology = ss.getTokenMetadata().cloneOnlyTokenMap().getTopology();
-            Set<InetAddress> dcEndpoints = Sets.newHashSet();
-            Multimap<String,InetAddress> dcEndpointsMap = topology.getDatacenterEndpoints();
-            for (String dc : dataCenters)
-            {
-                Collection<InetAddress> c = dcEndpointsMap.get(dc);
-                if (c != null)
-                   dcEndpoints.addAll(c);
-            }
-            return Sets.intersection(neighbors, dcEndpoints);
+            Multimap<String, InetAddressAndPort> dcEndpointsMap = topology.getDatacenterEndpoints();
+            Iterable<InetAddressAndPort> dcEndpoints = concat(transform(dataCenters, dcEndpointsMap::get));
+            return neighbors.select(dcEndpoints, true);
         }
         else if (hosts != null && !hosts.isEmpty())
         {
-            Set<InetAddress> specifiedHost = new HashSet<>();
+            Set<InetAddressAndPort> specifiedHost = new HashSet<>();
             for (final String host : hosts)
             {
                 try
                 {
-                    final InetAddress endpoint = InetAddress.getByName(host.trim());
-                    if (endpoint.equals(FBUtilities.getBroadcastAddress()) || neighbors.contains(endpoint))
+                    final InetAddressAndPort endpoint = InetAddressAndPort.getByName(host.trim());
+                    if (endpoint.equals(FBUtilities.getBroadcastAddressAndPort()) || neighbors.endpoints().contains(endpoint))
                         specifiedHost.add(endpoint);
                 }
                 catch (UnknownHostException e)
@@ -353,7 +363,7 @@ public class ActiveRepairService implements IEndpointStateChangeSubscriber, IFai
                 }
             }
 
-            if (!specifiedHost.contains(FBUtilities.getBroadcastAddress()))
+            if (!specifiedHost.contains(FBUtilities.getBroadcastAddressAndPort()))
                 throw new IllegalArgumentException("The current host must be part of the repair");
 
             if (specifiedHost.size() <= 1)
@@ -364,9 +374,8 @@ public class ActiveRepairService implements IEndpointStateChangeSubscriber, IFai
                 throw new IllegalArgumentException(String.format(msg, hosts, toRepair, neighbors));
             }
 
-            specifiedHost.remove(FBUtilities.getBroadcastAddress());
-            return specifiedHost;
-
+            specifiedHost.remove(FBUtilities.getBroadcastAddressAndPort());
+            return neighbors.keep(specifiedHost);
         }
 
         return neighbors;
@@ -377,13 +386,14 @@ public class ActiveRepairService implements IEndpointStateChangeSubscriber, IFai
      * incremental repairs, forced incremental repairs, and full repairs, the UNREPAIRED_SSTABLE value will prevent
      * sstables from being promoted to repaired or preserve the repairedAt/pendingRepair values, respectively.
      */
-    static long getRepairedAt(RepairOption options)
+    static long getRepairedAt(RepairOption options, boolean force)
     {
-        // we only want to set repairedAt for incremental repairs including all replicas for a token range. For non-global incremental repairs, forced incremental repairs, and
-        // full repairs, the UNREPAIRED_SSTABLE value will prevent sstables from being promoted to repaired or preserve the repairedAt/pendingRepair values, respectively.
-        if (options.isIncremental() && options.isGlobal() && !options.isForcedRepair())
+        // we only want to set repairedAt for incremental repairs including all replicas for a token range. For non-global incremental repairs, full repairs, the UNREPAIRED_SSTABLE value will prevent
+        // sstables from being promoted to repaired or preserve the repairedAt/pendingRepair values, respectively. For forced repairs, repairedAt time is only set to UNREPAIRED_SSTABLE if we actually
+        // end up skipping replicas
+        if (options.isIncremental() && options.isGlobal() && ! force)
         {
-            return Clock.instance.currentTimeMillis();
+            return System.currentTimeMillis();
         }
         else
         {
@@ -391,30 +401,33 @@ public class ActiveRepairService implements IEndpointStateChangeSubscriber, IFai
         }
     }
 
-    public UUID prepareForRepair(UUID parentRepairSession, InetAddress coordinator, Set<InetAddress> endpoints, RepairOption options, List<ColumnFamilyStore> columnFamilyStores)
+    public UUID prepareForRepair(UUID parentRepairSession, InetAddressAndPort coordinator, Set<InetAddressAndPort> endpoints, RepairOption options, boolean isForcedRepair, List<ColumnFamilyStore> columnFamilyStores)
     {
-        long repairedAt = getRepairedAt(options);
+        long repairedAt = getRepairedAt(options, isForcedRepair);
         registerParentRepairSession(parentRepairSession, coordinator, columnFamilyStores, options.getRanges(), options.isIncremental(), repairedAt, options.isGlobal(), options.getPreviewKind());
         final CountDownLatch prepareLatch = new CountDownLatch(endpoints.size());
         final AtomicBoolean status = new AtomicBoolean(true);
         final Set<String> failedNodes = Collections.synchronizedSet(new HashSet<String>());
-        IAsyncCallbackWithFailure callback = new IAsyncCallbackWithFailure()
+        RequestCallback callback = new RequestCallback()
         {
-            public void response(MessageIn msg)
+            @Override
+            public void onResponse(Message msg)
             {
                 prepareLatch.countDown();
             }
 
-            public boolean isLatencyForSnitch()
-            {
-                return false;
-            }
-
-            public void onFailure(InetAddress from, RequestFailureReason failureReason)
+            @Override
+            public void onFailure(InetAddressAndPort from, RequestFailureReason failureReason)
             {
                 status.set(false);
-                failedNodes.add(from.getHostAddress());
+                failedNodes.add(from.toString());
                 prepareLatch.countDown();
+            }
+
+            @Override
+            public boolean invokeOnFailure()
+            {
+                return true;
             }
         };
 
@@ -422,17 +435,19 @@ public class ActiveRepairService implements IEndpointStateChangeSubscriber, IFai
         for (ColumnFamilyStore cfs : columnFamilyStores)
             tableIds.add(cfs.metadata.id);
 
-        for (InetAddress neighbour : endpoints)
+        for (InetAddressAndPort neighbour : endpoints)
         {
             if (FailureDetector.instance.isAlive(neighbour))
             {
                 PrepareMessage message = new PrepareMessage(parentRepairSession, tableIds, options.getRanges(), options.isIncremental(), repairedAt, options.isGlobal(), options.getPreviewKind());
-                MessageOut<RepairMessage> msg = message.createMessage();
-                MessagingService.instance().sendRR(msg, neighbour, callback, DatabaseDescriptor.getRpcTimeout(), true);
+                Message<RepairMessage> msg = Message.out(PREPARE_MSG, message);
+                MessagingService.instance().sendWithCallback(msg, neighbour, callback);
             }
             else
             {
-                if (options.isForcedRepair())
+                // we pre-filter the endpoints we want to repair for forced incremental repairs. So if any of the
+                // remaining ones go down, we still want to fail so we don't create repair sessions that can't complete
+                if (isForcedRepair && !options.isIncremental())
                 {
                     prepareLatch.countDown();
                 }
@@ -469,7 +484,7 @@ public class ActiveRepairService implements IEndpointStateChangeSubscriber, IFai
         throw new RuntimeException(errorMsg);
     }
 
-    public void registerParentRepairSession(UUID parentRepairSession, InetAddress coordinator, List<ColumnFamilyStore> columnFamilyStores, Collection<Range<Token>> ranges, boolean isIncremental, long repairedAt, boolean isGlobal, PreviewKind previewKind)
+    public synchronized void registerParentRepairSession(UUID parentRepairSession, InetAddressAndPort coordinator, List<ColumnFamilyStore> columnFamilyStores, Collection<Range<Token>> ranges, boolean isIncremental, long repairedAt, boolean isGlobal, PreviewKind previewKind)
     {
         assert isIncremental || repairedAt == ActiveRepairService.UNREPAIRED_SSTABLE;
         if (!registeredForEndpointChanges)
@@ -479,7 +494,10 @@ public class ActiveRepairService implements IEndpointStateChangeSubscriber, IFai
             registeredForEndpointChanges = true;
         }
 
-        parentRepairSessions.put(parentRepairSession, new ParentRepairSession(coordinator, columnFamilyStores, ranges, isIncremental, repairedAt, isGlobal, previewKind));
+        if (!parentRepairSessions.containsKey(parentRepairSession))
+        {
+            parentRepairSessions.put(parentRepairSession, new ParentRepairSession(coordinator, columnFamilyStores, ranges, isIncremental, repairedAt, isGlobal, previewKind));
+        }
     }
 
     public ParentRepairSession getParentRepairSession(UUID parentSessionId)
@@ -504,29 +522,32 @@ public class ActiveRepairService implements IEndpointStateChangeSubscriber, IFai
     public synchronized ParentRepairSession removeParentRepairSession(UUID parentSessionId)
     {
         String snapshotName = parentSessionId.toString();
-        for (ColumnFamilyStore cfs : getParentRepairSession(parentSessionId).columnFamilyStores.values())
+        ParentRepairSession session = parentRepairSessions.remove(parentSessionId);
+        if (session == null)
+            return null;
+        for (ColumnFamilyStore cfs : session.columnFamilyStores.values())
         {
             if (cfs.snapshotExists(snapshotName))
                 cfs.clearSnapshot(snapshotName);
         }
-        return parentRepairSessions.remove(parentSessionId);
+        return session;
     }
 
-    public void handleMessage(InetAddress endpoint, RepairMessage message)
+    public void handleMessage(Message<? extends RepairMessage> message)
     {
-        RepairJobDesc desc = message.desc;
+        RepairJobDesc desc = message.payload.desc;
         RepairSession session = sessions.get(desc.sessionId);
         if (session == null)
             return;
-        switch (message.messageType)
+        switch (message.verb())
         {
-            case VALIDATION_COMPLETE:
-                ValidationComplete validation = (ValidationComplete) message;
-                session.validationComplete(desc, endpoint, validation.trees);
+            case VALIDATION_RSP:
+                ValidationResponse validation = (ValidationResponse) message.payload;
+                session.validationComplete(desc, message.from(), validation.trees);
                 break;
-            case SYNC_COMPLETE:
+            case SYNC_RSP:
                 // one of replica is synced.
-                SyncComplete sync = (SyncComplete) message;
+                SyncResponse sync = (SyncResponse) message.payload;
                 session.syncComplete(desc, sync.nodes, sync.success, sync.summaries);
                 break;
             default:
@@ -541,21 +562,28 @@ public class ActiveRepairService implements IEndpointStateChangeSubscriber, IFai
      */
     public static class ParentRepairSession
     {
+        private final Keyspace keyspace;
         private final Map<TableId, ColumnFamilyStore> columnFamilyStores = new HashMap<>();
         private final Collection<Range<Token>> ranges;
         public final boolean isIncremental;
         public final boolean isGlobal;
         public final long repairedAt;
-        public final InetAddress coordinator;
+        public final InetAddressAndPort coordinator;
         public final PreviewKind previewKind;
 
-        public ParentRepairSession(InetAddress coordinator, List<ColumnFamilyStore> columnFamilyStores, Collection<Range<Token>> ranges, boolean isIncremental, long repairedAt, boolean isGlobal, PreviewKind previewKind)
+        public ParentRepairSession(InetAddressAndPort coordinator, List<ColumnFamilyStore> columnFamilyStores, Collection<Range<Token>> ranges, boolean isIncremental, long repairedAt, boolean isGlobal, PreviewKind previewKind)
         {
             this.coordinator = coordinator;
+            Set<Keyspace> keyspaces = new HashSet<>();
             for (ColumnFamilyStore cfs : columnFamilyStores)
             {
+                keyspaces.add(cfs.keyspace);
                 this.columnFamilyStores.put(cfs.metadata.id, cfs);
             }
+
+            Preconditions.checkArgument(keyspaces.size() == 1, "repair sessions cannot operate on multiple keyspaces");
+            this.keyspace = Iterables.getOnlyElement(keyspaces);
+
             this.ranges = ranges;
             this.repairedAt = repairedAt;
             this.isIncremental = isIncremental;
@@ -568,50 +596,22 @@ public class ActiveRepairService implements IEndpointStateChangeSubscriber, IFai
             return previewKind != PreviewKind.NONE;
         }
 
-        public Predicate<SSTableReader> getPreviewPredicate()
-        {
-            switch (previewKind)
-            {
-                case ALL:
-                    return (s) -> true;
-                case REPAIRED:
-                    return (s) -> s.isRepaired();
-                case UNREPAIRED:
-                    return (s) -> !s.isRepaired();
-                default:
-                    throw new RuntimeException("Can't get preview predicate for preview kind " + previewKind);
-            }
-        }
-
-        public synchronized void maybeSnapshot(TableId tableId, UUID parentSessionId)
-        {
-            String snapshotName = parentSessionId.toString();
-            if (!columnFamilyStores.get(tableId).snapshotExists(snapshotName))
-            {
-                Set<SSTableReader> snapshottedSSTables = columnFamilyStores.get(tableId).snapshot(snapshotName, new Predicate<SSTableReader>()
-                {
-                    public boolean apply(SSTableReader sstable)
-                    {
-                        return sstable != null &&
-                               (!isIncremental || !sstable.isRepaired()) &&
-                               !(sstable.metadata().isIndex()) && // exclude SSTables from 2i
-                               new Bounds<>(sstable.first.getToken(), sstable.last.getToken()).intersects(ranges);
-                    }
-                }, true, false);
-            }
-        }
-
         public Collection<ColumnFamilyStore> getColumnFamilyStores()
         {
             return ImmutableSet.<ColumnFamilyStore>builder().addAll(columnFamilyStores.values()).build();
         }
 
-        public Set<TableId> getTableIds()
+        public Keyspace getKeyspace()
         {
-            return ImmutableSet.copyOf(Iterables.transform(getColumnFamilyStores(), cfs -> cfs.metadata.id));
+            return keyspace;
         }
 
-        public Collection<Range<Token>> getRanges()
+        public Set<TableId> getTableIds()
+        {
+            return ImmutableSet.copyOf(transform(getColumnFamilyStores(), cfs -> cfs.metadata.id));
+        }
+
+        public Set<Range<Token>> getRanges()
         {
             return ImmutableSet.copyOf(ranges);
         }
@@ -631,18 +631,18 @@ public class ActiveRepairService implements IEndpointStateChangeSubscriber, IFai
     If the coordinator node dies we should remove the parent repair session from the other nodes.
     This uses the same notifications as we get in RepairSession
      */
-    public void onJoin(InetAddress endpoint, EndpointState epState) {}
-    public void beforeChange(InetAddress endpoint, EndpointState currentState, ApplicationState newStateKey, VersionedValue newValue) {}
-    public void onChange(InetAddress endpoint, ApplicationState state, VersionedValue value) {}
-    public void onAlive(InetAddress endpoint, EndpointState state) {}
-    public void onDead(InetAddress endpoint, EndpointState state) {}
+    public void onJoin(InetAddressAndPort endpoint, EndpointState epState) {}
+    public void beforeChange(InetAddressAndPort endpoint, EndpointState currentState, ApplicationState newStateKey, VersionedValue newValue) {}
+    public void onChange(InetAddressAndPort endpoint, ApplicationState state, VersionedValue value) {}
+    public void onAlive(InetAddressAndPort endpoint, EndpointState state) {}
+    public void onDead(InetAddressAndPort endpoint, EndpointState state) {}
 
-    public void onRemove(InetAddress endpoint)
+    public void onRemove(InetAddressAndPort endpoint)
     {
         convict(endpoint, Double.MAX_VALUE);
     }
 
-    public void onRestart(InetAddress endpoint, EndpointState state)
+    public void onRestart(InetAddressAndPort endpoint, EndpointState state)
     {
         convict(endpoint, Double.MAX_VALUE);
     }
@@ -656,7 +656,7 @@ public class ActiveRepairService implements IEndpointStateChangeSubscriber, IFai
      * @param ep  endpoint to be convicted
      * @param phi the value of phi with with ep was convicted
      */
-    public void convict(InetAddress ep, double phi)
+    public void convict(InetAddressAndPort ep, double phi)
     {
         // We want a higher confidence in the failure detection than usual because failing a repair wrongly has a high cost.
         if (phi < 2 * DatabaseDescriptor.getPhiConvictThreshold() || parentRepairSessions.isEmpty())
