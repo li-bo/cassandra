@@ -5142,6 +5142,14 @@ public class StorageService extends NotificationBroadcasterSupport implements IE
         ColumnFamilyStore.loadNewSSTables(ksName, cfName);
     }
 
+//    @Override
+//    public void deleteSStables(String ksName, String cfName, String... sstablePath) {
+//        if (!isInitialized())
+//            throw new RuntimeException("Not yet initialized, can't delete sstables");
+//        verifyKeyspaceIsValid(ksName);
+//        ColumnFamilyStore.deleteSSTables(ksName, cfName, sstablePath);
+//    }
+
     /**
      * #{@inheritDoc}
      */

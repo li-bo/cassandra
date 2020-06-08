@@ -145,6 +145,8 @@ public interface ColumnFamilyStoreMBean
      */
     public void loadNewSSTables();
 
+    public List<String> removeSSTables(Set<String> sstablePath);
+
     /**
      * @return the number of SSTables in L0.  Always return 0 if Leveled compaction is not enabled.
      */

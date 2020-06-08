@@ -17,26 +17,20 @@
  */
 package org.apache.cassandra.db.lifecycle;
 
-import java.io.File;
-import java.util.*;
-import java.util.concurrent.CopyOnWriteArrayList;
-import java.util.concurrent.atomic.AtomicReference;
-
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Function;
 import com.google.common.base.Predicate;
 import com.google.common.base.Predicates;
-import com.google.common.collect.*;
-
+import com.google.common.collect.Iterables;
+import com.google.common.collect.Sets;
+import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.Directories;
 import org.apache.cassandra.db.Memtable;
 import org.apache.cassandra.db.commitlog.CommitLogPosition;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
-import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.compaction.OperationType;
+import org.apache.cassandra.io.sstable.Component;
+import org.apache.cassandra.io.sstable.Descriptor;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.io.util.FileUtils;
 import org.apache.cassandra.metrics.StorageMetrics;
@@ -44,6 +38,13 @@ import org.apache.cassandra.notifications.*;
 import org.apache.cassandra.utils.Pair;
 import org.apache.cassandra.utils.Throwables;
 import org.apache.cassandra.utils.concurrent.OpOrder;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.File;
+import java.util.*;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static com.google.common.base.Predicates.and;
 import static com.google.common.collect.ImmutableSet.copyOf;
@@ -51,9 +52,7 @@ import static com.google.common.collect.Iterables.filter;
 import static java.util.Collections.singleton;
 import static java.util.Collections.singletonList;
 import static org.apache.cassandra.db.lifecycle.Helpers.*;
-import static org.apache.cassandra.db.lifecycle.View.permitCompacting;
-import static org.apache.cassandra.db.lifecycle.View.updateCompacting;
-import static org.apache.cassandra.db.lifecycle.View.updateLiveSet;
+import static org.apache.cassandra.db.lifecycle.View.*;
 import static org.apache.cassandra.utils.Throwables.maybeFail;
 import static org.apache.cassandra.utils.Throwables.merge;
 import static org.apache.cassandra.utils.concurrent.Refs.release;
@@ -288,6 +287,22 @@ public class Tracker
         }, OperationType.UNKNOWN, null));
     }
 
+
+    // return true if remove failed
+    public boolean removeSSTable(final String filename)
+    {
+        Descriptor desc = Descriptor.fromFilename(filename);
+        return Throwables.failIfCanCast(dropSSTables(new Predicate<SSTableReader>()
+        {
+            public boolean apply(SSTableReader reader)
+            {
+                logger.info("remove sstable filename {} --  {}",
+                        filename, reader.descriptor.filenameFor(Component.DATA));
+
+                return reader.descriptor.filenameFor(Component.DATA).equals(filename);
+            }
+        }, OperationType.UNKNOWN, null), null);
+    }
 
 
     // FLUSHING

@@ -32,7 +32,12 @@ import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.io.sstable.format.SSTableWriter;
 import org.apache.cassandra.io.sstable.metadata.MetadataCollector;
 
-public class SimpleSSTableMultiWriter implements SSTableMultiWriter
+import java.util.Collection;
+import java.util.Collections;
+import java.util.UUID;
+
+public class
+SimpleSSTableMultiWriter implements SSTableMultiWriter
 {
     private final SSTableWriter writer;
     private final LifecycleNewTracker lifecycleNewTracker;

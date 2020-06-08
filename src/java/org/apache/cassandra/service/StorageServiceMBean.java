@@ -17,6 +17,14 @@
  */
 package org.apache.cassandra.service;
 
+import org.apache.cassandra.db.ColumnFamilyStoreMBean;
+import org.apache.cassandra.exceptions.ConfigurationException;
+
+import javax.annotation.Nullable;
+import javax.management.NotificationEmitter;
+import javax.management.openmbean.CompositeData;
+import javax.management.openmbean.OpenDataException;
+import javax.management.openmbean.TabularData;
 import java.io.IOException;
 import java.net.InetAddress;
 import java.net.UnknownHostException;

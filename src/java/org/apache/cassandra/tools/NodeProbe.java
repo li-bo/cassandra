@@ -1636,4 +1636,10 @@ class ColumnFamilyStoreMBeanIterator implements Iterator<Map.Entry<String, Colum
     {
         throw new UnsupportedOperationException();
     }
+
+    public List<String> removeSStables(String ksName, String cfName, Set<String> srcPaths)
+    {
+        return getCfsProxy(ksName, cfName).removeSSTables(srcPaths);
+    }
+
 }

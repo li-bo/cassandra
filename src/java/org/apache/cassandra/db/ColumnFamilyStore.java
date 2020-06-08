@@ -278,6 +278,24 @@ public class ColumnFamilyStore implements ColumnFamilyStoreMBean
             executorService.awaitTermination(60, TimeUnit.SECONDS);
     }
 
+//    public static void removeSSTables(String ksName, String cfName, Set<String> sstablePath) {
+//        /** ks/cf existence checks will be done by open and getCFS methods for us */
+//        Keyspace keyspace = Keyspace.open(ksName);
+//        keyspace.getColumnFamilyStore(cfName).removeSSTables(sstablePath);
+//    }
+
+    public List<String> removeSSTables(Set<String> sstablePath) {
+        List<String> failedDirectories = new ArrayList<>();
+
+        for (String filename: sstablePath) {
+            boolean failed = data.removeSSTable(filename);
+            if (failed)
+                failedDirectories.add(filename);
+        }
+
+        return failedDirectories;
+    }
+
     public void reload()
     {
         // metadata object has been mutated directly. make all the members jibe with new settings.
