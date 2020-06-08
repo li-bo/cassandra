@@ -78,6 +78,16 @@
             <artifactId>rmi</artifactId>
             <version>1.0.1.wso2v1</version>
         </dependency>
+        <dependency>
+            <groupId>io.airlift</groupId>
+            <artifactId>json</artifactId>
+            <version>0.197</version>
+        </dependency>
+        <dependency>
+            <groupId>io.airlift</groupId>
+            <artifactId>airline</artifactId>
+            <version>0.9</version>
+        </dependency>
     </dependencies>
 
 </project>

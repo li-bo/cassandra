@@ -95,7 +95,10 @@
     <condition property="maven-repository-id" value="apache.releases.https">
       <isset property="release"/>
     </condition>
+    <!--
     <property name="maven-repository-url" value="https://repository.apache.org/content/repositories/snapshots"/>
+    -->
+    <property name="maven-repository-url" value="https://repo.maven.apache.org/maven2"/>
     <property name="maven-repository-id" value="apache.snapshots.https"/>
 
     <property name="test.timeout" value="240000" />
@@ -434,7 +437,7 @@
           <dependency groupId="io.dropwizard.metrics" artifactId="metrics-jvm" version="3.1.5" />
           <dependency groupId="com.addthis.metrics" artifactId="reporter-config3" version="3.0.3" />
           <dependency groupId="org.mindrot" artifactId="jbcrypt" version="0.3m" />
-          <dependency groupId="io.airlift" artifactId="airline" version="0.6" />
+          <dependency groupId="io.airlift" artifactId="airline" version="0.9" />
           <dependency groupId="io.netty" artifactId="netty-all" version="4.0.44.Final" />
           <dependency groupId="com.google.code.findbugs" artifactId="jsr305" version="2.0.2" />
           <dependency groupId="com.clearspring.analytics" artifactId="stream" version="2.5.2" />
