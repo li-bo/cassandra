@@ -17,23 +17,22 @@
  */
 package org.apache.cassandra.io.sstable;
 
-import java.lang.ref.WeakReference;
-import java.util.*;
-
 import com.google.common.annotations.VisibleForTesting;
-
 import org.apache.cassandra.cache.InstrumentingCache;
 import org.apache.cassandra.cache.KeyCacheKey;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.DecoratedKey;
 import org.apache.cassandra.db.RowIndexEntry;
+import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
 import org.apache.cassandra.db.rows.UnfilteredRowIterator;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.io.sstable.format.SSTableWriter;
-import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
 import org.apache.cassandra.utils.NativeLibrary;
 import org.apache.cassandra.utils.concurrent.Transactional;
+
+import java.lang.ref.WeakReference;
+import java.util.*;
 
 /**
  * Wraps one or more writers as output for rewriting one or more readers: every sstable_preemptive_open_interval_in_mb
@@ -64,7 +63,7 @@ public class SSTableRewriter extends Transactional.AbstractTransactional impleme
 
     private long currentlyOpenedEarlyAt; // the position (in MB) in the target file we last (re)opened at
 
-    private final List<SSTableWriter> writers = new ArrayList<>();
+    private final Set<SSTableWriter> writers = new HashSet<>();
     private final boolean keepOriginals; // true if we do not want to obsolete the originals
 
     private SSTableWriter writer;
@@ -125,6 +124,13 @@ public class SSTableRewriter extends Transactional.AbstractTransactional impleme
     public SSTableWriter currentWriter()
     {
         return writer;
+    }
+
+    public void setCurrentWriter(SSTableWriter newWriter)
+    {
+        if (newWriter != null)
+            writers.add(newWriter.setMaxDataAge(maxAge));
+        this.writer = newWriter;
     }
 
     public RowIndexEntry append(UnfilteredRowIterator partition)

@@ -17,22 +17,27 @@
  */
 package org.apache.cassandra.db.compaction.writers;
 
-import java.util.Arrays;
-import java.util.Set;
-
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.Directories;
 import org.apache.cassandra.db.RowIndexEntry;
 import org.apache.cassandra.db.SerializationHeader;
-import org.apache.cassandra.db.rows.UnfilteredRowIterator;
+import org.apache.cassandra.db.compaction.NewTimeWindowCompactionStrategy;
+import org.apache.cassandra.db.compaction.NewTimeWindowCompactionStrategyOptions;
 import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
+import org.apache.cassandra.db.rows.Row;
+import org.apache.cassandra.db.rows.UnfilteredRowIterator;
+import org.apache.cassandra.db.transform.UnfilteredRows;
 import org.apache.cassandra.io.sstable.Descriptor;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.io.sstable.format.SSTableWriter;
 import org.apache.cassandra.io.sstable.metadata.MetadataCollector;
+import org.apache.cassandra.utils.Pair;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.HashMap;
+import java.util.Set;
+import java.util.concurrent.TimeUnit;
 
 /**
  * CompactionAwareWriter that splits input in differently sized sstables
@@ -40,79 +45,121 @@ import org.apache.cassandra.io.sstable.metadata.MetadataCollector;
  * Biggest sstable will be total_compaction_size / 2, second biggest total_compaction_size / 4 etc until
  * the result would be sub 50MB, all those are put in the same
  */
-public class SplittingSizeTieredCompactionWriter extends CompactionAwareWriter
+public class SplittingTimeWindowCompactionWriter extends CompactionAwareWriter
 {
     private static final Logger logger = LoggerFactory.getLogger(SplittingSizeTieredCompactionWriter.class);
 
-    public static final long DEFAULT_SMALLEST_SSTABLE_BYTES = 50_000_000;
-    private final double[] ratios;
+    public static final long DEFAULT_SMALLEST_SSTABLE_BYTES = 1;
     private final long totalSize;
     private final Set<SSTableReader> allSSTables;
-    private long currentBytesToWrite;
-    private int currentRatioIndex = 0;
+    private long expectedBloomFilterSize = 0;
+    private long windowInMills;
     private Directories.DataDirectory location;
+    private HashMap<Long, SSTableWriter> writerHashMap = new HashMap<>();
+    private NewTimeWindowCompactionStrategyOptions options;
+    boolean locationSwitched = false;
+    private long preSpan = -1;
 
-    public SplittingSizeTieredCompactionWriter(ColumnFamilyStore cfs, Directories directories, LifecycleTransaction txn, Set<SSTableReader> nonExpiredSSTables)
+    public SplittingTimeWindowCompactionWriter(ColumnFamilyStore cfs, Directories directories, LifecycleTransaction txn,
+                                               Set<SSTableReader> nonExpiredSSTables, NewTimeWindowCompactionStrategyOptions options)
     {
-        this(cfs, directories, txn, nonExpiredSSTables, DEFAULT_SMALLEST_SSTABLE_BYTES);
+        this(cfs, directories, txn, nonExpiredSSTables);
+        this.options = options;
+        windowInMills = NewTimeWindowCompactionStrategy.getTimeWindowInMills(
+                options.sstableWindowUnit, options.sstableWindowSize);
     }
 
-    public SplittingSizeTieredCompactionWriter(ColumnFamilyStore cfs, Directories directories, LifecycleTransaction txn, Set<SSTableReader> nonExpiredSSTables, long smallestSSTable)
+    public SplittingTimeWindowCompactionWriter(ColumnFamilyStore cfs, Directories directories, LifecycleTransaction txn,
+                                               Set<SSTableReader> nonExpiredSSTables)
     {
         super(cfs, directories, txn, nonExpiredSSTables, false, false);
         this.allSSTables = txn.originals();
-        totalSize = cfs.getExpectedCompactedFileSize(nonExpiredSSTables, txn.opType());
-        double[] potentialRatios = new double[20];
-        double currentRatio = 1;
-        for (int i = 0; i < potentialRatios.length; i++)
-        {
-            currentRatio /= 2;
-            potentialRatios[i] = currentRatio;
-        }
+        expectedBloomFilterSize = Math.max(cfs.metadata.params.minIndexInterval, (int)(SSTableReader.getApproximateKeyCount(nonExpiredSSTables)));
 
-        int noPointIndex = 0;
-        // find how many sstables we should create - 50MB min sstable size
-        for (double ratio : potentialRatios)
-        {
-            noPointIndex++;
-            if (ratio * totalSize < smallestSSTable)
-            {
-                break;
-            }
-        }
-        ratios = Arrays.copyOfRange(potentialRatios, 0, noPointIndex);
-        currentBytesToWrite = Math.round(totalSize * ratios[currentRatioIndex]);
+        totalSize = cfs.getExpectedCompactedFileSize(nonExpiredSSTables, txn.opType());
     }
 
     @Override
     public boolean realAppend(UnfilteredRowIterator partition)
     {
-        RowIndexEntry rie = sstableWriter.append(partition);
-        if (sstableWriter.currentWriter().getEstimatedOnDiskBytesWritten() > currentBytesToWrite && currentRatioIndex < ratios.length - 1) // if we underestimate how many keys we have, the last sstable might get more than we expect
-        {
-            currentRatioIndex++;
-            currentBytesToWrite = Math.round(totalSize * ratios[currentRatioIndex]);
-            switchCompactionLocation(location);
-            logger.debug("Switching writer, currentBytesToWrite = {}", currentBytesToWrite);
+        try {
+//        UnfilteredRowIterator it = new UnfilteredRowIterator(partition);
+            long span = getSpan(partition);
+
+            switchWriter(location, span);
+            RowIndexEntry rie = sstableWriter.append(partition);
+            logger.trace("realAppend {} - span {}", partition, span);
+
+            if (preSpan != span) {
+                preSpan = span;
+            }
+            return rie != null;
+        } catch (Exception e) {
+            logger.error("realAppend failed {}", e.getMessage());
+            return false;
         }
-        return rie != null;
+    }
+
+    private long getSpan(UnfilteredRowIterator partition) {
+        long span = 0;
+
+       if (partition.hasNext())
+        {
+            UnfilteredRows rows = (UnfilteredRows) partition;
+            Row row = (Row)rows.peek();
+            Long rowTimestamp = row.primaryKeyLivenessInfo().timestamp();
+            logger.trace("xxxxxxx  row info {}", rowTimestamp);
+            long tStamp = TimeUnit.MILLISECONDS.convert(rowTimestamp, TimeUnit.MICROSECONDS);
+            Pair<Long, Long> boundsMax = NewTimeWindowCompactionStrategy.getWindowBoundsInMillis(options.sstableWindowUnit, options.sstableWindowSize, tStamp);
+            span = (long) (boundsMax.left / windowInMills);
+        }
+        return span;
+    }
+
+    private void switchWriter(Directories.DataDirectory location, long span) {
+        if (span == preSpan) return;
+        if (locationSwitched && sstableWriter.currentWriter() != null) {
+            writerHashMap.put(span, sstableWriter.currentWriter());
+            locationSwitched = false;
+            logger.trace("Switching to pre-created writer {} for span {}",
+                    writerHashMap.get(span).descriptor.baseFilename(), span);
+            return;
+        }
+        if (writerHashMap.get(span) != null) {
+            sstableWriter.setCurrentWriter(writerHashMap.get(span));
+            logger.trace("Switching to existed writer {} for span {}",
+                    writerHashMap.get(span).descriptor.baseFilename(), span);
+            return;
+        }
+
+        SSTableWriter writer = SSTableWriter.create(Descriptor.fromFilename(cfs.getSSTablePath(getDirectories().getLocationForDisk(location))),
+                estimatedTotalKeys,
+                minRepairedAt,
+                cfs.metadata,
+                new MetadataCollector(allSSTables, cfs.metadata.comparator, 0),
+                SerializationHeader.make(cfs.metadata, nonExpiredSSTables),
+                cfs.indexManager.listIndexes(),
+                txn);
+        writerHashMap.put(span, writer);
+        sstableWriter.setCurrentWriter(writer);
+        logger.trace("Switching to new writer {} for span {}", writer.descriptor.baseFilename(), span);
     }
 
     @Override
     public void switchCompactionLocation(Directories.DataDirectory location)
     {
         this.location = location;
-        long currentPartitionsToWrite = Math.round(ratios[currentRatioIndex] * estimatedTotalKeys);
         @SuppressWarnings("resource")
         SSTableWriter writer = SSTableWriter.create(Descriptor.fromFilename(cfs.getSSTablePath(getDirectories().getLocationForDisk(location))),
-                                                    currentPartitionsToWrite,
+                                                    expectedBloomFilterSize,
                                                     minRepairedAt,
                                                     cfs.metadata,
                                                     new MetadataCollector(allSSTables, cfs.metadata.comparator, 0),
                                                     SerializationHeader.make(cfs.metadata, nonExpiredSSTables),
                                                     cfs.indexManager.listIndexes(),
                                                     txn);
-        logger.trace("Switching writer, currentPartitionsToWrite = {}", currentPartitionsToWrite);
-        sstableWriter.switchWriter(writer);
+        logger.trace("switchCompactionLocation create new writer {}", writer.descriptor.baseFilename());
+        sstableWriter.setCurrentWriter(writer);
+        locationSwitched = true;
     }
 }

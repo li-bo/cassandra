@@ -18,27 +18,22 @@
 
 package org.apache.cassandra.db.compaction.writers;
 
-import java.io.File;
-import java.util.Collection;
-import java.util.List;
-import java.util.Set;
-
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
-import org.apache.cassandra.db.ColumnFamilyStore;
-import org.apache.cassandra.db.DecoratedKey;
-import org.apache.cassandra.db.Directories;
-import org.apache.cassandra.db.DiskBoundaries;
-import org.apache.cassandra.db.PartitionPosition;
-import org.apache.cassandra.db.rows.UnfilteredRowIterator;
+import org.apache.cassandra.db.*;
 import org.apache.cassandra.db.compaction.CompactionTask;
+import org.apache.cassandra.db.compaction.OperationType;
 import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
+import org.apache.cassandra.db.rows.UnfilteredRowIterator;
 import org.apache.cassandra.io.sstable.SSTableRewriter;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.concurrent.Transactional;
-import org.apache.cassandra.db.compaction.OperationType;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.File;
+import java.util.Collection;
+import java.util.List;
+import java.util.Set;
 
 
 /**
@@ -58,9 +53,9 @@ public abstract class CompactionAwareWriter extends Transactional.AbstractTransa
 
     protected final SSTableRewriter sstableWriter;
     protected final LifecycleTransaction txn;
-    private final List<Directories.DataDirectory> locations;
-    private final List<PartitionPosition> diskBoundaries;
-    private int locationIndex;
+    protected final List<Directories.DataDirectory> locations;
+    protected final List<PartitionPosition> diskBoundaries;
+    protected int locationIndex;
 
     @Deprecated
     public CompactionAwareWriter(ColumnFamilyStore cfs,

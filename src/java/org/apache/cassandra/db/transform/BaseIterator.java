@@ -94,6 +94,15 @@ abstract class BaseIterator<V, I extends CloseableIterator<? extends V>, O exten
         maybeFail(fail);
     }
 
+    public final O peek()
+    {
+        if (next == null && !hasNext())
+            throw new NoSuchElementException();
+
+        O next = (O) this.next;
+        return next;
+    }
+
     public final O next()
     {
         if (next == null && !hasNext())

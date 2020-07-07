@@ -212,12 +212,12 @@ public class BigTableWriter extends SSTableWriter
         }
     }
 
-    private static class StatsCollector extends Transformation
+    public static class StatsCollector extends Transformation
     {
         private final MetadataCollector collector;
         private int cellCount;
 
-        StatsCollector(MetadataCollector collector)
+        public StatsCollector(MetadataCollector collector)
         {
             this.collector = collector;
         }
