@@ -27,16 +27,20 @@ import org.slf4j.LoggerFactory;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
 
-public final class NewTimeWindowCompactionStrategyOptions
+public final class TrueTimeWindowCompactionStrategyOptions
 {
-    private static final Logger logger = LoggerFactory.getLogger(NewTimeWindowCompactionStrategyOptions.class);
+    private static final Logger logger = LoggerFactory.getLogger(TrueTimeWindowCompactionStrategyOptions.class);
 
     protected static final TimeUnit DEFAULT_TIMESTAMP_RESOLUTION = TimeUnit.MICROSECONDS;
     protected static final TimeUnit DEFAULT_COMPACTION_WINDOW_UNIT = TimeUnit.DAYS;
     protected static final int DEFAULT_COMPACTION_WINDOW_SIZE = 1;
     protected static final int DEFAULT_EXPIRED_SSTABLE_CHECK_FREQUENCY_SECONDS = 60 * 10;
     protected static final Boolean DEFAULT_UNSAFE_AGGRESSIVE_SSTABLE_EXPIRATION = false;
-    private static final long DEFAULT_SSTABLE_SPLIT_THRESHOLD = 128 * 1024 * 1024L;   //128MB
+    private static final long DEFAULT_SSTABLE_SPLIT_THRESHOLD = 128L;   //128MB
+    private static final long DEFAULT_MAX_SSTABLE_SIZE_THRESHOLD = 10 * 1024L; //10GB
+    private static final int DEFAULT_MIN_SSTABLE_SPLIT_WINDOW = 1;
+    private static final long MEGABYTES = 1024*1024L;
+
 
     protected static final String TIMESTAMP_RESOLUTION_KEY = "timestamp_resolution";
     protected static final String COMPACTION_WINDOW_UNIT_KEY = "compaction_window_unit";
@@ -44,6 +48,8 @@ public final class NewTimeWindowCompactionStrategyOptions
     protected static final String EXPIRED_SSTABLE_CHECK_FREQUENCY_SECONDS_KEY = "expired_sstable_check_frequency_seconds";
     protected static final String UNSAFE_AGGRESSIVE_SSTABLE_EXPIRATION_KEY = "unsafe_aggressive_sstable_expiration";
     protected static final String SSTABLE_SPLIT_THRESHOLD_KEY = "sstable_split_threshold";
+    protected static final String MAX_SSTABLE_SIZE_THRESHOLD_KEY = "max_sstable_size_threshold";
+    protected static final String MIN_SSTABLE_SPLIT_WINDOW_KEY = "min_sstable_split_window";
 
     static final String UNSAFE_AGGRESSIVE_SSTABLE_EXPIRATION_PROPERTY = Config.PROPERTY_PREFIX + "allow_unsafe_aggressive_sstable_expiration";
 
@@ -53,13 +59,16 @@ public final class NewTimeWindowCompactionStrategyOptions
     protected final long expiredSSTableCheckFrequency;
     protected final boolean ignoreOverlaps;
     public final long sstableSplitThreshold;
+    public final long maxSStableSizeThreshold;
+    public final long timeWindowInMillis;
+    public final int minSStableSplitWindow;
 
     SizeTieredCompactionStrategyOptions stcsOptions;
 
     protected final static ImmutableList<TimeUnit> validTimestampTimeUnits = ImmutableList.of(TimeUnit.SECONDS, TimeUnit.MILLISECONDS, TimeUnit.MICROSECONDS, TimeUnit.NANOSECONDS);
     protected final static ImmutableList<TimeUnit> validWindowTimeUnits = ImmutableList.of(TimeUnit.MINUTES, TimeUnit.HOURS, TimeUnit.DAYS);
 
-    public NewTimeWindowCompactionStrategyOptions(Map<String, String> options)
+    public TrueTimeWindowCompactionStrategyOptions(Map<String, String> options)
     {
         String optionValue = options.get(TIMESTAMP_RESOLUTION_KEY);
         timestampResolution = optionValue == null ? DEFAULT_TIMESTAMP_RESOLUTION : TimeUnit.valueOf(optionValue);
@@ -79,19 +88,43 @@ public final class NewTimeWindowCompactionStrategyOptions
         ignoreOverlaps = optionValue == null ? DEFAULT_UNSAFE_AGGRESSIVE_SSTABLE_EXPIRATION : (Boolean.getBoolean(UNSAFE_AGGRESSIVE_SSTABLE_EXPIRATION_PROPERTY) && Boolean.parseBoolean(optionValue));
 
         optionValue = options.get(SSTABLE_SPLIT_THRESHOLD_KEY);
-        sstableSplitThreshold = optionValue == null ? DEFAULT_SSTABLE_SPLIT_THRESHOLD : Long.parseLong(optionValue);
+        sstableSplitThreshold = optionValue == null ? DEFAULT_SSTABLE_SPLIT_THRESHOLD * MEGABYTES : Long.parseLong(optionValue) * MEGABYTES;
+
+        optionValue = options.get(MAX_SSTABLE_SIZE_THRESHOLD_KEY);
+        maxSStableSizeThreshold = optionValue == null ? DEFAULT_MAX_SSTABLE_SIZE_THRESHOLD * MEGABYTES : Long.parseLong(optionValue) * MEGABYTES;
+
+        optionValue = options.get(MIN_SSTABLE_SPLIT_WINDOW_KEY);
+        minSStableSplitWindow = optionValue == null ? DEFAULT_MIN_SSTABLE_SPLIT_WINDOW : Integer.parseInt(optionValue);
+
+        timeWindowInMillis = getTimeWindowInMills(sstableWindowUnit, sstableWindowSize);
 
         stcsOptions = new SizeTieredCompactionStrategyOptions(options);
     }
 
-    public NewTimeWindowCompactionStrategyOptions()
+    private long getTimeWindowInMills(TimeUnit windowTimeUnit, int windowTimeSize) {
+        switch(windowTimeUnit) {
+            case MINUTES:
+                return 60L * windowTimeSize * 1000L;
+            case HOURS:
+                return 3600L * windowTimeSize * 1000L;
+            case DAYS:
+            default:
+                return 86400L * windowTimeSize * 1000L;
+        }
+    }
+
+    public TrueTimeWindowCompactionStrategyOptions()
     {
         sstableWindowUnit = DEFAULT_COMPACTION_WINDOW_UNIT;
         timestampResolution = DEFAULT_TIMESTAMP_RESOLUTION;
         sstableWindowSize = DEFAULT_COMPACTION_WINDOW_SIZE;
         expiredSSTableCheckFrequency = TimeUnit.MILLISECONDS.convert(DEFAULT_EXPIRED_SSTABLE_CHECK_FREQUENCY_SECONDS, TimeUnit.SECONDS);
         ignoreOverlaps = DEFAULT_UNSAFE_AGGRESSIVE_SSTABLE_EXPIRATION;
-        sstableSplitThreshold = DEFAULT_SSTABLE_SPLIT_THRESHOLD;
+        sstableSplitThreshold = DEFAULT_SSTABLE_SPLIT_THRESHOLD * MEGABYTES;
+        maxSStableSizeThreshold = DEFAULT_MAX_SSTABLE_SIZE_THRESHOLD * MEGABYTES;
+        minSStableSplitWindow = DEFAULT_MIN_SSTABLE_SPLIT_WINDOW;
+        timeWindowInMillis = getTimeWindowInMills(sstableWindowUnit, sstableWindowSize);
+
         stcsOptions = new SizeTieredCompactionStrategyOptions();
     }
 
@@ -176,12 +209,41 @@ public final class NewTimeWindowCompactionStrategyOptions
             throw new ConfigurationException(String.format("%s is not a parsable int (base10) for %s", optionValue, SSTABLE_SPLIT_THRESHOLD_KEY), e);
         }
 
+        optionValue = options.get(MAX_SSTABLE_SIZE_THRESHOLD_KEY);
+        try
+        {
+            long sstableSplitThreshold = optionValue == null ? DEFAULT_MAX_SSTABLE_SIZE_THRESHOLD : Long.parseLong(optionValue);
+            if (sstableSplitThreshold < 0)
+            {
+                throw new ConfigurationException(String.format("%d must be greater than 0 for %s", sstableSplitThreshold, MAX_SSTABLE_SIZE_THRESHOLD_KEY));
+            }
+        }
+        catch (NumberFormatException e)
+        {
+            throw new ConfigurationException(String.format("%s is not a parsable int (base10) for %s", optionValue, MAX_SSTABLE_SIZE_THRESHOLD_KEY), e);
+        }
+
+        optionValue = options.get(MIN_SSTABLE_SPLIT_WINDOW_KEY);
+        try
+        {
+            int minSStableSplitWindow = optionValue == null ? DEFAULT_MIN_SSTABLE_SPLIT_WINDOW : Integer.parseInt(optionValue);
+            if (minSStableSplitWindow < 0)
+            {
+                throw new ConfigurationException(String.format("%d must be greater than 0 for %s", minSStableSplitWindow, MIN_SSTABLE_SPLIT_WINDOW_KEY));
+            }
+        }
+        catch (NumberFormatException e)
+        {
+            throw new ConfigurationException(String.format("%s is not a parsable int (base10) for %s", optionValue, MIN_SSTABLE_SPLIT_WINDOW_KEY), e);
+        }
         uncheckedOptions.remove(COMPACTION_WINDOW_SIZE_KEY);
         uncheckedOptions.remove(COMPACTION_WINDOW_UNIT_KEY);
         uncheckedOptions.remove(TIMESTAMP_RESOLUTION_KEY);
         uncheckedOptions.remove(EXPIRED_SSTABLE_CHECK_FREQUENCY_SECONDS_KEY);
         uncheckedOptions.remove(UNSAFE_AGGRESSIVE_SSTABLE_EXPIRATION_KEY);
         uncheckedOptions.remove(SSTABLE_SPLIT_THRESHOLD_KEY);
+        uncheckedOptions.remove(MAX_SSTABLE_SIZE_THRESHOLD_KEY);
+        uncheckedOptions.remove(MIN_SSTABLE_SPLIT_WINDOW_KEY);
 
         uncheckedOptions = SizeTieredCompactionStrategyOptions.validateOptions(options, uncheckedOptions);
 

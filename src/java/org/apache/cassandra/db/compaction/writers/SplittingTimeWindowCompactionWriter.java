@@ -21,8 +21,8 @@ import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.Directories;
 import org.apache.cassandra.db.RowIndexEntry;
 import org.apache.cassandra.db.SerializationHeader;
-import org.apache.cassandra.db.compaction.NewTimeWindowCompactionStrategy;
-import org.apache.cassandra.db.compaction.NewTimeWindowCompactionStrategyOptions;
+import org.apache.cassandra.db.compaction.TrueTimeWindowCompactionStrategy;
+import org.apache.cassandra.db.compaction.TrueTimeWindowCompactionStrategyOptions;
 import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
 import org.apache.cassandra.db.rows.Row;
 import org.apache.cassandra.db.rows.UnfilteredRowIterator;
@@ -49,24 +49,20 @@ public class SplittingTimeWindowCompactionWriter extends CompactionAwareWriter
 {
     private static final Logger logger = LoggerFactory.getLogger(SplittingSizeTieredCompactionWriter.class);
 
-    public static final long DEFAULT_SMALLEST_SSTABLE_BYTES = 1;
     private final long totalSize;
     private final Set<SSTableReader> allSSTables;
     private long expectedBloomFilterSize = 0;
-    private long windowInMills;
     private Directories.DataDirectory location;
     private HashMap<Long, SSTableWriter> writerHashMap = new HashMap<>();
-    private NewTimeWindowCompactionStrategyOptions options;
+    private TrueTimeWindowCompactionStrategyOptions options;
     boolean locationSwitched = false;
     private long preSpan = -1;
 
     public SplittingTimeWindowCompactionWriter(ColumnFamilyStore cfs, Directories directories, LifecycleTransaction txn,
-                                               Set<SSTableReader> nonExpiredSSTables, NewTimeWindowCompactionStrategyOptions options)
+                                               Set<SSTableReader> nonExpiredSSTables, TrueTimeWindowCompactionStrategyOptions options)
     {
         this(cfs, directories, txn, nonExpiredSSTables);
         this.options = options;
-        windowInMills = NewTimeWindowCompactionStrategy.getTimeWindowInMills(
-                options.sstableWindowUnit, options.sstableWindowSize);
     }
 
     public SplittingTimeWindowCompactionWriter(ColumnFamilyStore cfs, Directories directories, LifecycleTransaction txn,
@@ -110,8 +106,12 @@ public class SplittingTimeWindowCompactionWriter extends CompactionAwareWriter
             Long rowTimestamp = row.primaryKeyLivenessInfo().timestamp();
             logger.trace("xxxxxxx  row info {}", rowTimestamp);
             long tStamp = TimeUnit.MILLISECONDS.convert(rowTimestamp, TimeUnit.MICROSECONDS);
-            Pair<Long, Long> boundsMax = NewTimeWindowCompactionStrategy.getWindowBoundsInMillis(options.sstableWindowUnit, options.sstableWindowSize, tStamp);
-            span = (long) (boundsMax.left / windowInMills);
+            long minSplitStamp = System.currentTimeMillis() - options.minSStableSplitWindow * options.timeWindowInMillis;
+            if (tStamp < minSplitStamp) {
+                tStamp = minSplitStamp;
+            }
+            Pair<Long, Long> boundsMax = TrueTimeWindowCompactionStrategy.getWindowBoundsInMillis(options.sstableWindowUnit, options.sstableWindowSize, tStamp);
+            span = (long) (boundsMax.left / options.timeWindowInMillis);
         }
         return span;
     }

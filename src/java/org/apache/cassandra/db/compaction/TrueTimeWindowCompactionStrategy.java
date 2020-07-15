@@ -38,22 +38,22 @@ import java.util.concurrent.TimeUnit;
 
 import static com.google.common.collect.Iterables.filter;
 
-public class NewTimeWindowCompactionStrategy extends AbstractCompactionStrategy
+public class TrueTimeWindowCompactionStrategy extends AbstractCompactionStrategy
 {
-    private static final Logger logger = LoggerFactory.getLogger(NewTimeWindowCompactionStrategy.class);
-    private static Range abnormalRange = new Range(Long.MIN_VALUE, Long.MIN_VALUE, Long.MAX_VALUE);
+    private static final Logger logger = LoggerFactory.getLogger(TrueTimeWindowCompactionStrategy.class);
+    private static Range abnormalRange = new Range(Long.MIN_VALUE, Long.MAX_VALUE, Long.MIN_VALUE);
 
-    private final NewTimeWindowCompactionStrategyOptions options;
+    private final TrueTimeWindowCompactionStrategyOptions options;
     protected volatile int estimatedRemainingTasks;
     private final Set<SSTableReader> sstables = new HashSet<>();
     private long lastExpiredCheck;
     private long highestWindowSeen;
 
-    public NewTimeWindowCompactionStrategy(ColumnFamilyStore cfs, Map<String, String> options)
+    public TrueTimeWindowCompactionStrategy(ColumnFamilyStore cfs, Map<String, String> options)
     {
         super(cfs, options);
         this.estimatedRemainingTasks = 0;
-        this.options = new NewTimeWindowCompactionStrategyOptions(options);
+        this.options = new TrueTimeWindowCompactionStrategyOptions(options);
         if (!options.containsKey(AbstractCompactionStrategy.TOMBSTONE_COMPACTION_INTERVAL_OPTION) && !options.containsKey(AbstractCompactionStrategy.TOMBSTONE_THRESHOLD_OPTION))
         {
             disableTombstoneCompactions = true;
@@ -99,7 +99,7 @@ public class NewTimeWindowCompactionStrategy extends AbstractCompactionStrategy
 
     private static class TimeWindowSplitCompactionTask extends CompactionTask
     {
-        private NewTimeWindowCompactionStrategyOptions options;
+        private TrueTimeWindowCompactionStrategyOptions options;
 
         public TimeWindowSplitCompactionTask(ColumnFamilyStore cfs, LifecycleTransaction txn, int gcBefore)
         {
@@ -115,7 +115,7 @@ public class NewTimeWindowCompactionStrategy extends AbstractCompactionStrategy
             return new SplittingTimeWindowCompactionWriter(cfs, directories, txn, nonExpiredSSTables, options);
         }
 
-        public void setOptions(NewTimeWindowCompactionStrategyOptions options) {
+        public void setOptions(TrueTimeWindowCompactionStrategyOptions options) {
             this.options = options;
         }
     }
@@ -184,8 +184,7 @@ public class NewTimeWindowCompactionStrategy extends AbstractCompactionStrategy
 
     private List<SSTableReader> getCompactionCandidates(Iterable<SSTableReader> candidateSSTables)
     {
-        Pair<HashMultimap<Range, SSTableReader>, Long> buckets = getBuckets(candidateSSTables, options.sstableWindowUnit,
-                options.sstableWindowSize, options.timestampResolution, options.sstableSplitThreshold);
+        Pair<HashMultimap<Range, SSTableReader>, Long> buckets = getBuckets(candidateSSTables, options);
         // Update the highest window seen, if necessary
         if(buckets.right > this.highestWindowSeen)
             this.highestWindowSeen = buckets.right;
@@ -194,8 +193,8 @@ public class NewTimeWindowCompactionStrategy extends AbstractCompactionStrategy
         List<SSTableReader> mostInteresting = newestBucket(buckets.left,
                                                            cfs.getMinimumCompactionThreshold(),
                                                            cfs.getMaximumCompactionThreshold(),
-                                                           options.stcsOptions,
-                                                           this.highestWindowSeen);
+                                                           options,
+                                                            this.highestWindowSeen);
         if (!mostInteresting.isEmpty())
             return mostInteresting;
         return null;
@@ -254,13 +253,18 @@ public class NewTimeWindowCompactionStrategy extends AbstractCompactionStrategy
         {
             this.min = min;
             this.max = max;
-            this.span = (int) ((max - min) / timeWindow + 1);
+            if (timeWindow == Long.MIN_VALUE)
+                this.span = Integer.MAX_VALUE;
+            else
+                this.span = (int) ((max - min) / timeWindow + 1);
             //logger.trace("new range {}-{}, span {}, timewindow {}", min, max, span, timeWindow);
         }
 
         @Override
         public int compareTo(Range o) {
-            return (this.min == o.min && this.max == o.max) ? 0 : 1;
+            long x = this.max + this.min;
+            long y = o.max + o.min;
+            return (x < y) ? -1 : ((x == y && this.max == o.max && this.span == o.span) ? 0 : 1);
         }
 
         @Override
@@ -273,7 +277,7 @@ public class NewTimeWindowCompactionStrategy extends AbstractCompactionStrategy
 
         @Override
         public int hashCode() {
-            int hash = 31 * Long.hashCode(min) + Long.hashCode(max);
+            int hash = 31 * Long.hashCode(min) + Long.hashCode(max) + Long.hashCode(span);
             //logger.debug("range hashcode called , return {}", hash);
             return hash;
         }
@@ -283,54 +287,45 @@ public class NewTimeWindowCompactionStrategy extends AbstractCompactionStrategy
      * Group files with similar max timestamp into buckets.
      *
      * @param files pairs consisting of a file and its min timestamp
-     * @param sstableWindowUnit
-     * @param sstableWindowSize
-     * @param timestampResolution
-     * @param sstableSplitThreshold
+     * @param options
      * @return A pair, where the left element is the bucket representation (map of timestamp to sstablereader), and the right is the highest timestamp seen
      */
     @VisibleForTesting
-    static Pair<HashMultimap<Range, SSTableReader>, Long> getBuckets(Iterable<SSTableReader> files, TimeUnit sstableWindowUnit, int sstableWindowSize, TimeUnit timestampResolution, long sstableSplitThreshold)
+    static Pair<HashMultimap<Range, SSTableReader>, Long> getBuckets(Iterable<SSTableReader> files, TrueTimeWindowCompactionStrategyOptions options)
     {
         HashMultimap<Range, SSTableReader> buckets = HashMultimap.create();
 
         long maxTimestamp = 0;
+        long minSplitTimeInMills = System.currentTimeMillis() - options.minSStableSplitWindow * options.timeWindowInMillis;
+
         // Create hash map to represent buckets
         // For each sstable, add sstable to the time bucket
         // Where the bucket is the file's max timestamp rounded to the nearest window bucket
         for (SSTableReader f : files)
         {
-            assert TimeWindowCompactionStrategyOptions.validTimestampTimeUnits.contains(timestampResolution);
-            long tStampMax = TimeUnit.MILLISECONDS.convert(f.getMaxTimestamp(), timestampResolution);
-            long tStampMin = TimeUnit.MILLISECONDS.convert(f.getMinTimestamp(), timestampResolution);
-            Pair<Long,Long> boundsMax = getWindowBoundsInMillis(sstableWindowUnit, sstableWindowSize, tStampMax);
-            Pair<Long,Long> boundsMin = getWindowBoundsInMillis(sstableWindowUnit, sstableWindowSize, tStampMin);
-            long windowInMills = getTimeWindowInMills(sstableWindowUnit, sstableWindowSize);
-            Range range = new Range(boundsMin.left, boundsMax.left, windowInMills);
-            // span > 2, and big enough, try to split later.
-            if (range.span <= 2 || f.onDiskLength() > sstableSplitThreshold) {
+            assert TimeWindowCompactionStrategyOptions.validTimestampTimeUnits.contains(options.timestampResolution);
+            long tStampMax = TimeUnit.MILLISECONDS.convert(f.getMaxTimestamp(), options.timestampResolution);
+            long tStampMin = TimeUnit.MILLISECONDS.convert(f.getMinTimestamp(), options.timestampResolution);
+            Pair<Long,Long> boundsMax = getWindowBoundsInMillis(options.sstableWindowUnit, options.sstableWindowSize, tStampMax);
+            Pair<Long,Long> boundsMin = getWindowBoundsInMillis(options.sstableWindowUnit, options.sstableWindowSize, tStampMin);
+            Pair<Long,Long> boundsSpit = getWindowBoundsInMillis(options.sstableWindowUnit, options.sstableWindowSize, minSplitTimeInMills);
+
+            Range range = new Range(boundsMin.left, boundsMax.left, options.timeWindowInMillis);
+            // real-time tw OR span > 2, try to compact big enough then split later.
+            if (range.span <= 2 ||
+                    (f.onDiskLength() > options.sstableSplitThreshold && boundsMax.left > boundsSpit.left)) {
                 buckets.put(range, f);
-            } else {
+            } else if (boundsMax.left > boundsSpit.left) {
                 buckets.put(abnormalRange, f);
+            } else {
+                buckets.put(new Range(Long.MIN_VALUE, boundsSpit.left, options.timeWindowInMillis), f);
             }
-            if (boundsMax.left > maxTimestamp)
+            if (boundsMax.left != Long.MAX_VALUE && boundsMax.left > maxTimestamp)
                 maxTimestamp = boundsMax.left;
         }
 
         logger.trace("buckets {}, max timestamp {}", buckets, maxTimestamp);
         return Pair.create(buckets, maxTimestamp);
-    }
-
-    public static long getTimeWindowInMills(TimeUnit windowTimeUnit, int windowTimeSize) {
-        switch(windowTimeUnit) {
-            case MINUTES:
-                return 60L * windowTimeSize * 1000L;
-            case HOURS:
-                return 3600L * windowTimeSize * 1000L;
-            case DAYS:
-            default:
-                return 86400L * windowTimeSize * 1000L;
-        }
     }
 
     private void updateEstimatedCompactionsByTasks(HashMultimap<Range, SSTableReader> tasks)
@@ -355,15 +350,18 @@ public class NewTimeWindowCompactionStrategy extends AbstractCompactionStrategy
      * @param buckets list of buckets, sorted from newest to oldest, from which to return the newest bucket within thresholds.
      * @param minThreshold minimum number of sstables in a bucket to qualify.
      * @param maxThreshold maximum number of sstables to compact at once (the returned bucket will be trimmed down to this).
+     * @param now
      * @return a bucket (list) of sstables to compact.
      */
     @VisibleForTesting
-    static List<SSTableReader> newestBucket(HashMultimap<Range, SSTableReader> buckets, int minThreshold, int maxThreshold, SizeTieredCompactionStrategyOptions stcsOptions, long now)
+    static List<SSTableReader> newestBucket(HashMultimap<Range, SSTableReader> buckets, int minThreshold, int maxThreshold,
+                                            TrueTimeWindowCompactionStrategyOptions options, long now)
     {
         // If the current bucket has at least minThreshold SSTables, choose that one.
         // For any other bucket, at least 2 SSTables is enough.
         // In any case, limit to maxThreshold SSTables.
 
+        SizeTieredCompactionStrategyOptions stcsOptions = options.stcsOptions;
         TreeSet<Range> allKeys = new TreeSet<>(buckets.keySet());
 
         Iterator<Range> it = allKeys.descendingIterator();
@@ -373,7 +371,7 @@ public class NewTimeWindowCompactionStrategy extends AbstractCompactionStrategy
 
             Set<SSTableReader> bucket = buckets.get(range);
             logger.trace("Key {} - {} ", range.min, now);
-            if (bucket.size() >= minThreshold && range.max >= now)
+            if (bucket.size() >= minThreshold && range.span <= 2 && range.max >= now)
             {
                 // If we're in the newest bucket, we'll use STCS to prioritize sstables
                 List<Pair<SSTableReader,Long>> pairs = SizeTieredCompactionStrategy.createSSTableAndLengthPairs(bucket);
@@ -385,15 +383,31 @@ public class NewTimeWindowCompactionStrategy extends AbstractCompactionStrategy
                 if (!stcsInterestingBucket.isEmpty())
                     return stcsInterestingBucket;
             }
-            else if (bucket.size() >= 2 && range.max < now)
+            else if (bucket.size() >= 2)
             {
                 logger.debug("bucket size {} >= 2 and not in current bucket, compacting what's here: {}", bucket.size(), bucket);
-                return trimToThreshold(bucket, maxThreshold);
+                boolean excludeLargest = false;
+                if (range.span<=2 && range.max >= now) {
+                    continue;
+                }
+                if (range.span == 1 && range.max < now) {
+                    excludeLargest = true;
+                }
+
+                List<SSTableReader>  ret = trimToThreshold(bucket, maxThreshold, excludeLargest, options.maxSStableSizeThreshold);
+                if (ret != null) {
+                    return ret;
+                }
             }
             else if (bucket.size() == 1 && range.span > 1)
             {
+                boolean excludeSplit = (range.min == Long.MIN_VALUE && range.max != Long.MAX_VALUE)
+                        || bucket.iterator().next().onDiskLength() < options.sstableSplitThreshold;
+                if (excludeSplit) {
+                    continue;
+                }
                 logger.debug("bucket size == 1 and span {} not in current bucket, compacting(splitting) what's here: {}", range.span, bucket);
-                return trimToThreshold(bucket, 1);
+                return ImmutableList.copyOf(Iterables.limit(bucket, 1));
             }
             else
             {
@@ -406,17 +420,29 @@ public class NewTimeWindowCompactionStrategy extends AbstractCompactionStrategy
     /**
      * @param bucket set of sstables
      * @param maxThreshold maximum number of sstables in a single compaction task.
+     * @param excludeLargest
+     * @param maxSStableSizeThreshold
      * @return A bucket trimmed to the maxThreshold newest sstables.
      */
     @VisibleForTesting
-    static List<SSTableReader> trimToThreshold(Set<SSTableReader> bucket, int maxThreshold)
+    static List<SSTableReader> trimToThreshold(Set<SSTableReader> bucket, int maxThreshold, boolean excludeLargest, long maxSStableSizeThreshold)
     {
         List<SSTableReader> ssTableReaders = new ArrayList<>(bucket);
 
         // Trim the largest sstables off the end to meet the maxThreshold
         Collections.sort(ssTableReaders, SSTableReader.sizeComparator);
+        if (excludeLargest && ssTableReaders.get(ssTableReaders.size() - 1).onDiskLength() >= maxSStableSizeThreshold) {
+            excludeLargest = true;
+        } else {
+            excludeLargest = false;
+        }
 
-        return ImmutableList.copyOf(Iterables.limit(ssTableReaders, maxThreshold));
+        if (excludeLargest && ssTableReaders.size() <= 2) {
+            return null;
+        }
+
+        return ImmutableList.copyOf(Iterables.limit(ssTableReaders,
+                Math.max(maxThreshold, ssTableReaders.size() - (excludeLargest ? 1:0 ))));
     }
 
     @Override
@@ -462,7 +488,7 @@ public class NewTimeWindowCompactionStrategy extends AbstractCompactionStrategy
     public static Map<String, String> validateOptions(Map<String, String> options) throws ConfigurationException
     {
         Map<String, String> uncheckedOptions = AbstractCompactionStrategy.validateOptions(options);
-        uncheckedOptions = NewTimeWindowCompactionStrategyOptions.validateOptions(options, uncheckedOptions);
+        uncheckedOptions = TrueTimeWindowCompactionStrategyOptions.validateOptions(options, uncheckedOptions);
 
         uncheckedOptions.remove(CompactionParams.Option.MIN_THRESHOLD.toString());
         uncheckedOptions.remove(CompactionParams.Option.MAX_THRESHOLD.toString());
