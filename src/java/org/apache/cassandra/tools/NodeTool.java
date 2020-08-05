@@ -98,6 +98,8 @@ public class NodeTool
                 Rebuild.class,
                 Refresh.class,
                 RemoveSStables.class,
+                RemoveSStablesBefore.class,
+                DescSStablesDistribution.class,
                 RemoveNode.class,
                 Assassinate.class,
                 Repair.class,

@@ -374,6 +374,10 @@ public class TimeWindowCompactionStrategy extends AbstractCompactionStrategy
         return uncheckedOptions;
     }
 
+    public TimeWindowCompactionStrategyOptions getOptions() {
+        return options;
+    }
+
     public String toString()
     {
         return String.format("TimeWindowCompactionStrategy[%s/%s]",

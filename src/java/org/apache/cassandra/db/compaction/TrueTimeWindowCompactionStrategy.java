@@ -30,6 +30,7 @@ import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.schema.CompactionParams;
 import org.apache.cassandra.utils.Pair;
+import org.apache.commons.lang3.builder.HashCodeBuilder;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -41,7 +42,7 @@ import static com.google.common.collect.Iterables.filter;
 public class TrueTimeWindowCompactionStrategy extends AbstractCompactionStrategy
 {
     private static final Logger logger = LoggerFactory.getLogger(TrueTimeWindowCompactionStrategy.class);
-    private static Range abnormalRange = new Range(Long.MIN_VALUE, Long.MAX_VALUE, Long.MIN_VALUE);
+    private static Range abnormalRange = new Range(0, Long.MAX_VALUE, Long.MIN_VALUE);
 
     private final TrueTimeWindowCompactionStrategyOptions options;
     protected volatile int estimatedRemainingTasks;
@@ -63,6 +64,28 @@ public class TrueTimeWindowCompactionStrategy extends AbstractCompactionStrategy
             logger.debug("Enabling tombstone compactions for TWCS");
     }
 
+    public static Pair<List<SSTableReader>, List<SSTableReader>> getSSTablesBefore(Set<SSTableReader> uncompacting, int sstableWindowSize, TimeUnit sstableWindowUnit, TimeUnit timestampResolution, long minTimestamp, int windowOffset) {
+        long twInMills = TrueTimeWindowCompactionStrategyOptions.getTimeWindowInMills(sstableWindowUnit, sstableWindowSize);
+        long tsBefore = minTimestamp + windowOffset * twInMills - 1000;
+        List<SSTableReader> truncatedSSTables = new ArrayList<>();
+        List<SSTableReader> suspectedSSTables = new ArrayList<>();
+
+        logger.debug("getSSTablesBefore {}", tsBefore);
+
+        for (SSTableReader f : uncompacting) {
+            assert TimeWindowCompactionStrategyOptions.validTimestampTimeUnits.contains(timestampResolution);
+            long tStampMax = TimeUnit.MILLISECONDS.convert(f.getMaxTimestamp(), timestampResolution);
+            long tStampMin = TimeUnit.MILLISECONDS.convert(f.getMinTimestamp(), timestampResolution);
+            Pair<Long, Long> boundsMax = getWindowBoundsInMillis(sstableWindowUnit, sstableWindowSize, tStampMax);
+            Pair<Long,Long> boundsMin = getWindowBoundsInMillis(sstableWindowUnit, sstableWindowSize, tStampMin);
+            logger.debug("getSSTablesBefore file-max {}", boundsMax.right);
+            if (boundsMax.right <= tsBefore)
+                truncatedSSTables.add(f);
+            else if (boundsMin.left <= tsBefore)
+                suspectedSSTables.add(f);
+        }
+        return Pair.create(truncatedSSTables, suspectedSSTables);
+    }
     @Override
     @SuppressWarnings("resource") // transaction is closed by AbstractCompactionTask::execute
     public AbstractCompactionTask getNextBackgroundTask(int gcBefore)
@@ -244,7 +267,7 @@ public class TrueTimeWindowCompactionStrategy extends AbstractCompactionStrategy
 
     }
 
-    private static class Range implements java.io.Serializable, Comparable<Range>  {
+    public static class Range implements java.io.Serializable, Comparable<Range>  {
         public long max;
         public long min;
         public int span;
@@ -264,7 +287,7 @@ public class TrueTimeWindowCompactionStrategy extends AbstractCompactionStrategy
         public int compareTo(Range o) {
             long x = this.max + this.min;
             long y = o.max + o.min;
-            return (x < y) ? -1 : ((x == y && this.max == o.max && this.span == o.span) ? 0 : 1);
+            return (x < y) ? -1 : ((x == y) ? 0 : 1);
         }
 
         @Override
@@ -277,10 +300,54 @@ public class TrueTimeWindowCompactionStrategy extends AbstractCompactionStrategy
 
         @Override
         public int hashCode() {
-            int hash = 31 * Long.hashCode(min) + Long.hashCode(max) + Long.hashCode(span);
-            //logger.debug("range hashcode called , return {}", hash);
-            return hash;
+            HashCodeBuilder builder = new HashCodeBuilder();
+            builder.append(min).append(max);
+            return builder.hashCode();
         }
+
+        @Override
+        public String toString() {
+            return String.format("Range[%-%]", min, max);
+        }
+    }
+
+    /**
+     * Group files with similar max timestamp into buckets.
+     *
+     * @param files pairs consisting of a file and its min timestamp
+     * @param options
+     * @return A pair, where the left element is the bucket representation (map of timestamp to sstablereader), and the right is the highest timestamp seen
+     */
+    @VisibleForTesting
+    static public Pair<HashMultimap<Range, SSTableReader>, Range> descBuckets(Iterable<SSTableReader> files,  int sstableWindowSize, TimeUnit sstableWindowUnit, TimeUnit timestampResolution)
+    {
+        long maxTimestamp = 0;
+        long minTimestamp = Long.MAX_VALUE;
+        long timeWindowInMillis = TrueTimeWindowCompactionStrategyOptions.getTimeWindowInMills(sstableWindowUnit, sstableWindowSize);
+
+        HashMultimap<Range, SSTableReader> buckets = HashMultimap.create();
+
+        // Create hash map to represent buckets
+        // For each sstable, add sstable to the time bucket
+        // Where the bucket is the file's max timestamp rounded to the nearest window bucket
+        for (SSTableReader f : files)
+        {
+            assert TimeWindowCompactionStrategyOptions.validTimestampTimeUnits.contains(timestampResolution);
+            long tStampMax = TimeUnit.MILLISECONDS.convert(f.getMaxTimestamp(), timestampResolution);
+            long tStampMin = TimeUnit.MILLISECONDS.convert(f.getMinTimestamp(), timestampResolution);
+            Pair<Long,Long> boundsMax = getWindowBoundsInMillis(sstableWindowUnit, sstableWindowSize, tStampMax);
+            Pair<Long,Long> boundsMin = getWindowBoundsInMillis(sstableWindowUnit, sstableWindowSize, tStampMin);
+            Range range = new Range(boundsMin.left/timeWindowInMillis, boundsMax.left/timeWindowInMillis, 1);
+            buckets.put(range, f);
+
+            if (boundsMax.left > maxTimestamp)
+                maxTimestamp = boundsMax.left;
+            if (boundsMin.left < minTimestamp)
+                minTimestamp = boundsMin.left;
+        }
+
+        logger.trace("buckets {}", buckets);
+        return Pair.create(buckets, new Range(minTimestamp, maxTimestamp, timeWindowInMillis));
     }
 
     /**
@@ -311,16 +378,16 @@ public class TrueTimeWindowCompactionStrategy extends AbstractCompactionStrategy
             Pair<Long,Long> boundsSpit = getWindowBoundsInMillis(options.sstableWindowUnit, options.sstableWindowSize, minSplitTimeInMills);
 
             Range range = new Range(boundsMin.left, boundsMax.left, options.timeWindowInMillis);
-            // real-time tw OR span > 2, try to compact big enough then split later.
+            // real-time(span <=2 is just supposed to be rt sstables) tw OR span > 2, try to compact big enough then split later.
             if (range.span <= 2 ||
-                    (f.onDiskLength() > options.sstableSplitThreshold && boundsMax.left > boundsSpit.left)) {
+                    (f.onDiskLength() >= options.sstableSplitThreshold && boundsMax.left > boundsSpit.left)) {
                 buckets.put(range, f);
             } else if (boundsMax.left > boundsSpit.left) {
                 buckets.put(abnormalRange, f);
             } else {
-                buckets.put(new Range(Long.MIN_VALUE, boundsSpit.left, options.timeWindowInMillis), f);
+                buckets.put(new Range(0, boundsSpit.left, options.timeWindowInMillis), f);
             }
-            if (boundsMax.left != Long.MAX_VALUE && boundsMax.left > maxTimestamp)
+            if (boundsMax.left > maxTimestamp)
                 maxTimestamp = boundsMax.left;
         }
 
@@ -387,7 +454,7 @@ public class TrueTimeWindowCompactionStrategy extends AbstractCompactionStrategy
             {
                 logger.debug("bucket size {} >= 2 and not in current bucket, compacting what's here: {}", bucket.size(), bucket);
                 boolean excludeLargest = false;
-                if (range.span<=2 && range.max >= now) {
+                if (range.span <= 2 && range.max >= now) {
                     continue;
                 }
                 if (range.span == 1 && range.max < now) {
@@ -401,7 +468,7 @@ public class TrueTimeWindowCompactionStrategy extends AbstractCompactionStrategy
             }
             else if (bucket.size() == 1 && range.span > 1)
             {
-                boolean excludeSplit = (range.min == Long.MIN_VALUE && range.max != Long.MAX_VALUE)
+                boolean excludeSplit = (range.min == 0 && range.max != Long.MAX_VALUE)
                         || bucket.iterator().next().onDiskLength() < options.sstableSplitThreshold;
                 if (excludeSplit) {
                     continue;
@@ -496,10 +563,16 @@ public class TrueTimeWindowCompactionStrategy extends AbstractCompactionStrategy
         return uncheckedOptions;
     }
 
+    public TrueTimeWindowCompactionStrategyOptions getOptions()
+    {
+        return options;
+    }
+
     public String toString()
     {
-        return String.format("NewTimeWindowCompactionStrategy[%s/%s]",
-                cfs.getMinimumCompactionThreshold(),
-                cfs.getMaximumCompactionThreshold());
+        return String.format("NewTimeWindowCompactionStrategy[%s/%s] - [%s %s/%sMB/%s/%sGB]",
+                cfs.getMinimumCompactionThreshold(), cfs.getMaximumCompactionThreshold(),
+                options.sstableWindowSize, options.sstableWindowUnit,
+                options.sstableSplitThreshold/options.MEGABYTES, options.minSStableSplitWindow, options.maxSStableSizeThreshold/(options.MEGABYTES*1024));
     }
 }

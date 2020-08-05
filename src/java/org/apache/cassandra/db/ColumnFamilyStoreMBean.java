@@ -146,6 +146,8 @@ public interface ColumnFamilyStoreMBean
     public void loadNewSSTables();
 
     public List<String> removeSSTables(Set<String> sstablePath);
+    public String descSSTablesDistribution();
+    public String removeSSTablesBefore(long minTimestamp, int windowOffset, boolean execRemove);
 
     /**
      * @return the number of SSTables in L0.  Always return 0 if Leveled compaction is not enabled.
@@ -194,4 +196,5 @@ public interface ColumnFamilyStoreMBean
        Enable/Disable compaction space check
      */
     public void compactionDiskSpaceCheck(boolean enable);
+
 }

@@ -1549,6 +1549,15 @@ public class NodeProbe implements AutoCloseable
         return getCfsProxy(ksName, cfName).removeSSTables(srcPaths);
     }
 
+    public String removeSSTablesBefore(String ksName, String cfName, long minTimestamp, int windowOffset, boolean execRemove)
+    {
+        return getCfsProxy(ksName, cfName).removeSSTablesBefore(minTimestamp, windowOffset, execRemove);
+    }
+
+    public String descSSTablesDistribution(String ksName, String cfName)
+    {
+        return getCfsProxy(ksName, cfName).descSSTablesDistribution();
+    }
 }
 
 class ColumnFamilyStoreMBeanIterator implements Iterator<Map.Entry<String, ColumnFamilyStoreMBean>>

@@ -22,6 +22,7 @@ import java.io.IOException;
 import java.io.PrintStream;
 import java.nio.ByteBuffer;
 import java.nio.file.Files;
+import java.text.SimpleDateFormat;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -83,6 +84,7 @@ import org.apache.cassandra.utils.memory.MemtableAllocator;
 import org.json.simple.JSONArray;
 import org.json.simple.JSONObject;
 
+import static com.google.common.collect.Iterables.filter;
 import static org.apache.cassandra.utils.Throwables.maybeFail;
 
 public class ColumnFamilyStore implements ColumnFamilyStoreMBean
@@ -294,6 +296,238 @@ public class ColumnFamilyStore implements ColumnFamilyStoreMBean
         }
 
         return failedDirectories;
+    }
+
+    //support TimeWindowCompactionStrategy sstable output.
+    public String removeSSTablesBefore(long minTimestamp, int windowOffset, boolean execRemove) {
+        TrueTimeWindowCompactionStrategy trueTWTS = null;
+        TimeWindowCompactionStrategy twts = null;
+        List<List<AbstractCompactionStrategy>> strategies = this.compactionStrategyManager.getStrategies();
+        for (List<AbstractCompactionStrategy> lst: strategies) {
+            for (AbstractCompactionStrategy strategy: lst) {
+                if (strategy instanceof  TrueTimeWindowCompactionStrategy) {
+                    trueTWTS = (TrueTimeWindowCompactionStrategy)strategy;
+                    break;
+                } else if (strategy instanceof  TimeWindowCompactionStrategy) {
+                    twts = (TimeWindowCompactionStrategy)strategy;
+                    break;
+                }
+            }
+            if (trueTWTS != null)
+                break;
+            if (twts != null)
+                break;
+        }
+
+        if (trueTWTS == null && twts == null) {
+            return String.format("(True)TimeWindowCompactionStrategy not found for %s.%s", keyspace.getName(), getTableName());
+        }
+
+        Set<SSTableReader> uncompacting = ImmutableSet.copyOf(getUncompactingSSTables());
+        long timeWindowInMillis = 0;
+        String twtsString = null;
+        Pair<List<SSTableReader>, List<SSTableReader>> retSSTables = null;
+        if (twts != null) {
+            TimeWindowCompactionStrategyOptions options = twts.getOptions();
+            retSSTables =
+                    TrueTimeWindowCompactionStrategy.getSSTablesBefore(uncompacting, options.sstableWindowSize,
+                            options.sstableWindowUnit, options.timestampResolution, minTimestamp, windowOffset);
+            timeWindowInMillis = TrueTimeWindowCompactionStrategyOptions.getTimeWindowInMills(options.sstableWindowUnit, options.sstableWindowSize);
+            twtsString = twts.toString();
+        } else {
+            TrueTimeWindowCompactionStrategyOptions options = trueTWTS.getOptions();
+            retSSTables =
+                    TrueTimeWindowCompactionStrategy.getSSTablesBefore(uncompacting, options.sstableWindowSize,
+                            options.sstableWindowUnit, options.timestampResolution, minTimestamp, windowOffset);
+            timeWindowInMillis = options.timeWindowInMillis;
+            twtsString = trueTWTS.toString();
+        }
+
+        logger.debug("before output buckets for (true)TWTS");
+        List<SSTableReader> truncatedSSTables = retSSTables.left;
+        if (!truncatedSSTables.isEmpty() && execRemove)
+            markObsolete(truncatedSSTables, OperationType.UNKNOWN);
+
+        return outputRemoved(minTimestamp, windowOffset, execRemove, timeWindowInMillis, twtsString, retSSTables);
+    }
+
+    private String outputRemoved(long minTimestamp, int windowOffset, boolean execRemove, long twInMills, String twtsString, Pair<List<SSTableReader>, List<SSTableReader>> retSSTables) {
+        StringBuilder output = new StringBuilder();
+        String tmpOutput;
+        List<SSTableReader> truncatedSSTables = retSSTables.left;
+        List<SSTableReader> suspectedSSTables = retSSTables.right;
+        String removeFlag = "TO BE REMOVED";
+        if (execRemove)
+            removeFlag = "REMOVED";
+        long spaceReleased = 0;
+        String pattern = "yyyy-MM-dd HH:mm:ss";
+        Date dateEnd = new Date();
+        long tsEnd = minTimestamp + windowOffset * twInMills - 1000;
+        dateEnd.setTime(tsEnd);
+        SimpleDateFormat dtFromat = new SimpleDateFormat(pattern);
+        String strDataEnd = dtFromat.format(dateEnd);
+
+        tmpOutput = String.format("Options for %s.%s: %s\n", keyspace.getName(), getTableName(), twtsString);
+        output.append(tmpOutput);
+
+        output.append("***********************************************\n");
+
+        tmpOutput = String.format("[%s] %d sstables before %d(%s) removed:\n",
+                removeFlag, truncatedSSTables.size(), tsEnd, strDataEnd);
+        output.append(tmpOutput);
+        if (truncatedSSTables.size() > 0) {
+            for (SSTableReader reader : truncatedSSTables) {
+                tmpOutput = String.format("[R] path=%s  [%d]-[%d].\n", reader.getFilename(), reader.getMinTimestamp()/1000, reader.getMaxTimestamp()/1000);
+                output.append(tmpOutput);
+                spaceReleased += reader.onDiskLength();
+            }
+            tmpOutput = String.format("[%s] %d MB disk space released\n", removeFlag, spaceReleased/TrueTimeWindowCompactionStrategyOptions.MEGABYTES);
+            output.append(tmpOutput);
+        }
+
+        if (suspectedSSTables.size() > 0) {
+            output.append("***********************************************\n");
+            tmpOutput = String.format("[Warning] %d sstables across the time window %d(%s):\n",
+                    suspectedSSTables.size(), tsEnd, strDataEnd);
+            output.append(tmpOutput);
+            for (SSTableReader reader: suspectedSSTables) {
+                tmpOutput = String.format("[S] path=%s  [%d]-[%d].\n", reader.getFilename(), reader.getMinTimestamp()/1000, reader.getMaxTimestamp()/1000);
+                output.append(tmpOutput);
+            }
+        }
+        output.append("***********************************************\n");
+
+        return output.toString();
+    }
+
+    public String descSSTablesDistribution() {
+        TrueTimeWindowCompactionStrategy trueTWTS = null;
+        TimeWindowCompactionStrategy twts = null;
+        List<List<AbstractCompactionStrategy>> strategies = this.compactionStrategyManager.getStrategies();
+        for (List<AbstractCompactionStrategy> lst: strategies) {
+            for (AbstractCompactionStrategy strategy: lst) {
+                if (strategy instanceof  TrueTimeWindowCompactionStrategy) {
+                    trueTWTS = (TrueTimeWindowCompactionStrategy)strategy;
+                    break;
+                } else if (strategy instanceof  TimeWindowCompactionStrategy) {
+                    twts = (TimeWindowCompactionStrategy)strategy;
+                    break;
+                }
+            }
+            if (trueTWTS != null)
+                break;
+
+            if (twts != null)
+                break;
+        }
+
+        if (trueTWTS == null && twts == null) {
+            return String.format("(True)TimeWindowCompactionStrategy not found for %s.%s", keyspace.getName(), getTableName());
+        }
+
+        int sstableWindowSize = 0;
+        TimeUnit sstableWindowUnit;
+        TimeUnit timestampResolution;
+        String twtsString = null;
+        if (twts != null) {
+            TimeWindowCompactionStrategyOptions options = twts.getOptions();
+            sstableWindowUnit = options.sstableWindowUnit;
+            timestampResolution = options.timestampResolution;
+            sstableWindowSize = options.sstableWindowSize;
+        } else {
+            TrueTimeWindowCompactionStrategyOptions options = trueTWTS.getOptions();
+            sstableWindowUnit = options.sstableWindowUnit;
+            timestampResolution = options.timestampResolution;
+            sstableWindowSize = options.sstableWindowSize;
+        }
+        Set<SSTableReader> uncompacting = ImmutableSet.copyOf(getUncompactingSSTables());
+        Pair<HashMultimap<TrueTimeWindowCompactionStrategy.Range, SSTableReader>, TrueTimeWindowCompactionStrategy.Range> buckets
+                = TrueTimeWindowCompactionStrategy.descBuckets(uncompacting, sstableWindowSize, sstableWindowUnit, timestampResolution);
+        if (buckets.left.size() == 0) {
+            return String.format("No sstables found for %s.%s", keyspace.getName(), getTableName());
+        }
+        logger.debug("before output buckets for trueTWTS");
+
+        return outputTW(buckets);
+    }
+
+    private String outputTW(Pair<HashMultimap<TrueTimeWindowCompactionStrategy.Range, SSTableReader>, TrueTimeWindowCompactionStrategy.Range> buckets) {
+        StringBuilder strB = new StringBuilder();
+        StringBuilder strB2 = new StringBuilder();
+        StringBuilder strDash = new StringBuilder();
+        StringBuilder strDash2 = new StringBuilder();
+        String output =  "";
+        TreeSet<TrueTimeWindowCompactionStrategy.Range> allKeys = new TreeSet<>(buckets.left.keySet());
+        Iterator<TrueTimeWindowCompactionStrategy.Range> it = allKeys.iterator();
+        TrueTimeWindowCompactionStrategy.Range maxRange = buckets.right;
+        long twInMills = (maxRange.max - maxRange.min)/(maxRange.span - 1);
+        String pattern = "yyyy-MM-dd HH:mm:ss";
+        Date dateStart = new Date();
+        dateStart.setTime(maxRange.min);
+        Date dateEnd = new Date();
+        long tsEnd = maxRange.max + twInMills - 1000;
+        dateEnd.setTime(tsEnd);  // in seconds
+        SimpleDateFormat  dtFromat = new SimpleDateFormat(pattern);
+        output = String.format("Range %d(%s) --> %d(%s) (%d spans with window size %d)%n",
+                maxRange.min, dtFromat.format(dateStart),
+                tsEnd, dtFromat.format(dateEnd),
+                maxRange.span, twInMills);
+        String normalHead = output + "Normal SSTables # ";
+        String abnormalHead = "abNormal SSTables # ";
+
+        logger.debug(output);
+        int minWindowNo = (int) (maxRange.min / twInMills);
+        int preSpan = 0;
+        int preSpan2 = 0;
+        int normalCnt = 0;
+        int abnormalCnt = 0;
+        while(it.hasNext()) {
+            TrueTimeWindowCompactionStrategy.Range range = it.next();
+            Set<SSTableReader> bucket = buckets.left.get(range);
+            int spanOffset = (int)range.min - minWindowNo;
+
+            if (range.span == 1) {
+                output = String.format("[%d]-%d\t", spanOffset, bucket.size());
+                if (preSpan > 0 && spanOffset < preSpan) {
+                    strDash.append("\n");
+                    preSpan = 0;
+                }
+                int padCount = spanOffset - preSpan;
+                while ( padCount-- > 0) {
+                    strDash.append("x");
+                }
+                strDash.append("-");
+                preSpan = spanOffset + range.span;
+                normalCnt += bucket.size();
+
+                strB.append(output);
+            } else {
+                output = String.format("[%d(%d)]-%d\t", spanOffset, range.span, bucket.size());
+                if (preSpan2 > 0 && spanOffset <= preSpan2) {
+                    strDash2.append("\n");
+                    preSpan2 = 0;
+                }
+                int padCount = spanOffset - preSpan2;
+                while ( padCount-- > 0) {
+                    strDash2.append("x");
+                }
+                padCount =  range.span;
+                while ( padCount-- > 0) {
+                    strDash2.append("_");
+                }
+                preSpan2 = spanOffset + range.span;
+                abnormalCnt += bucket.size();
+
+                strB2.append(output);
+            }
+            logger.debug(output);
+        }
+        normalHead += normalCnt + ":\n";
+        abnormalHead += abnormalCnt + ":\n";
+
+        StringBuilder res = new StringBuilder();
+        return res.append(normalHead).append(strB).append("\n").append(strDash).append("\n").
+                append(abnormalHead).append(strB2).append("\n").append(strDash2).toString();
     }
 
     public void reload()

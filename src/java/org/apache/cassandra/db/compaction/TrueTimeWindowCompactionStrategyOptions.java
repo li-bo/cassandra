@@ -38,8 +38,8 @@ public final class TrueTimeWindowCompactionStrategyOptions
     protected static final Boolean DEFAULT_UNSAFE_AGGRESSIVE_SSTABLE_EXPIRATION = false;
     private static final long DEFAULT_SSTABLE_SPLIT_THRESHOLD = 128L;   //128MB
     private static final long DEFAULT_MAX_SSTABLE_SIZE_THRESHOLD = 10 * 1024L; //10GB
-    private static final int DEFAULT_MIN_SSTABLE_SPLIT_WINDOW = 1;
-    private static final long MEGABYTES = 1024*1024L;
+    private static final int DEFAULT_MIN_SSTABLE_SPLIT_WINDOW = Integer.MAX_VALUE;
+    public static final long MEGABYTES = 1024*1024L;
 
 
     protected static final String TIMESTAMP_RESOLUTION_KEY = "timestamp_resolution";
@@ -101,7 +101,7 @@ public final class TrueTimeWindowCompactionStrategyOptions
         stcsOptions = new SizeTieredCompactionStrategyOptions(options);
     }
 
-    private long getTimeWindowInMills(TimeUnit windowTimeUnit, int windowTimeSize) {
+    public static long getTimeWindowInMills(TimeUnit windowTimeUnit, int windowTimeSize) {
         switch(windowTimeUnit) {
             case MINUTES:
                 return 60L * windowTimeSize * 1000L;

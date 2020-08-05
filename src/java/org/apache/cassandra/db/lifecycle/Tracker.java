@@ -291,7 +291,6 @@ public class Tracker
     // return true if remove failed
     public boolean removeSSTable(final String filename)
     {
-        Descriptor desc = Descriptor.fromFilename(filename);
         return Throwables.failIfCanCast(dropSSTables(new Predicate<SSTableReader>()
         {
             public boolean apply(SSTableReader reader)
