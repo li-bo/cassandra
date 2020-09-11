@@ -126,13 +126,6 @@ public class SSTableRewriter extends Transactional.AbstractTransactional impleme
         return writer;
     }
 
-    public void setCurrentWriter(SSTableWriter newWriter)
-    {
-        if (newWriter != null)
-            writers.add(newWriter.setMaxDataAge(maxAge));
-        this.writer = newWriter;
-    }
-
     public RowIndexEntry append(UnfilteredRowIterator partition)
     {
         // we do this before appending to ensure we can resetAndTruncate() safely if the append fails
@@ -303,6 +296,13 @@ public class SSTableRewriter extends Transactional.AbstractTransactional impleme
         }
     }
 
+    public void setCurrentWriter(SSTableWriter newWriter)
+    {
+        if (newWriter != null)
+            writers.add(newWriter.setMaxDataAge(maxAge));
+        this.writer = newWriter;
+    }
+
     public void switchWriter(SSTableWriter newWriter)
     {
         if (newWriter != null)
@@ -381,6 +381,9 @@ public class SSTableRewriter extends Transactional.AbstractTransactional impleme
         // No early open to finalize and replace
         for (SSTableWriter writer : writers)
         {
+            if (writer.getFilePointer() == 0) {
+                continue;
+            }
             assert writer.getFilePointer() > 0;
             writer.setRepairedAt(repairedAt).setOpenResult(true).prepareToCommit();
             SSTableReader reader = writer.finished();

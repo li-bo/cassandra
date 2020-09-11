@@ -335,8 +335,15 @@ public class TrueTimeWindowCompactionStrategy extends AbstractCompactionStrategy
             assert TimeWindowCompactionStrategyOptions.validTimestampTimeUnits.contains(timestampResolution);
             long tStampMax = TimeUnit.MILLISECONDS.convert(f.getMaxTimestamp(), timestampResolution);
             long tStampMin = TimeUnit.MILLISECONDS.convert(f.getMinTimestamp(), timestampResolution);
+
             Pair<Long,Long> boundsMax = getWindowBoundsInMillis(sstableWindowUnit, sstableWindowSize, tStampMax);
             Pair<Long,Long> boundsMin = getWindowBoundsInMillis(sstableWindowUnit, sstableWindowSize, tStampMin);
+            Pair<Long,Long> boundsMinPlus1 = getWindowBoundsInMillis(sstableWindowUnit, sstableWindowSize, tStampMin+1);
+            // Minimum timestamp: 1599436799999999 is set to 1599436799999999+1,
+            // cause some sstables metadata is just like this and data are all after that time.
+            if (boundsMinPlus1.left > boundsMin.left) {
+                boundsMin = boundsMinPlus1;
+            }
             Range range = new Range(boundsMin.left/timeWindowInMillis, boundsMax.left/timeWindowInMillis, 1);
             buckets.put(range, f);
 
@@ -350,13 +357,13 @@ public class TrueTimeWindowCompactionStrategy extends AbstractCompactionStrategy
         return Pair.create(buckets, new Range(minTimestamp, maxTimestamp, timeWindowInMillis));
     }
 
-    /**
-     * Group files with similar max timestamp into buckets.
-     *
-     * @param files pairs consisting of a file and its min timestamp
-     * @param options
-     * @return A pair, where the left element is the bucket representation (map of timestamp to sstablereader), and the right is the highest timestamp seen
-     */
+        /**
+         * Group files with similar max timestamp into buckets.
+         *
+         * @param files pairs consisting of a file and its min timestamp
+         * @param options
+         * @return A pair, where the left element is the bucket representation (map of timestamp to sstablereader), and the right is the highest timestamp seen
+         */
     @VisibleForTesting
     static Pair<HashMultimap<Range, SSTableReader>, Long> getBuckets(Iterable<SSTableReader> files, TrueTimeWindowCompactionStrategyOptions options)
     {
@@ -376,14 +383,22 @@ public class TrueTimeWindowCompactionStrategy extends AbstractCompactionStrategy
             Pair<Long,Long> boundsMax = getWindowBoundsInMillis(options.sstableWindowUnit, options.sstableWindowSize, tStampMax);
             Pair<Long,Long> boundsMin = getWindowBoundsInMillis(options.sstableWindowUnit, options.sstableWindowSize, tStampMin);
             Pair<Long,Long> boundsSpit = getWindowBoundsInMillis(options.sstableWindowUnit, options.sstableWindowSize, minSplitTimeInMills);
+            Pair<Long,Long> boundsMinPlus1 = getWindowBoundsInMillis(options.sstableWindowUnit, options.sstableWindowSize, tStampMin+1);
+            // Minimum timestamp: 1599436799999999 is set to 1599436799999999+1,
+            // cause some sstables metadata is just like this and data are all after that time.
+            if (boundsMinPlus1.left > boundsMin.left) {
+                boundsMin = boundsMinPlus1;
+            }
 
             Range range = new Range(boundsMin.left, boundsMax.left, options.timeWindowInMillis);
             // real-time(span <=2 is just supposed to be rt sstables) tw OR span > 2, try to compact big enough then split later.
-            if (range.span <= 2 ||
-                    (f.onDiskLength() >= options.sstableSplitThreshold && boundsMax.left > boundsSpit.left)) {
-                buckets.put(range, f);
-            } else if (boundsMax.left > boundsSpit.left) {
-                buckets.put(abnormalRange, f);
+            //if (range.span <= 2 ||
+            //        (f.onDiskLength() >= options.sstableSplitThreshold && boundsMax.left > boundsSpit.left)) {
+            if (boundsMax.left > boundsSpit.left) {
+                if (range.span == 1)
+                    buckets.put(range, f);
+                else
+                    buckets.put(abnormalRange, f);
             } else {
                 buckets.put(new Range(0, boundsSpit.left, options.timeWindowInMillis), f);
             }
@@ -438,7 +453,7 @@ public class TrueTimeWindowCompactionStrategy extends AbstractCompactionStrategy
 
             Set<SSTableReader> bucket = buckets.get(range);
             logger.trace("Key {} - {} ", range.min, now);
-            if (bucket.size() >= minThreshold && range.span <= 2 && range.max >= now)
+            if (bucket.size() >= minThreshold && range.span == 1 && range.max >= now)
             {
                 // If we're in the newest bucket, we'll use STCS to prioritize sstables
                 List<Pair<SSTableReader,Long>> pairs = SizeTieredCompactionStrategy.createSSTableAndLengthPairs(bucket);
@@ -450,30 +465,26 @@ public class TrueTimeWindowCompactionStrategy extends AbstractCompactionStrategy
                 if (!stcsInterestingBucket.isEmpty())
                     return stcsInterestingBucket;
             }
-            else if (bucket.size() >= 2)
-            {
+            else if ((bucket.size() >= 2) &&
+                    ((range.span == 1 && range.max < now) || (range.min == 0 && range.max != Long.MAX_VALUE))) {
                 logger.debug("bucket size {} >= 2 and not in current bucket, compacting what's here: {}", bucket.size(), bucket);
                 boolean excludeLargest = false;
-                if (range.span <= 2 && range.max >= now) {
-                    continue;
-                }
                 if (range.span == 1 && range.max < now) {
                     excludeLargest = true;
                 }
 
                 List<SSTableReader>  ret = trimToThreshold(bucket, maxThreshold, excludeLargest, options.maxSStableSizeThreshold);
-                if (ret != null) {
+                if (ret != null && ret.size() > 1) {
                     return ret;
                 }
             }
-            else if (bucket.size() == 1 && range.span > 1)
+            else if (range.span > 1)
             {
-                boolean excludeSplit = (range.min == 0 && range.max != Long.MAX_VALUE)
-                        || bucket.iterator().next().onDiskLength() < options.sstableSplitThreshold;
+                boolean excludeSplit = (range.min == 0 && range.max != Long.MAX_VALUE);
                 if (excludeSplit) {
                     continue;
                 }
-                logger.debug("bucket size == 1 and span {} not in current bucket, compacting(splitting) what's here: {}", range.span, bucket);
+                logger.debug("range.span > 1 and span {} not in current bucket, compacting(splitting) what's here: {}", range.span, bucket);
                 return ImmutableList.copyOf(Iterables.limit(bucket, 1));
             }
             else

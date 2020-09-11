@@ -412,6 +412,7 @@ public class BigTableWriter extends SSTableWriter
 
     public long getFilePointer()
     {
+        assert dataFile != null;
         return dataFile.position();
     }
 

@@ -17,15 +17,14 @@
  */
 package org.apache.cassandra.db.compaction.writers;
 
-import org.apache.cassandra.db.ColumnFamilyStore;
-import org.apache.cassandra.db.Directories;
-import org.apache.cassandra.db.RowIndexEntry;
-import org.apache.cassandra.db.SerializationHeader;
+import com.google.common.collect.ArrayListMultimap;
+import com.google.common.collect.ListMultimap;
+import com.google.common.collect.Lists;
+import org.apache.cassandra.db.*;
 import org.apache.cassandra.db.compaction.TrueTimeWindowCompactionStrategy;
 import org.apache.cassandra.db.compaction.TrueTimeWindowCompactionStrategyOptions;
 import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
-import org.apache.cassandra.db.rows.Row;
-import org.apache.cassandra.db.rows.UnfilteredRowIterator;
+import org.apache.cassandra.db.rows.*;
 import org.apache.cassandra.db.transform.UnfilteredRows;
 import org.apache.cassandra.io.sstable.Descriptor;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
@@ -35,8 +34,8 @@ import org.apache.cassandra.utils.Pair;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.util.HashMap;
-import java.util.Set;
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 
 /**
@@ -80,18 +79,92 @@ public class SplittingTimeWindowCompactionWriter extends CompactionAwareWriter
     {
         try {
 //        UnfilteredRowIterator it = new UnfilteredRowIterator(partition);
-            long span = getSpan(partition);
+            List<RowIndexEntry> rieA = Lists.newArrayList();
+            if (partition.hasNext()) {
+                UnfilteredRows rows = (UnfilteredRows) partition;
 
-            switchWriter(location, span);
-            RowIndexEntry rie = sstableWriter.append(partition);
-            logger.trace("realAppend {} - span {}", partition, span);
+                if (rows.metadata().clusteringColumns().size() > 0) {
+                    RowIndexEntry rie = null;
+                    ListMultimap<Long, Row> mRedisRows = ArrayListMultimap.create();
+                    partition.forEachRemaining(unfiltered -> {
+                        if (unfiltered.isRow()) {
+                            Row irow = (Row) unfiltered;
+                            long span = getSpan(irow, partition);
+                            if (span > 0) {
+                                mRedisRows.put(span, irow);
+                            }
+                        }
+                    });
+                    for (Long span: mRedisRows.keySet()) {
+                        Collection<Row> srows = mRedisRows.get(span);
+                        Iterator<Row> rowsIterator = srows.iterator();//Arrays.asList(srows).iterator();
+                        UnfilteredRowIterator tmpRow =  new AbstractUnfilteredRowIterator(partition.metadata(), partition.partitionKey(),
+                                DeletionTime.LIVE, partition.columns(), Rows.EMPTY_STATIC_ROW, false, EncodingStats.NO_STATS) {
+                            @Override
+                            protected Unfiltered computeNext() {
+                                return rowsIterator.hasNext() ? rowsIterator.next() : endOfData();
+                            }
+                        };
+                        switchWriter(location, span);
+                        rie = sstableWriter.append(tmpRow);
+                        rieA.add(rie);
+                        logger.trace("realAppend {} size {} - span {}", partition.toString(), srows.size(), span);
+                    }
 
-            if (preSpan != span) {
-                preSpan = span;
+//                        RowIndexEntry rie = null;
+//                        if (unfiltered.isRow()) {
+//                            Row irow = (Row) unfiltered;
+//                            UnfilteredRowIterator tmpRow = null;
+//                            Iterator<Row> rowsIterator = Arrays.asList(irow).iterator();
+////                            //tmpRow = Transformation.apply(rowsIterator, new BigTableWriter.StatsCollector(null));
+//                            tmpRow =  new AbstractUnfilteredRowIterator(partition.metadata(), partition.partitionKey(),
+//                                    DeletionTime.LIVE, partition.columns(), Rows.EMPTY_STATIC_ROW, false, EncodingStats.NO_STATS) {
+//                                private boolean returned;
+//
+//                                @Override
+//                                protected Unfiltered computeNext() {
+//                                    if (returned)
+//                                        return endOfData();
+//                                    returned = true;
+//                                    return rowsIterator.next();
+//                                }
+//                            };
+//                            long span = getSpan(irow, partition);
+//
+//                            if (span > 0) {
+//                                switchWriter(location, span);
+//                                rie = sstableWriter.append(tmpRow);
+//                                rieA.add(rie);
+//                                logger.trace("realAppend {} - span {}", partition, span);
+//
+//                                if(partition.hasNext())
+//                                    switchCompactionLocation(location);
+//
+////                                if (preSpan != span) {
+////                                    preSpan = span;
+////                                }
+//                            }
+//                        }
+//                    });
+                } else {
+                    Row row = (Row)rows.peek();
+                    long span = getSpan(row, partition);
+                    if (span > 0) {
+                        switchWriter(location, span);
+                        RowIndexEntry rie = sstableWriter.append(partition);
+                        rieA.add(rie);
+                        logger.trace("realAppend {} - span {}", partition, span);
+
+                        if (preSpan != span) {
+                            preSpan = span;
+                        }
+                    }
+                }
             }
-            return rie != null;
+            return rieA.size() > 0;
         } catch (Exception e) {
-            logger.error("realAppend failed {}", e.getMessage());
+            e.printStackTrace();
+            logger.error("realAppend failed {}", e.toString());
             return false;
         }
     }
@@ -99,7 +172,7 @@ public class SplittingTimeWindowCompactionWriter extends CompactionAwareWriter
     private long getSpan(UnfilteredRowIterator partition) {
         long span = 0;
 
-       if (partition.hasNext())
+        if (partition.hasNext())
         {
             UnfilteredRows rows = (UnfilteredRows) partition;
             Row row = (Row)rows.peek();
@@ -113,6 +186,100 @@ public class SplittingTimeWindowCompactionWriter extends CompactionAwareWriter
             Pair<Long, Long> boundsMax = TrueTimeWindowCompactionStrategy.getWindowBoundsInMillis(options.sstableWindowUnit, options.sstableWindowSize, tStamp);
             span = (long) (boundsMax.left / options.timeWindowInMillis);
         }
+        return span;
+    }
+
+    public boolean realAppend4WideRow(UnfilteredRowIterator partition)
+    {
+        try {
+//        UnfilteredRowIterator it = new UnfilteredRowIterator(partition);
+            List<RowIndexEntry> rieA = Lists.newArrayList();
+            partition.forEachRemaining(unfiltered -> {
+                if (unfiltered.isRow())
+                {
+                    Row row = (Row) unfiltered;
+                    UnfilteredRowIterator tmpRow = partition;
+                    if (row.clustering().size() > 0) {
+                        Iterator<Row> rowsIterator = Arrays.asList(row).iterator();
+                        tmpRow = new AbstractUnfilteredRowIterator(partition.metadata(), partition.partitionKey(),
+                                DeletionTime.LIVE, partition.columns(), Rows.EMPTY_STATIC_ROW, false, EncodingStats.NO_STATS) {
+                            @Override
+                            protected Unfiltered computeNext() {
+                                return rowsIterator.hasNext() ? rowsIterator.next() : endOfData();
+                            }
+                        };
+                    }
+                    long span = getSpan(row, partition);
+
+                    if (span > 0) {
+                        switchWriter(location, span);
+                        RowIndexEntry rie = sstableWriter.append(tmpRow);
+                        rieA.add(rie);
+                        logger.trace("realAppend {} - span {}", partition, span);
+
+                        if (preSpan != span) {
+                            preSpan = span;
+                        }
+                    }
+                }
+            });
+            return rieA.size() > 0;
+        } catch (Exception e) {
+            e.printStackTrace();
+            logger.error("realAppend failed {}", e.toString());
+            return false;
+        }
+    }
+
+    private long getSpan(Row row, UnfilteredRowIterator partition) {
+        long span = 0;
+        long rowTimestamp = row.primaryKeyLivenessInfo().timestamp();
+
+        long origRowTS = rowTimestamp;
+        // get max timestamp, a  row' timestamp can get from the row-livenessinfo or cells,
+        // or from both.
+        //if (rowTimestamp == Long.MIN_VALUE) {
+        Iterable<Cell> cells = row.cells();
+        for (Cell cell: cells) {
+            if(cell.timestamp() > rowTimestamp) {
+                rowTimestamp = cell.timestamp();
+                //break;
+            }
+        }
+        if (origRowTS < 0) {
+            origRowTS = rowTimestamp;
+        } else if (rowTimestamp < 0) {
+            rowTimestamp = origRowTS;
+        }
+
+        long otStamp = 0, tStamp = 0;
+        Pair<Long, Long> boundsMax = null, boundsOrig = null;
+        long minSplitStamp = System.currentTimeMillis() - options.minSStableSplitWindow * options.timeWindowInMillis;
+        if (origRowTS != rowTimestamp) {
+            otStamp = TimeUnit.MILLISECONDS.convert(origRowTS, TimeUnit.MICROSECONDS);
+            tStamp = TimeUnit.MILLISECONDS.convert(rowTimestamp, TimeUnit.MICROSECONDS);
+            if (tStamp < minSplitStamp && otStamp < minSplitStamp) {
+                boundsOrig = boundsMax = TrueTimeWindowCompactionStrategy.getWindowBoundsInMillis(options.sstableWindowUnit, options.sstableWindowSize, minSplitStamp);
+            } else {
+                boundsMax = TrueTimeWindowCompactionStrategy.getWindowBoundsInMillis(options.sstableWindowUnit, options.sstableWindowSize, tStamp);
+                boundsOrig = TrueTimeWindowCompactionStrategy.getWindowBoundsInMillis(options.sstableWindowUnit, options.sstableWindowSize, otStamp);
+            }
+            if (boundsOrig.left != boundsMax.left) {
+                //rows.next();
+                logger.error("realAppend failed, drop record {}/{}-{} ", partition.partitionKey(), otStamp, tStamp);
+                return -1; // cannot decide which partition this row belongs to, ignore it.
+            }
+        } else {
+            tStamp = TimeUnit.MILLISECONDS.convert(rowTimestamp, TimeUnit.MICROSECONDS);
+            if (tStamp < minSplitStamp) {
+                tStamp = minSplitStamp;
+            }
+            boundsMax = TrueTimeWindowCompactionStrategy.getWindowBoundsInMillis(options.sstableWindowUnit, options.sstableWindowSize, tStamp);
+        }
+
+        span = (long) (boundsMax.left / options.timeWindowInMillis);
+        logger.trace("xxxxxxx  row {}/{} ts {} - span {} / boundsMax.left {}", partition.partitionKey(), row.clustering().getRawValues(),
+                rowTimestamp, span, boundsMax.left);
         return span;
     }
 
@@ -142,7 +309,9 @@ public class SplittingTimeWindowCompactionWriter extends CompactionAwareWriter
                 txn);
         writerHashMap.put(span, writer);
         sstableWriter.setCurrentWriter(writer);
-        logger.trace("Switching to new writer {} for span {}", writer.descriptor.baseFilename(), span);
+        //sstableWriter.switchWriter(writer);
+
+        logger.debug("Switching to new writer {} for span {}", writer.descriptor.baseFilename(), span);
     }
 
     @Override
@@ -158,7 +327,7 @@ public class SplittingTimeWindowCompactionWriter extends CompactionAwareWriter
                                                     SerializationHeader.make(cfs.metadata, nonExpiredSSTables),
                                                     cfs.indexManager.listIndexes(),
                                                     txn);
-        logger.trace("switchCompactionLocation create new writer {}", writer.descriptor.baseFilename());
+        logger.debug("switchCompactionLocation create new writer {}", writer.descriptor.baseFilename());
         sstableWriter.setCurrentWriter(writer);
         locationSwitched = true;
     }
