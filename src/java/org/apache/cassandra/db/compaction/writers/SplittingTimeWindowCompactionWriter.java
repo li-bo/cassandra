@@ -235,51 +235,66 @@ public class SplittingTimeWindowCompactionWriter extends CompactionAwareWriter
         long span = 0;
         long rowTimestamp = row.primaryKeyLivenessInfo().timestamp();
 
-        long origRowTS = rowTimestamp;
-        // get max timestamp, a  row' timestamp can get from the row-livenessinfo or cells,
-        // or from both.
+        long maxRowTS = rowTimestamp;
+        long minRowTS = Long.MAX_VALUE;
+        // get max/min timestamp, a  row' timestamp can get from the row-livenessinfo or cells,
+        // or from both. NOTE: different cell may have different timestamps,
+        // some may have no timestamp!
         //if (rowTimestamp == Long.MIN_VALUE) {
         Iterable<Cell> cells = row.cells();
         for (Cell cell: cells) {
-            if(cell.timestamp() > rowTimestamp) {
-                rowTimestamp = cell.timestamp();
-                //break;
+            if(cell.timestamp() > maxRowTS) {
+                maxRowTS = cell.timestamp();
+            }
+            if (cell.timestamp() > 0 && cell.timestamp() < minRowTS) {
+                minRowTS = cell.timestamp();
             }
         }
+
+        if (rowTimestamp > 0) {
+            minRowTS = Math.min(minRowTS, rowTimestamp);
+            maxRowTS = Math.max(maxRowTS, rowTimestamp);
+        } else if (maxRowTS > 0) {
+            minRowTS = Math.min(minRowTS, maxRowTS);
+        }
+
+/*
         if (origRowTS < 0) {
             origRowTS = rowTimestamp;
         } else if (rowTimestamp < 0) {
             rowTimestamp = origRowTS;
         }
+*/
 
-        long otStamp = 0, tStamp = 0;
-        Pair<Long, Long> boundsMax = null, boundsOrig = null;
+        long minStamp = 0, maxStamp = 0;
+        Pair<Long, Long> boundsMax = null, boundsMin = null;
         long minSplitStamp = System.currentTimeMillis() - options.minSStableSplitWindow * options.timeWindowInMillis;
-        if (origRowTS != rowTimestamp) {
-            otStamp = TimeUnit.MILLISECONDS.convert(origRowTS, TimeUnit.MICROSECONDS);
-            tStamp = TimeUnit.MILLISECONDS.convert(rowTimestamp, TimeUnit.MICROSECONDS);
-            if (tStamp < minSplitStamp && otStamp < minSplitStamp) {
-                boundsOrig = boundsMax = TrueTimeWindowCompactionStrategy.getWindowBoundsInMillis(options.sstableWindowUnit, options.sstableWindowSize, minSplitStamp);
+        if (minRowTS != maxRowTS) {
+            minStamp = TimeUnit.MILLISECONDS.convert(minRowTS, TimeUnit.MICROSECONDS);
+            maxStamp = TimeUnit.MILLISECONDS.convert(maxRowTS, TimeUnit.MICROSECONDS);
+            if (minStamp < minSplitStamp && maxStamp < minSplitStamp) {
+                boundsMin = boundsMax = TrueTimeWindowCompactionStrategy.getWindowBoundsInMillis(options.sstableWindowUnit, options.sstableWindowSize, minSplitStamp);
             } else {
-                boundsMax = TrueTimeWindowCompactionStrategy.getWindowBoundsInMillis(options.sstableWindowUnit, options.sstableWindowSize, tStamp);
-                boundsOrig = TrueTimeWindowCompactionStrategy.getWindowBoundsInMillis(options.sstableWindowUnit, options.sstableWindowSize, otStamp);
+                boundsMin = TrueTimeWindowCompactionStrategy.getWindowBoundsInMillis(options.sstableWindowUnit, options.sstableWindowSize, minStamp);
+                boundsMax = TrueTimeWindowCompactionStrategy.getWindowBoundsInMillis(options.sstableWindowUnit, options.sstableWindowSize, maxStamp);
             }
-            if (boundsOrig.left != boundsMax.left) {
+            if (boundsMin.left.longValue() != boundsMax.left.longValue()) {
                 //rows.next();
-                logger.error("realAppend failed, drop record {}/{}-{} ", partition.partitionKey(), otStamp, tStamp);
+                logger.error("realAppend failed, drop record {}/{}-{}/{}-{} ", partition.partitionKey(), minStamp, maxStamp,
+                        boundsMin.left, boundsMax.left);
                 return -1; // cannot decide which partition this row belongs to, ignore it.
             }
         } else {
-            tStamp = TimeUnit.MILLISECONDS.convert(rowTimestamp, TimeUnit.MICROSECONDS);
-            if (tStamp < minSplitStamp) {
-                tStamp = minSplitStamp;
+            minStamp = TimeUnit.MILLISECONDS.convert(minRowTS, TimeUnit.MICROSECONDS);
+            if (minStamp < minSplitStamp) {
+                minStamp = minSplitStamp;
             }
-            boundsMax = TrueTimeWindowCompactionStrategy.getWindowBoundsInMillis(options.sstableWindowUnit, options.sstableWindowSize, tStamp);
+            boundsMax = TrueTimeWindowCompactionStrategy.getWindowBoundsInMillis(options.sstableWindowUnit, options.sstableWindowSize, minStamp);
         }
 
         span = (long) (boundsMax.left / options.timeWindowInMillis);
         logger.trace("xxxxxxx  row {}/{} ts {} - span {} / boundsMax.left {}", partition.partitionKey(), row.clustering().getRawValues(),
-                rowTimestamp, span, boundsMax.left);
+                minStamp, span, boundsMax.left);
         return span;
     }
 

@@ -509,6 +509,10 @@ public class TrueTimeWindowCompactionStrategy extends AbstractCompactionStrategy
 
         // Trim the largest sstables off the end to meet the maxThreshold
         Collections.sort(ssTableReaders, SSTableReader.sizeComparator);
+        for (SSTableReader reader: ssTableReaders) {
+            logger.warn("get sstable to compact {}-{}, maxSStableSizeThreshold {}", reader.descriptor.directory,
+                    reader.onDiskLength(), maxSStableSizeThreshold);
+        }
         if (excludeLargest && ssTableReaders.get(ssTableReaders.size() - 1).onDiskLength() >= maxSStableSizeThreshold) {
             excludeLargest = true;
         } else {
