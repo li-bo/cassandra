@@ -377,7 +377,11 @@ public class ColumnFamilyStore implements ColumnFamilyStoreMBean
         output.append(tmpOutput);
         if (truncatedSSTables.size() > 0) {
             for (SSTableReader reader : truncatedSSTables) {
-                tmpOutput = String.format("[R] path=%s  [%d]-[%d].\n", reader.getFilename(), reader.getMinTimestamp()/1000, reader.getMaxTimestamp()/1000);
+                long tsStart = reader.getMinTimestamp() + windowOffset * twInMills - 1000;
+                dateEnd.setTime(tsStart);
+                String strDataStart = dtFromat.format(dateEnd);
+                tmpOutput = String.format("[R] path=%s [%d MB] [ST %s - %s]-[W %d].\n", reader.getFilename(), reader.onDiskLength()/TrueTimeWindowCompactionStrategyOptions.MEGABYTES,
+                        strDataStart, reader.getMinTimestamp(), (tsStart-minTimestamp)/twInMills);
                 output.append(tmpOutput);
                 spaceReleased += reader.onDiskLength();
             }
@@ -459,24 +463,24 @@ public class ColumnFamilyStore implements ColumnFamilyStoreMBean
         String output =  "";
         TreeSet<TrueTimeWindowCompactionStrategy.Range> allKeys = new TreeSet<>(buckets.left.keySet());
         Iterator<TrueTimeWindowCompactionStrategy.Range> it = allKeys.iterator();
-        TrueTimeWindowCompactionStrategy.Range maxRange = buckets.right;
-        long twInMills = (maxRange.max - maxRange.min)/(maxRange.span - 1);
+        TrueTimeWindowCompactionStrategy.Range totalRange = buckets.right;
+        long twInMills = totalRange.timeWindow;
         String pattern = "yyyy-MM-dd HH:mm:ss";
         Date dateStart = new Date();
-        dateStart.setTime(maxRange.min);
+        dateStart.setTime(totalRange.min);
         Date dateEnd = new Date();
-        long tsEnd = maxRange.max + twInMills - 1000;
+        long tsEnd = totalRange.max + twInMills - 1000;
         dateEnd.setTime(tsEnd);  // in seconds
         SimpleDateFormat  dtFromat = new SimpleDateFormat(pattern);
         output = String.format("Range %d(%s) --> %d(%s) (%d spans with window size %d)%n",
-                maxRange.min, dtFromat.format(dateStart),
+                totalRange.min, dtFromat.format(dateStart),
                 tsEnd, dtFromat.format(dateEnd),
-                maxRange.span, twInMills);
+                totalRange.span, twInMills);
         String normalHead = output + "Normal SSTables # ";
         String abnormalHead = "abNormal SSTables # ";
 
         logger.debug(output);
-        int minWindowNo = (int) (maxRange.min / twInMills);
+        int minWindowNo = (int) (totalRange.min / twInMills);
         int preSpan = 0;
         int preSpan2 = 0;
         int normalCnt = 0;

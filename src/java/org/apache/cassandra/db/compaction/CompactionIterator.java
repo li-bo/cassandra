@@ -17,11 +17,7 @@
  */
 package org.apache.cassandra.db.compaction;
 
-import java.util.*;
-import java.util.function.Predicate;
-
 import com.google.common.collect.Ordering;
-
 import org.apache.cassandra.config.CFMetaData;
 import org.apache.cassandra.db.*;
 import org.apache.cassandra.db.filter.ColumnFilter;
@@ -34,6 +30,11 @@ import org.apache.cassandra.index.transactions.CompactionTransaction;
 import org.apache.cassandra.io.sstable.ISSTableScanner;
 import org.apache.cassandra.metrics.CompactionMetrics;
 import org.apache.cassandra.schema.CompactionParams.TombstoneOption;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.UUID;
+import java.util.function.Predicate;
 
 /**
  * Merge multiple iterators over the content of sstable into a "compacted" iterator.
@@ -550,5 +551,9 @@ public class CompactionIterator extends CompactionInfo.Holder implements Unfilte
 
             return new GarbageSkippingUnfilteredRowIterator(partition, UnfilteredRowIterators.merge(iters, nowInSec), nowInSec, cellLevelGC);
         }
+    }
+
+    public UnfilteredPartitionIterator getCompacted() {
+        return compacted;
     }
 }

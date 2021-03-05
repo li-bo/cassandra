@@ -271,15 +271,18 @@ public class TrueTimeWindowCompactionStrategy extends AbstractCompactionStrategy
         public long max;
         public long min;
         public int span;
+        public long timeWindow;
 
         Range(long min, long max, long timeWindow)
         {
             this.min = min;
             this.max = max;
+            this.timeWindow = timeWindow;
             if (timeWindow == Long.MIN_VALUE)
                 this.span = Integer.MAX_VALUE;
             else
                 this.span = (int) ((max - min) / timeWindow + 1);
+            if (max == min) this.timeWindow = timeWindow;
             //logger.trace("new range {}-{}, span {}, timewindow {}", min, max, span, timeWindow);
         }
 
@@ -406,7 +409,7 @@ public class TrueTimeWindowCompactionStrategy extends AbstractCompactionStrategy
                 maxTimestamp = boundsMax.left;
         }
 
-        logger.trace("buckets {}, max timestamp {}", buckets, maxTimestamp);
+        logger.trace("buckets {}, max timestamp {}", buckets.size(), maxTimestamp);
         return Pair.create(buckets, maxTimestamp);
     }
 
@@ -445,7 +448,7 @@ public class TrueTimeWindowCompactionStrategy extends AbstractCompactionStrategy
 
         SizeTieredCompactionStrategyOptions stcsOptions = options.stcsOptions;
         TreeSet<Range> allKeys = new TreeSet<>(buckets.keySet());
-
+        
         Iterator<Range> it = allKeys.descendingIterator();
         while(it.hasNext())
         {
@@ -468,10 +471,10 @@ public class TrueTimeWindowCompactionStrategy extends AbstractCompactionStrategy
             else if ((bucket.size() >= 2) &&
                     ((range.span == 1 && range.max < now) || (range.min == 0 && range.max != Long.MAX_VALUE))) {
                 logger.debug("bucket size {} >= 2 and not in current bucket, compacting what's here: {}", bucket.size(), bucket);
-                boolean excludeLargest = false;
-                if (range.span == 1 && range.max < now) {
-                    excludeLargest = true;
-                }
+                boolean excludeLargest = true;
+//                if (range.span == 1 && range.max < now) {
+//                    excludeLargest = true;
+//                }
 
                 List<SSTableReader>  ret = trimToThreshold(bucket, maxThreshold, excludeLargest, options.maxSStableSizeThreshold);
                 if (ret != null && ret.size() > 1) {
@@ -506,25 +509,33 @@ public class TrueTimeWindowCompactionStrategy extends AbstractCompactionStrategy
     static List<SSTableReader> trimToThreshold(Set<SSTableReader> bucket, int maxThreshold, boolean excludeLargest, long maxSStableSizeThreshold)
     {
         List<SSTableReader> ssTableReaders = new ArrayList<>(bucket);
+        int excludeCount = 0;
 
         // Trim the largest sstables off the end to meet the maxThreshold
         Collections.sort(ssTableReaders, SSTableReader.sizeComparator);
         for (SSTableReader reader: ssTableReaders) {
-            logger.warn("get sstable to compact {}-{}, maxSStableSizeThreshold {}", reader.descriptor.directory,
-                    reader.onDiskLength(), maxSStableSizeThreshold);
-        }
-        if (excludeLargest && ssTableReaders.get(ssTableReaders.size() - 1).onDiskLength() >= maxSStableSizeThreshold) {
-            excludeLargest = true;
-        } else {
-            excludeLargest = false;
+            if (excludeLargest && reader.onDiskLength() >= maxSStableSizeThreshold) {
+                excludeCount ++;
+                logger.debug("exclude sstables({}) to compact {}-{}, maxSStableSizeThreshold {}", ssTableReaders.size(),
+                    reader.descriptor.baseFilename(), reader.onDiskLength(), maxSStableSizeThreshold);
+            }
         }
 
-        if (excludeLargest && ssTableReaders.size() <= 2) {
+//        if (excludeLargest && ssTableReaders.get(ssTableReaders.size() - 1).onDiskLength() >= maxSStableSizeThreshold) {
+//            SSTableReader reader = ssTableReaders.get(ssTableReaders.size() - 1);
+//            excludeLargest = true;
+//            logger.debug("exclude sstables({}) to compact {}-{}, maxSStableSizeThreshold {}", ssTableReaders.size(),
+//                    reader.descriptor.baseFilename(), reader.onDiskLength(), maxSStableSizeThreshold);
+//        } else {
+//            excludeLargest = false;
+//        }
+
+        if (ssTableReaders.size() <= excludeCount + 1) {
             return null;
         }
 
         return ImmutableList.copyOf(Iterables.limit(ssTableReaders,
-                Math.max(maxThreshold, ssTableReaders.size() - (excludeLargest ? 1:0 ))));
+                Math.min(maxThreshold, ssTableReaders.size() - excludeCount)));
     }
 
     @Override

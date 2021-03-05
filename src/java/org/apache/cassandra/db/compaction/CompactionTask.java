@@ -33,6 +33,8 @@ import com.google.common.util.concurrent.RateLimiter;
 import org.apache.cassandra.db.Directories;
 import org.apache.cassandra.db.compaction.writers.CompactionAwareWriter;
 import org.apache.cassandra.db.compaction.writers.DefaultCompactionWriter;
+import org.apache.cassandra.db.compaction.writers.SplittingTimeWindowCompactionWriter;
+import org.apache.cassandra.db.partitions.UnfilteredPartitionIterator;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.commons.lang3.StringUtils;
 import org.slf4j.Logger;
@@ -192,13 +194,18 @@ public class CompactionTask extends AbstractCompactionTask
 
                 try (CompactionAwareWriter writer = getCompactionAwareWriter(cfs, getDirectories(), transaction, actuallyCompact))
                 {
+                    UnfilteredPartitionIterator nIter = ci.getCompacted();
+                    if (writer instanceof SplittingTimeWindowCompactionWriter) {
+                        SplittingTimeWindowCompactionWriter stwCW = (SplittingTimeWindowCompactionWriter) writer;
+                        nIter = stwCW.reOrderPartitionBySpan(ci);
+                    }
                     estimatedKeys = writer.estimatedKeys();
-                    while (ci.hasNext())
+                    while (nIter.hasNext())
                     {
                         if (ci.isStopRequested())
                             throw new CompactionInterruptedException(ci.getCompactionInfo());
 
-                        if (writer.append(ci.next()))
+                        if (writer.append(nIter.next()))
                             totalKeysWritten++;
 
 

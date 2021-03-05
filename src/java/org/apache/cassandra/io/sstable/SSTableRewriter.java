@@ -64,6 +64,8 @@ public class SSTableRewriter extends Transactional.AbstractTransactional impleme
     private long currentlyOpenedEarlyAt; // the position (in MB) in the target file we last (re)opened at
 
     private final Set<SSTableWriter> writers = new HashSet<>();
+    private final Set<SSTableWriter> inTransWriters = new HashSet<>();
+
     private final boolean keepOriginals; // true if we do not want to obsolete the originals
 
     private SSTableWriter writer;
@@ -298,8 +300,24 @@ public class SSTableRewriter extends Transactional.AbstractTransactional impleme
 
     public void setCurrentWriter(SSTableWriter newWriter)
     {
-        if (newWriter != null)
+        if (preemptiveOpenInterval != Long.MAX_VALUE) {
+            if (writer != null && !inTransWriters.contains(writer)) {
+                // we leave it as a tmp file, but we open it and add it to the Tracker
+                SSTableReader reader = writer.setMaxDataAge(maxAge).openEarly();
+                if (reader != null) {
+                    transaction.update(reader, false);
+                    moveStarts(reader, reader.last);
+                    transaction.checkpoint();
+                    inTransWriters.add(writer);
+                }
+            }
+        }
+
+        if (newWriter != null) {
             writers.add(newWriter.setMaxDataAge(maxAge));
+        }
+
+        currentlyOpenedEarlyAt = 0;
         this.writer = newWriter;
     }
 
