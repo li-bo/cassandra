@@ -20,11 +20,11 @@
  */
 package org.apache.cassandra.db.transform;
 
-import java.util.Iterator;
-import java.util.NoSuchElementException;
-
 import net.nicoulaj.compilecommand.annotations.DontInline;
 import org.apache.cassandra.utils.CloseableIterator;
+
+import java.util.Iterator;
+import java.util.NoSuchElementException;
 
 import static org.apache.cassandra.utils.Throwables.maybeFail;
 import static org.apache.cassandra.utils.Throwables.merge;
@@ -92,15 +92,6 @@ abstract class BaseIterator<V, I extends CloseableIterator<? extends V>, O exten
         try { input.close(); }
         catch (Throwable t) { fail = merge(fail, t); }
         maybeFail(fail);
-    }
-
-    public final O peek()
-    {
-        if (next == null && !hasNext())
-            throw new NoSuchElementException();
-
-        O next = (O) this.next;
-        return next;
     }
 
     public final O next()

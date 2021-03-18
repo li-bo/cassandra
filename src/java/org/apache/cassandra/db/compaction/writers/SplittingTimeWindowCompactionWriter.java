@@ -25,6 +25,7 @@ import org.apache.cassandra.db.*;
 import org.apache.cassandra.db.compaction.CompactionIterator;
 import org.apache.cassandra.db.compaction.TrueTimeWindowCompactionStrategy;
 import org.apache.cassandra.db.compaction.TrueTimeWindowCompactionStrategyOptions;
+import org.apache.cassandra.db.filter.ColumnFilter;
 import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
 import org.apache.cassandra.db.partitions.UnfilteredPartitionIterator;
 import org.apache.cassandra.db.rows.*;
@@ -100,6 +101,7 @@ public class SplittingTimeWindowCompactionWriter extends CompactionAwareWriter
         return rie != null;
     }
 
+    /*
     public boolean realAppend2(UnfilteredRowIterator partition)
     {
         try {
@@ -138,7 +140,7 @@ public class SplittingTimeWindowCompactionWriter extends CompactionAwareWriter
                     }
                 } else {
                     Row row = (Row)rows.peek();
-                    long span = getSpan(row, partition);
+                    Pair<Row, Long> retRow  = getSpan(row, partition);
                     if (span > 0) {
                         switchWriter(location, span);
                         RowIndexEntry rie = sstableWriter.append(partition);
@@ -175,50 +177,12 @@ public class SplittingTimeWindowCompactionWriter extends CompactionAwareWriter
         }
         return span;
     }
-
-    public boolean realAppend4WideRow(UnfilteredRowIterator partition)
-    {
-        try {
-//        UnfilteredRowIterator it = new UnfilteredRowIterator(partition);
-            List<RowIndexEntry> rieA = Lists.newArrayList();
-            partition.forEachRemaining(unfiltered -> {
-                if (unfiltered.isRow())
-                {
-                    Row row = (Row) unfiltered;
-                    UnfilteredRowIterator tmpRow = partition;
-                    if (row.clustering().size() > 0) {
-                        Iterator<Row> rowsIterator = Arrays.asList(row).iterator();
-                        tmpRow = new AbstractUnfilteredRowIterator(partition.metadata(), partition.partitionKey(),
-                                DeletionTime.LIVE, partition.columns(), Rows.EMPTY_STATIC_ROW, false, EncodingStats.NO_STATS) {
-                            @Override
-                            protected Unfiltered computeNext() {
-                                return rowsIterator.hasNext() ? rowsIterator.next() : endOfData();
-                            }
-                        };
-                    }
-                    long span = getSpan(row, partition);
-
-                    if (span > 0) {
-                        switchWriter(location, span);
-                        RowIndexEntry rie = sstableWriter.append(tmpRow);
-                        rieA.add(rie);
-                        logger.trace("realAppend {} - span {}", partition, span);
-
-                        if (preSpan != span) {
-                            preSpan = span;
-                        }
-                    }
-                }
-            });
-            return rieA.size() > 0;
-        } catch (Exception e) {
-            e.printStackTrace();
-            logger.error("realAppend failed {}", e.toString());
-            return false;
-        }
+  */
+    private Row rewriteAbnormalRow(Row row, long minRowTS) {
+        return row.updateAllTimestamp(minRowTS);
     }
 
-    private long getSpan(Row row, UnfilteredRowIterator partition) {
+    private Pair<Row, Long> getSpan(Row row, UnfilteredRowIterator partition) {
         long span = 0;
         long rowTimestamp = row.primaryKeyLivenessInfo().timestamp();
 
@@ -269,9 +233,12 @@ public class SplittingTimeWindowCompactionWriter extends CompactionAwareWriter
             }
             if (boundsMin.left.longValue() != boundsMax.left.longValue()) {
                 //rows.next();
-                logger.error("realAppend failed, drop record {}/{}-{}/{}-{} ", partition.partitionKey(), minStamp, maxStamp,
+                logger.warn("realAppend meet row across multi-TW, rewrite record with minStamp {}/{}-{}/{}-{} ", partition.partitionKey(), minStamp, maxStamp,
                         boundsMin.left, boundsMax.left);
-                return -1; // cannot decide which partition this row belongs to, ignore it.
+                Row nRow = rewriteAbnormalRow(row, minRowTS);
+                span = (long) (boundsMin.left / options.timeWindowInMillis);
+                return Pair.create(nRow, span);
+                //return -1; // cannot decide which partition this row belongs to, ignore it.
             }
         } else {
             minStamp = TimeUnit.MILLISECONDS.convert(minRowTS, TimeUnit.MICROSECONDS);
@@ -284,7 +251,9 @@ public class SplittingTimeWindowCompactionWriter extends CompactionAwareWriter
         span = (long) (boundsMax.left / options.timeWindowInMillis);
         logger.trace("xxxxxxx  row {}/{} ts {} - span {} / boundsMax.left {}", partition.partitionKey(), row.clustering().toCQLString(cfs.metadata),
                 minStamp, span, boundsMax.left);
-        return span;
+//        Row nRow = row.filter(ColumnFilter.all(partition.metadata()), partition.metadata());
+        Row nRow = row;
+        return Pair.create(nRow, span);
     }
 
     private void switchWriter(Directories.DataDirectory location, long span) {
@@ -402,8 +371,9 @@ public class SplittingTimeWindowCompactionWriter extends CompactionAwareWriter
     }
 
     class MyUnfilteredPartitionIterator implements UnfilteredPartitionIterator {
+        private final boolean isForThrift;
+        private final CFMetaData metadata;
         ListMultimap<Long, UnfilteredRowIterator> mRows = null;
-        CompactionIterator ci = null;
         Iterator<Long> spanIter = null;
         Iterator<UnfilteredRowIterator> rowIter = null;
         long curSpan = 0;
@@ -411,17 +381,12 @@ public class SplittingTimeWindowCompactionWriter extends CompactionAwareWriter
 
         @Override
         public boolean isForThrift() {
-            return ci.isForThrift();
+            return isForThrift;
         }
 
         @Override
         public CFMetaData metadata() {
-            return ci.metadata();
-        }
-
-        @Override
-        public void close() {
-            ci.close();
+            return metadata;
         }
 
         @Override
@@ -447,15 +412,21 @@ public class SplittingTimeWindowCompactionWriter extends CompactionAwareWriter
             return rIter;
         }
 
-        public MyUnfilteredPartitionIterator(CompactionIterator ci, ListMultimap<Long, UnfilteredRowIterator> mRows) {
-            this.ci = ci;
+        public MyUnfilteredPartitionIterator(UnfilteredPartitionIterator ci, ListMultimap<Long, UnfilteredRowIterator> mRows) {
+            this.isForThrift = ci.isForThrift();
+            this.metadata = ci.metadata();
             this.mRows = mRows;
 
             spanIter = mRows.keySet().iterator();
         }
+
+        @Override
+        public void close() {
+
+        }
     };
 
-    public MyUnfilteredPartitionIterator reOrderPartitionBySpan(CompactionIterator ci) {
+    public MyUnfilteredPartitionIterator reOrderPartitionBySpan(UnfilteredPartitionIterator ci) {
         ListMultimap<Long, UnfilteredRowIterator> mRows = ArrayListMultimap.create();
 
         while (ci.hasNext()) {
@@ -463,12 +434,14 @@ public class SplittingTimeWindowCompactionWriter extends CompactionAwareWriter
             UnfilteredRows rows = (UnfilteredRows) partition;
 
             if (rows.metadata().clusteringColumns().size() > 0) {
-                RowIndexEntry rie = null;
                 partition.forEachRemaining(unfiltered -> {
                     if (unfiltered.isRow()) {
                         Row irow = (Row) unfiltered;
-                        long span = getSpan(irow, partition);
+                        Pair<Row, Long> retRow = getSpan(irow, partition);
+                        irow = retRow.left;
+                        long span = retRow.right;
                         boolean isNewPartition = true;
+
                         if (span > 0) {
                             List<UnfilteredRowIterator> spanRows = mRows.get(span);
                             if (spanRows != null && spanRows.size() > 0) {
@@ -487,12 +460,31 @@ public class SplittingTimeWindowCompactionWriter extends CompactionAwareWriter
                     }
                 });
             } else {
-                Row irow = (Row)rows.peek();
-                UnfilteredRowIterator tmpRow =  new MyUnfilteredRowIterator(partition.metadata(), partition.partitionKey(),
-                        DeletionTime.LIVE, partition.columns(), Rows.EMPTY_STATIC_ROW, false, EncodingStats.NO_STATS, irow);
-                long span = getSpan(irow, partition);
-                mRows.put(span, tmpRow);
+                Row irow = (Row)rows.next();
+                Pair<Row, Long> retRow = getSpan(irow, partition);
+                irow = retRow.left;
+                long span = retRow.right;
+                if (span > 0) {
+                    UnfilteredRowIterator tmpRow =  new MyUnfilteredRowIterator(partition.metadata(), partition.partitionKey(),
+                            DeletionTime.LIVE, partition.columns(), Rows.EMPTY_STATIC_ROW, false, EncodingStats.NO_STATS, irow);
+                    mRows.put(span, tmpRow);
+                }
+
+//                partition.forEachRemaining(unfiltered -> {
+//                    if (unfiltered.isRow()) {
+//                        Row irow = (Row) unfiltered;
+//                        Pair<Row, Long> retRow = getSpan(irow, partition);
+//                        irow = retRow.left;
+//                        long span = retRow.right;
+//                        if (span > 0) {
+//                            UnfilteredRowIterator tmpRow =  new MyUnfilteredRowIterator(partition.metadata(), partition.partitionKey(),
+//                                    DeletionTime.LIVE, partition.columns(), Rows.EMPTY_STATIC_ROW, false, EncodingStats.NO_STATS, irow);
+//                            mRows.put(span, tmpRow);
+//                        }
+//                    }
+//                });
             }
+            //partition.close();
         }
 
         return new MyUnfilteredPartitionIterator(ci, mRows);

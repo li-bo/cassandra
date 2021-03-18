@@ -197,7 +197,7 @@ public class CompactionTask extends AbstractCompactionTask
                     UnfilteredPartitionIterator nIter = ci.getCompacted();
                     if (writer instanceof SplittingTimeWindowCompactionWriter) {
                         SplittingTimeWindowCompactionWriter stwCW = (SplittingTimeWindowCompactionWriter) writer;
-                        nIter = stwCW.reOrderPartitionBySpan(ci);
+                        nIter = stwCW.reOrderPartitionBySpan(nIter);
                     }
                     estimatedKeys = writer.estimatedKeys();
                     while (nIter.hasNext())
@@ -222,6 +222,7 @@ public class CompactionTask extends AbstractCompactionTask
                             lastCheckObsoletion = System.nanoTime();
                         }
                     }
+                    //nIter.close();
 
                     // point of no return
                     newSStables = writer.finish();
