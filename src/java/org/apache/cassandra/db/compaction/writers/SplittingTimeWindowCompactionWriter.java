@@ -19,13 +19,10 @@ package org.apache.cassandra.db.compaction.writers;
 
 import com.google.common.collect.ArrayListMultimap;
 import com.google.common.collect.ListMultimap;
-import com.google.common.collect.Lists;
 import org.apache.cassandra.config.CFMetaData;
 import org.apache.cassandra.db.*;
-import org.apache.cassandra.db.compaction.CompactionIterator;
 import org.apache.cassandra.db.compaction.TrueTimeWindowCompactionStrategy;
 import org.apache.cassandra.db.compaction.TrueTimeWindowCompactionStrategyOptions;
-import org.apache.cassandra.db.filter.ColumnFilter;
 import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
 import org.apache.cassandra.db.partitions.UnfilteredPartitionIterator;
 import org.apache.cassandra.db.rows.*;
@@ -40,6 +37,7 @@ import org.slf4j.LoggerFactory;
 
 import java.util.*;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * CompactionAwareWriter that splits input in differently sized sstables
@@ -373,6 +371,8 @@ public class SplittingTimeWindowCompactionWriter extends CompactionAwareWriter
     class MyUnfilteredPartitionIterator implements UnfilteredPartitionIterator {
         private final boolean isForThrift;
         private final CFMetaData metadata;
+        private final long maxKeySpan;
+        private boolean maxKeySpanScanned = false;
         ListMultimap<Long, UnfilteredRowIterator> mRows = null;
         Iterator<Long> spanIter = null;
         Iterator<UnfilteredRowIterator> rowIter = null;
@@ -391,7 +391,7 @@ public class SplittingTimeWindowCompactionWriter extends CompactionAwareWriter
 
         @Override
         public boolean hasNext() {
-            return spanIter.hasNext() || (rowIter != null && rowIter.hasNext());
+            return spanIter.hasNext() || !maxKeySpanScanned || (rowIter != null && rowIter.hasNext());
         }
 
         @Override
@@ -402,7 +402,19 @@ public class SplittingTimeWindowCompactionWriter extends CompactionAwareWriter
                     spanSwitched = true;
                 }
                 curSpan = spanIter.next();
+
+                // the span with the maxKey should be write last!!!
+                if (curSpan == maxKeySpan) {
+                    if (spanIter.hasNext())
+                        curSpan = spanIter.next();
+                    else maxKeySpanScanned = true;
+                }
                 rowIter = mRows.get(curSpan).iterator();
+            } else if (!spanIter.hasNext() && maxKeySpanScanned == false) {
+                curSpan = maxKeySpan;
+                rowIter = mRows.get(maxKeySpan).iterator();
+                maxKeySpanScanned = true;
+                spanSwitched = true;
             }
 
             UnfilteredRowIterator rIter = rowIter.next();
@@ -412,12 +424,14 @@ public class SplittingTimeWindowCompactionWriter extends CompactionAwareWriter
             return rIter;
         }
 
-        public MyUnfilteredPartitionIterator(UnfilteredPartitionIterator ci, ListMultimap<Long, UnfilteredRowIterator> mRows) {
+
+        public MyUnfilteredPartitionIterator(UnfilteredPartitionIterator ci, ListMultimap<Long, UnfilteredRowIterator> mRows, long maxKeySpan) {
             this.isForThrift = ci.isForThrift();
             this.metadata = ci.metadata();
             this.mRows = mRows;
 
             spanIter = mRows.keySet().iterator();
+            this.maxKeySpan = maxKeySpan;
         }
 
         @Override
@@ -428,12 +442,16 @@ public class SplittingTimeWindowCompactionWriter extends CompactionAwareWriter
 
     public MyUnfilteredPartitionIterator reOrderPartitionBySpan(UnfilteredPartitionIterator ci) {
         ListMultimap<Long, UnfilteredRowIterator> mRows = ArrayListMultimap.create();
+        // the span with the maxKey should be write to sstable last, here we got the maxKeySpan.
+        AtomicLong maxKeySpan = new AtomicLong();
+        final DecoratedKey[] maxKey = {null};
 
         while (ci.hasNext()) {
             UnfilteredRowIterator partition = ci.next();
             UnfilteredRows rows = (UnfilteredRows) partition;
 
-            if (rows.metadata().clusteringColumns().size() > 0) {
+            //if (rows.metadata().clusteringColumns().size() > 0) {
+            if (true) {
                 partition.forEachRemaining(unfiltered -> {
                     if (unfiltered.isRow()) {
                         Row irow = (Row) unfiltered;
@@ -441,6 +459,11 @@ public class SplittingTimeWindowCompactionWriter extends CompactionAwareWriter
                         irow = retRow.left;
                         long span = retRow.right;
                         boolean isNewPartition = true;
+                        if (maxKey[0] == null) maxKey[0] = partition.partitionKey();
+                        if (maxKey[0].compareTo(partition.partitionKey()) < 0) {
+                            maxKey[0] = partition.partitionKey();
+                            maxKeySpan.set(span);
+                        }
 
                         if (span > 0) {
                             List<UnfilteredRowIterator> spanRows = mRows.get(span);
@@ -487,6 +510,13 @@ public class SplittingTimeWindowCompactionWriter extends CompactionAwareWriter
             //partition.close();
         }
 
-        return new MyUnfilteredPartitionIterator(ci, mRows);
+        return new MyUnfilteredPartitionIterator(ci, mRows, maxKeySpan.get());
+    }
+
+    private ListMultimap<Long, UnfilteredRowIterator> reOrderSpanByKeys(ListMultimap<Long, UnfilteredRowIterator> mRows, long maxKeySpan) {
+        List<UnfilteredRowIterator> lastRows = mRows.get(maxKeySpan);
+        mRows.removeAll(maxKeySpan);
+        mRows.putAll(maxKeySpan, lastRows);
+        return mRows;
     }
 }

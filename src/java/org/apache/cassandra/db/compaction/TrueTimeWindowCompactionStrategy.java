@@ -403,7 +403,11 @@ public class TrueTimeWindowCompactionStrategy extends AbstractCompactionStrategy
                 else
                     buckets.put(abnormalRange, f);
             } else {
-                buckets.put(new Range(0, boundsSpit.left, options.timeWindowInMillis), f);
+                // original buckets with only 1 span, should not be compacted with other outdated abnormal sstables.
+                if (range.span == 1)
+                    buckets.put(range, f);
+                else
+                    buckets.put(new Range(0, boundsSpit.left, options.timeWindowInMillis), f);
             }
             if (boundsMax.left > maxTimestamp)
                 maxTimestamp = boundsMax.left;
